@@ -1,0 +1,1377 @@
+openapi: 3.1.0
+info:
+  title: OneIssuer Phase Two Identity and Client API
+  version: 0.1.0-dev.2
+  license:
+    name: Apache License 2.0
+    identifier: Apache-2.0
+  description: |-
+    Implemented phase-two JSON contract for a self-hosted, single-Issuer
+    deployment. It covers health, current-user session management, and the
+    administrator Users, Clients, Sessions, and Audit APIs.
+
+    Browser authentication is hosted as HTML at `/login`, `/register`,
+    `/logout`, and `/auth/complete`; those form interactions are intentionally
+    not represented as JSON operations here. Discovery, JWKS, Authorize, Token,
+    UserInfo, Revocation, and Introspection are not implemented and are not part
+    of this contract.
+
+    Authenticated JSON calls use a server-side session cookie. State-changing
+    calls additionally require the clear CSRF value returned in the
+    `X-CSRF-Token` response header by `/api/v1/me`, `/api/v1/me/sessions`,
+    `/api/admin/v1/me`, or an administrative list endpoint. The browser also
+    sends the matching CSRF cookie, and OneIssuer applies same-origin checks.
+servers:
+  - url: /
+    description: Configured OneIssuer origin
+
+tags:
+  - name: Health
+    description: Process liveness and dependency readiness.
+  - name: Current user
+    description: Same-origin account and session operations for the authenticated user.
+  - name: Administration
+    description: Administrator-only identity, client, session, and audit operations.
+
+paths:
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: getLiveness
+      summary: Check whether the HTTP process is responsive
+      security: []
+      responses:
+        "200":
+          description: The process is live; external dependencies are not checked.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LiveResponse"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: getReadiness
+      summary: Check lifecycle initialization and PostgreSQL connectivity
+      security: []
+      responses:
+        "200":
+          description: The process is ready to serve traffic.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyResponse"
+        "503":
+          description: The process is shutting down or PostgreSQL is unavailable.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UnavailableResponse"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /api/v1/me:
+    get:
+      tags: [Current user]
+      operationId: getCurrentUser
+      summary: Read the current non-sensitive identity and session ID
+      description: This is an account API, not the OIDC UserInfo endpoint.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Current identity and session summary.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            X-CSRF-Token:
+              $ref: "#/components/headers/CSRFToken"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /api/v1/me/sessions:
+    get:
+      tags: [Current user]
+      operationId: listCurrentUserSessions
+      summary: List only the current user's session summaries
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A bounded keyset-paginated session page.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            X-CSRF-Token:
+              $ref: "#/components/headers/CSRFToken"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /api/v1/me/sessions/{id}/revoke:
+    post:
+      tags: [Current user]
+      operationId: revokeCurrentUserSession
+      summary: Revoke a session only if it belongs to the current user
+      description: A foreign or unknown session identifier is indistinguishable from not found.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceID"
+      responses:
+        "204":
+          description: The owned session was revoked. Revoking the current session also clears authentication cookies.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /api/v1/me/sessions/revoke-others:
+    post:
+      tags: [Current user]
+      operationId: revokeOtherCurrentUserSessions
+      summary: Revoke all of the current user's sessions except the current one
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      responses:
+        "200":
+          description: Number of sessions newly revoked.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RevokedCount"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /api/admin/v1/me:
+    get:
+      tags: [Administration]
+      operationId: getCurrentAdministrator
+      summary: Read the current administrator identity and session ID
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Current active administrator and session summary.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            X-CSRF-Token:
+              $ref: "#/components/headers/CSRFToken"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /api/admin/v1/users:
+    get:
+      tags: [Administration]
+      operationId: listUsers
+      summary: Search and list users with bounded keyset pagination
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/UserSearch"
+      responses:
+        "200":
+          description: Credential-free user page.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            X-CSRF-Token:
+              $ref: "#/components/headers/CSRFToken"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      tags: [Administration]
+      operationId: createUser
+      summary: Create a managed user and initial password credential
+      description: Creating an administrator also requires recent authentication.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateUserRequest"
+      responses:
+        "201":
+          description: Credential-free created user.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/admin/v1/users/{id}:
+    get:
+      tags: [Administration]
+      operationId: getUser
+      summary: Read one credential-free user
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceID"
+      responses:
+        "200":
+          description: Credential-free user.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    patch:
+      tags: [Administration]
+      operationId: updateUser
+      summary: Update restricted user profile, status, or role fields
+      description: |-
+        Status or role changes require recent authentication and revoke the
+        affected user's active sessions. The final active administrator cannot
+        be disabled or demoted. Concurrent stale updates return `409`.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateUserRequest"
+      responses:
+        "200":
+          description: Updated credential-free user.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/admin/v1/users/{id}/revoke-sessions:
+    post:
+      tags: [Administration]
+      operationId: revokeUserSessions
+      summary: Revoke every active session belonging to a user
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceID"
+      responses:
+        "200":
+          description: Number of sessions newly revoked.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RevokedCount"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /api/admin/v1/clients:
+    get:
+      tags: [Administration]
+      operationId: listClients
+      summary: List credential-free clients with keyset pagination
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Client page containing no clear secret or secret digest.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            X-CSRF-Token:
+              $ref: "#/components/headers/CSRFToken"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      tags: [Administration]
+      operationId: createClient
+      summary: Create a public or confidential client
+      description: |-
+        Requires recent authentication. A confidential clear secret appears
+        only in this successful response; a public client has no secret.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateClientRequest"
+      responses:
+        "201":
+          description: Created client and, for a confidential client, its one-time secret.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatedClientResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/admin/v1/clients/{id}:
+    get:
+      tags: [Administration]
+      operationId: getClient
+      summary: Read one credential-free client configuration
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceID"
+      responses:
+        "200":
+          description: Client configuration containing no clear secret or secret digest.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Client"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    patch:
+      tags: [Administration]
+      operationId: updateClient
+      summary: Update restricted client metadata, URI, scope, or status fields
+      description: Requires recent authentication and revalidates every URI and scope.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateClientRequest"
+      responses:
+        "200":
+          description: Updated client containing no clear secret or secret digest.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Client"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/admin/v1/clients/{id}/secrets/rotate:
+    post:
+      tags: [Administration]
+      operationId: rotateClientSecret
+      summary: Replace a confidential client secret and reveal the new value once
+      description: Requires recent authentication. Old secrets are invalid after commit.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceID"
+      responses:
+        "200":
+          description: One-time replacement secret. It cannot be retrieved again.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RotatedSecretResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /api/admin/v1/sessions:
+    get:
+      tags: [Administration]
+      operationId: listSessions
+      summary: List safe login-session summaries
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Administrative session page.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            X-CSRF-Token:
+              $ref: "#/components/headers/CSRFToken"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /api/admin/v1/sessions/{id}/revoke:
+    post:
+      tags: [Administration]
+      operationId: revokeSession
+      summary: Revoke one login session
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceID"
+      responses:
+        "204":
+          description: Session revoked. Revoking the current session also clears authentication cookies.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /api/admin/v1/audit-events:
+    get:
+      tags: [Administration]
+      operationId: listAuditEvents
+      summary: List immutable, value-free audit events
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/EventType"
+      responses:
+        "200":
+          description: Append-only audit event page.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            X-CSRF-Token:
+              $ref: "#/components/headers/CSRFToken"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: oneissuer_session
+      description: |-
+        Opaque server-side session cookie. The deployed name is configurable;
+        production requires a Secure `__Host-` name. The database stores only a
+        domain-separated digest. Never copy this value into logs or examples.
+    csrfToken:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+      description: |-
+        Clear double-submit value returned by an authenticated GET. Mutations
+        also require the matching CSRF cookie and same-origin validation.
+
+  headers:
+    RequestID:
+      description: Bounded caller-provided or server-generated request ID.
+      schema:
+        type: string
+        pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    CSRFToken:
+      description: Rotated or reused clear CSRF value for a subsequent same-origin mutation. Treat as sensitive.
+      schema:
+        type: string
+        writeOnly: true
+        pattern: "^c1_[A-Za-z0-9_-]{43}$"
+    NoStore:
+      description: Prevents persistence of a one-time clear client secret.
+      schema:
+        type: string
+        const: no-store
+    RetryAfter:
+      description: Minimum seconds before retrying the bounded password-hashing path.
+      schema:
+        type: integer
+        minimum: 1
+
+  parameters:
+    ResourceID:
+      name: id
+      in: path
+      required: true
+      description: Internal opaque resource UUID.
+      schema:
+        type: string
+        format: uuid
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque versioned keyset cursor returned as `next_cursor`.
+      schema:
+        type: string
+        pattern: "^[A-Za-z0-9_-]{34}$"
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Bounded page size; defaults to 20.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    UserSearch:
+      name: search
+      in: query
+      required: false
+      description: Normalized username/email prefix search, bounded to 320 characters.
+      schema:
+        type: string
+        maxLength: 320
+    EventType:
+      name: event_type
+      in: query
+      required: false
+      description: Exact fixed audit event type.
+      schema:
+        $ref: "#/components/schemas/AuditEventType"
+
+  schemas:
+    LiveResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok
+    ReadyResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ready
+    UnavailableResponse:
+      type: object
+      additionalProperties: false
+      required: [status, request_id]
+      properties:
+        status:
+          type: string
+          const: unavailable
+        request_id:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, request_id]
+          properties:
+            code:
+              type: string
+              enum:
+                - invalid_json
+                - authentication_required
+                - csrf_failed
+                - forbidden
+                - recent_authentication_required
+                - registration_disabled
+                - not_found
+                - conflict
+                - last_admin_protected
+                - invalid_input
+                - temporarily_unavailable
+                - invalid_authentication_flow
+                - method_not_allowed
+                - internal_error
+            message:
+              type: string
+              maxLength: 256
+            request_id:
+              type: string
+              pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+
+    UserStatus:
+      type: string
+      enum: [active, disabled]
+    UserRole:
+      type: string
+      enum: [user, admin]
+    User:
+      type: object
+      additionalProperties: false
+      description: Credential-free identity. Normalized identifiers, version, and password digest are absent.
+      required:
+        - id
+        - subject
+        - username
+        - display_name
+        - email
+        - email_verified
+        - status
+        - role
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        subject:
+          type: string
+          pattern: "^sub_[A-Za-z0-9_-]{43}$"
+        username:
+          type: string
+          minLength: 3
+          maxLength: 64
+        display_name:
+          type: string
+          maxLength: 128
+        email:
+          type: string
+          format: email
+          maxLength: 320
+        email_verified:
+          type: boolean
+        status:
+          $ref: "#/components/schemas/UserStatus"
+        role:
+          $ref: "#/components/schemas/UserRole"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        last_login_at:
+          type: [string, "null"]
+          format: date-time
+    MeResponse:
+      type: object
+      additionalProperties: false
+      required: [user, session_id]
+      properties:
+        user:
+          $ref: "#/components/schemas/User"
+        session_id:
+          type: string
+          format: uuid
+    CreateUserRequest:
+      type: object
+      additionalProperties: false
+      required: [username, email, password]
+      properties:
+        username:
+          type: string
+          minLength: 3
+          maxLength: 64
+        display_name:
+          type: string
+          maxLength: 128
+          description: Defaults to the normalized display username when empty.
+        email:
+          type: string
+          format: email
+          maxLength: 320
+        password:
+          type: string
+          minLength: 15
+          maxLength: 4096
+          writeOnly: true
+          description: Exact UTF-8 input; deployment byte limit defaults to 1024 and is never logged or returned.
+        role:
+          allOf:
+            - $ref: "#/components/schemas/UserRole"
+          default: user
+    UpdateUserRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        username:
+          type: string
+          minLength: 3
+          maxLength: 64
+        display_name:
+          type: string
+          maxLength: 128
+        email:
+          type: string
+          format: email
+          maxLength: 320
+        status:
+          $ref: "#/components/schemas/UserStatus"
+        role:
+          $ref: "#/components/schemas/UserRole"
+    UserPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/User"
+        next_cursor:
+          type: string
+          pattern: "^[A-Za-z0-9_-]{34}$"
+
+    SessionSummary:
+      type: object
+      additionalProperties: false
+      description: Safe session metadata; clear token, token digest, CSRF digest, and user-agent digest are absent.
+      required:
+        - id
+        - created_at
+        - last_seen_at
+        - authenticated_at
+        - expires_at
+        - idle_expires_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        username:
+          type: string
+          minLength: 3
+          maxLength: 64
+        user_status:
+          $ref: "#/components/schemas/UserStatus"
+        created_at:
+          type: string
+          format: date-time
+        last_seen_at:
+          type: string
+          format: date-time
+        authenticated_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        idle_expires_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: [string, "null"]
+          format: date-time
+        revoke_reason:
+          type: string
+          enum: [logout, user, others, admin, user_disabled, role_changed, rotation, expired]
+        ip_prefix:
+          type: string
+          description: Coarsened network prefix, never a full client IP.
+          maxLength: 64
+        current:
+          type: boolean
+    SessionPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/SessionSummary"
+        next_cursor:
+          type: string
+          pattern: "^[A-Za-z0-9_-]{34}$"
+    RevokedCount:
+      type: object
+      additionalProperties: false
+      required: [revoked]
+      properties:
+        revoked:
+          type: integer
+          format: int64
+          minimum: 0
+
+    ClientType:
+      type: string
+      enum: [public, confidential]
+    ClientStatus:
+      type: string
+      enum: [active, disabled]
+    ClientAuthMethod:
+      type: string
+      enum: [none, client_secret_basic]
+    Scope:
+      type: string
+      enum: [openid, profile, email, offline_access]
+    LogoURI:
+      description: Empty to clear, otherwise an HTTPS URI or an explicitly enabled development loopback HTTP URI.
+      oneOf:
+        - type: string
+          const: ""
+        - type: string
+          format: uri
+          minLength: 1
+          maxLength: 2048
+    URIList:
+      type: array
+      maxItems: 32
+      uniqueItems: true
+      items:
+        type: string
+        format: uri
+        maxLength: 2048
+      description: HTTPS URI, except explicitly enabled loopback HTTP in development; no fragment, userinfo, or wildcard.
+    ScopeList:
+      type: array
+      minItems: 1
+      maxItems: 4
+      uniqueItems: true
+      contains:
+        const: openid
+      items:
+        $ref: "#/components/schemas/Scope"
+    Client:
+      type: object
+      additionalProperties: false
+      description: Read model. It intentionally has no clear secret, secret hash, or secret identifier field.
+      required:
+        - id
+        - client_id
+        - client_type
+        - token_endpoint_auth_method
+        - name
+        - description
+        - status
+        - registration_enabled
+        - redirect_uris
+        - logout_uris
+        - scopes
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        client_id:
+          type: string
+          pattern: "^ois_cli_[A-Za-z0-9_-]{32}$"
+        client_type:
+          $ref: "#/components/schemas/ClientType"
+        token_endpoint_auth_method:
+          $ref: "#/components/schemas/ClientAuthMethod"
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        description:
+          type: string
+          maxLength: 2048
+        logo_uri:
+          $ref: "#/components/schemas/LogoURI"
+        status:
+          $ref: "#/components/schemas/ClientStatus"
+        registration_enabled:
+          type: boolean
+        redirect_uris:
+          allOf:
+            - $ref: "#/components/schemas/URIList"
+          minItems: 1
+        logout_uris:
+          $ref: "#/components/schemas/URIList"
+        scopes:
+          $ref: "#/components/schemas/ScopeList"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    CreateClientRequest:
+      type: object
+      additionalProperties: false
+      required: [client_type, name, redirect_uris, scopes]
+      properties:
+        client_type:
+          $ref: "#/components/schemas/ClientType"
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        description:
+          type: string
+          maxLength: 2048
+        logo_uri:
+          $ref: "#/components/schemas/LogoURI"
+        registration_enabled:
+          type: boolean
+          default: false
+        redirect_uris:
+          allOf:
+            - $ref: "#/components/schemas/URIList"
+          minItems: 1
+        logout_uris:
+          $ref: "#/components/schemas/URIList"
+        scopes:
+          $ref: "#/components/schemas/ScopeList"
+    UpdateClientRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        description:
+          type: string
+          maxLength: 2048
+        logo_uri:
+          $ref: "#/components/schemas/LogoURI"
+        status:
+          $ref: "#/components/schemas/ClientStatus"
+        registration_enabled:
+          type: boolean
+        redirect_uris:
+          allOf:
+            - $ref: "#/components/schemas/URIList"
+          minItems: 1
+        logout_uris:
+          $ref: "#/components/schemas/URIList"
+        scopes:
+          $ref: "#/components/schemas/ScopeList"
+    CreatedClientResponse:
+      type: object
+      additionalProperties: false
+      required: [client]
+      properties:
+        client:
+          $ref: "#/components/schemas/Client"
+        client_secret:
+          type: string
+          pattern: "^ois_sec_v1_[A-Za-z0-9_-]{43}$"
+          writeOnly: true
+          description: One-time confidential secret returned only by successful creation; absent for public clients.
+    RotatedSecretResponse:
+      type: object
+      additionalProperties: false
+      required: [client_secret]
+      properties:
+        client_secret:
+          type: string
+          pattern: "^ois_sec_v1_[A-Za-z0-9_-]{43}$"
+          writeOnly: true
+          description: One-time replacement secret; subsequent reads contain no secret field.
+    ClientPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/Client"
+        next_cursor:
+          type: string
+          pattern: "^[A-Za-z0-9_-]{34}$"
+
+    AuditEventType:
+      type: string
+      enum:
+        - admin_bootstrap_succeeded
+        - admin_bootstrap_rejected
+        - user_registered
+        - user_registration_rejected
+        - user_created
+        - user_updated
+        - user_status_changed
+        - user_role_changed
+        - login_succeeded
+        - login_failed
+        - login_disabled_user
+        - session_created
+        - session_revoked
+        - sessions_revoked_all
+        - client_created
+        - client_updated
+        - client_disabled
+        - client_secret_rotated
+        - authorization_transaction_created
+        - authorization_transaction_consumed
+        - authorization_transaction_expired
+        - authorization_transaction_rejected
+    AuditResult:
+      type: string
+      enum: [success, rejected, failure]
+    AuditTargetType:
+      type: string
+      enum: [user, client, session, auth_transaction]
+    AuditChangedField:
+      type: string
+      enum:
+        - status
+        - role
+        - username
+        - display_name
+        - email
+        - name
+        - description
+        - logo_uri
+        - registration_enabled
+        - redirect_uris
+        - logout_uris
+        - scopes
+        - secret
+        - revoked
+        - created
+    AuditEvent:
+      type: object
+      additionalProperties: false
+      description: Fixed-schema event containing field names only, never changed values or credential material.
+      required: [id, event_type, result, changed_fields, occurred_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        event_type:
+          $ref: "#/components/schemas/AuditEventType"
+        result:
+          $ref: "#/components/schemas/AuditResult"
+        actor_user_id:
+          type: string
+          format: uuid
+        target_type:
+          $ref: "#/components/schemas/AuditTargetType"
+        target_id:
+          type: string
+          format: uuid
+        request_id:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        changed_fields:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/AuditChangedField"
+        occurred_at:
+          type: string
+          format: date-time
+    AuditPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/AuditEvent"
+        next_cursor:
+          type: string
+          pattern: "^[A-Za-z0-9_-]{34}$"
+
+  responses:
+    BadRequest:
+      description: Malformed JSON or authentication-flow syntax (`invalid_json` or `invalid_authentication_flow`).
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unauthorized:
+      description: Missing, invalid, expired, revoked, or disabled session (`authentication_required`).
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Forbidden:
+      description: CSRF/origin failure, insufficient role, or missing recent authentication.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: Resource is absent or invisible to the caller (`not_found`).
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Conflict:
+      description: Duplicate identifier, stale update, or final-administrator protection.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    UnprocessableEntity:
+      description: Structurally valid request violates a field, URI, scope, filter, or cursor rule (`invalid_input`).
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    TooManyRequests:
+      description: Bounded password-hashing capacity is temporarily unavailable (`temporarily_unavailable`).
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+        Retry-After:
+          $ref: "#/components/headers/RetryAfter"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    InternalError:
+      description: Safe internal failure with no database, stack, or credential detail (`internal_error`).
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    MethodNotAllowed:
+      description: The path exists, but the HTTP method is not supported (`method_not_allowed`).
+      headers:
+        Allow:
+          description: Supported methods for this path.
+          schema:
+            type: string
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"

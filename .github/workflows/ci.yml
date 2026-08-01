@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go quality and PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17.5-alpine3.22
+        env:
+          POSTGRES_USER: oneissuer
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: oneissuer
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U oneissuer -d oneissuer"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Go
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: 1.26.5
+          cache: true
+      - name: Install pinned tools
+        run: make tools
+      - name: Check formatting and generated code
+        run: |
+          make fmt-check generate-check
+          make generate
+          git diff --exit-code
+      - name: Verify immutable production migrations
+        run: make migration-check
+      - name: Vet and lint
+        run: |
+          go vet ./...
+          .tools/bin/golangci-lint run ./...
+      - name: Log and error privacy regression tests
+        run: go test ./internal/observability ./internal/httpserver -run 'Redact|Leak|Privacy' -count=1
+      - name: Race-enabled tests
+        run: go test -race ./...
+      - name: Dependency vulnerability scan
+        run: .tools/bin/govulncheck ./...
+      - name: Empty PostgreSQL migration
+        env:
+          ONEISSUER_DATABASE_URL: postgresql://oneissuer:ci-only-password@127.0.0.1:5432/oneissuer?sslmode=disable
+        run: |
+          go run ./cmd/oneissuer migrate up
+          go run ./cmd/oneissuer migrate up
+          go run ./cmd/oneissuer migrate status
+      - name: Build static binary
+        run: make build
+
+  fuzz:
+    name: Phase-two fuzz smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Go
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: 1.26.5
+          cache: true
+      - name: Fuzz normalization, Client input, transactions, forms, and cursors
+        env:
+          ONEISSUER_FUZZ_TIME: 2s
+        run: make fuzz-smoke
+
+  contract:
+    name: OpenAPI, docs privacy, and migration contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Node.js for pinned Redocly
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24
+      - name: Validate phase-two public contracts
+        run: make contract-check
+
+  web:
+    name: Web prototype
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Node.js
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Lint, type-check, and build
+        run: npm run check
+      - name: Audit high-severity dependencies
+        run: npm audit --audit-level=high --fetch-retries=5 --fetch-retry-mintimeout=1000 --fetch-retry-maxtimeout=10000 --fetch-timeout=30000
+
+  container:
+    name: Non-root image and Compose smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build image
+        run: |
+          docker build \
+            --build-arg VERSION=v0.1.0-dev.2 \
+            --build-arg COMMIT="${GITHUB_SHA}" \
+            --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t oneissuer:ci -t oneissuer:v0.1.0-dev.2 .
+      - name: Verify configured and effective non-root user
+        run: |
+          test "$(docker image inspect oneissuer:ci --format '{{.Config.User}}')" = "65532:65532"
+          docker run --rm --entrypoint /bin/sh oneissuer:ci -c 'test "$(id -u)" = "65532"'
+      - name: Phase-two empty-volume Compose acceptance
+        run: |
+          cp .env.example .env
+          ./scripts/smoke-compose.sh
+      - name: Scan High and Critical image vulnerabilities
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v trivy-cache:/root/.cache/trivy \
+            aquasec/trivy:0.69.3 image \
+            --scanners vuln --exit-code 1 --ignore-unfixed --severity HIGH,CRITICAL \
+            oneissuer:v0.1.0-dev.2

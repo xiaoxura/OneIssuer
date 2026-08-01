@@ -1,0 +1,30 @@
+{{- /* Embedded, dependency-free authentication form. html/template escapes every field. */ -}}
+<!doctype html>
+<html lang="{{.Lang}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+</head>
+<body>
+  <main>
+    <h1>{{.Title}}</h1>
+    {{if .ErrorCode}}<p role="alert" data-error-code="{{.ErrorCode}}">{{.ErrorMessage}}</p>{{end}}
+    <form method="post" action="{{.Action}}" autocomplete="on">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <input type="hidden" name="transaction" value="{{.TransactionToken}}">
+      {{if .Register}}
+      <label>{{.UsernameLabel}} <input name="username" autocomplete="username" required maxlength="128"></label>
+      <label>{{.DisplayNameLabel}} <input name="display_name" autocomplete="name" maxlength="256"></label>
+      <label>{{.EmailLabel}} <input name="email" type="email" autocomplete="email" required maxlength="320"></label>
+      <label>{{.PasswordLabel}} <input name="password" type="password" autocomplete="new-password" required maxlength="4096"></label>
+      {{else}}
+      <label>{{.IdentifierLabel}} <input name="identifier" autocomplete="username" required maxlength="320"></label>
+      <label>{{.PasswordLabel}} <input name="password" type="password" autocomplete="current-password" required maxlength="4096"></label>
+      {{end}}
+      <button type="submit">{{.SubmitLabel}}</button>
+    </form>
+    <p><a href="{{.SwitchURL}}">{{.SwitchLabel}}</a></p>
+  </main>
+</body>
+</html>

@@ -1,0 +1,35 @@
+name: Feature request
+description: Propose a scoped product or engineering improvement
+title: "proposal: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the user/operator problem, not only a preferred implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed outcome
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and alternatives
+      description: Explain phase impact, security/privacy, and why existing boundaries are insufficient.
+    validations:
+      required: true
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Product boundaries
+      options:
+        - label: I considered the single-Issuer/non-multi-tenant boundary.
+          required: true
+        - label: This request does not present mock or placeholder behavior as implemented security functionality.
+          required: true
+

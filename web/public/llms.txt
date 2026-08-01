@@ -1,0 +1,14 @@
+# OneIssuer
+
+> OneIssuer is a lightweight, self-hosted OpenID Connect provider for developers and small teams.
+
+## UI Prototype
+
+- [Hosted sign-in](/login), [registration](/register), and [consent](/consent)
+- [Administration console](/admin)
+- This preview uses mock data and does not perform real authentication or issue tokens.
+
+## Documentation
+
+- Backend design: `/docs/go-backend-design.md`
+- UI design: `/docs/ui-design.md`

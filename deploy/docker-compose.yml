@@ -1,0 +1,102 @@
+name: oneissuer
+
+x-oneissuer-build: &oneissuer-build
+  context: ..
+  dockerfile: Dockerfile
+  args:
+    VERSION: ${ONEISSUER_VERSION:-v0.1.0-dev.2}
+    COMMIT: ${ONEISSUER_COMMIT:-local}
+    BUILD_TIME: ${ONEISSUER_BUILD_TIME:-local}
+
+services:
+  postgres:
+    image: postgres:17.5-alpine3.22
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-oneissuer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-oneissuer-local-only}
+      POSTGRES_DB: ${POSTGRES_DB:-oneissuer}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    restart: unless-stopped
+
+  migrate:
+    build: *oneissuer-build
+    image: oneissuer:${ONEISSUER_VERSION:-v0.1.0-dev.2}
+    command: ["migrate", "up"]
+    environment:
+      ONEISSUER_DATABASE_URL: postgresql://${POSTGRES_USER:-oneissuer}:${POSTGRES_PASSWORD:-oneissuer-local-only}@postgres:5432/${POSTGRES_DB:-oneissuer}?sslmode=disable
+      ONEISSUER_DATABASE_MAX_CONNS: ${ONEISSUER_DATABASE_MAX_CONNS:-10}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  oneissuer:
+    build: *oneissuer-build
+    image: oneissuer:${ONEISSUER_VERSION:-v0.1.0-dev.2}
+    environment:
+      ONEISSUER_ENV: ${ONEISSUER_ENV:-development}
+      ONEISSUER_ISSUER: ${ONEISSUER_ISSUER:-http://localhost:8080}
+      ONEISSUER_HTTP_ADDR: :8080
+      ONEISSUER_DATABASE_URL: postgresql://${POSTGRES_USER:-oneissuer}:${POSTGRES_PASSWORD:-oneissuer-local-only}@postgres:5432/${POSTGRES_DB:-oneissuer}?sslmode=disable
+      ONEISSUER_DATABASE_MAX_CONNS: ${ONEISSUER_DATABASE_MAX_CONNS:-10}
+      ONEISSUER_LOG_LEVEL: ${ONEISSUER_LOG_LEVEL:-info}
+      ONEISSUER_LOG_FORMAT: ${ONEISSUER_LOG_FORMAT:-json}
+      ONEISSUER_SHUTDOWN_TIMEOUT: ${ONEISSUER_SHUTDOWN_TIMEOUT:-15s}
+      ONEISSUER_HTTP_READ_HEADER_TIMEOUT: ${ONEISSUER_HTTP_READ_HEADER_TIMEOUT:-5s}
+      ONEISSUER_HTTP_READ_TIMEOUT: ${ONEISSUER_HTTP_READ_TIMEOUT:-10s}
+      ONEISSUER_HTTP_WRITE_TIMEOUT: ${ONEISSUER_HTTP_WRITE_TIMEOUT:-30s}
+      ONEISSUER_HTTP_IDLE_TIMEOUT: ${ONEISSUER_HTTP_IDLE_TIMEOUT:-60s}
+      ONEISSUER_HTTP_MAX_HEADER_BYTES: ${ONEISSUER_HTTP_MAX_HEADER_BYTES:-1048576}
+      ONEISSUER_TRUSTED_PROXIES: ${ONEISSUER_TRUSTED_PROXIES:-}
+      ONEISSUER_COOKIE_NAME: ${ONEISSUER_COOKIE_NAME:-oneissuer_session}
+      ONEISSUER_COOKIE_SECURE: ${ONEISSUER_COOKIE_SECURE:-false}
+      ONEISSUER_SESSION_TTL: ${ONEISSUER_SESSION_TTL:-24h}
+      ONEISSUER_SESSION_IDLE_TIMEOUT: ${ONEISSUER_SESSION_IDLE_TIMEOUT:-2h}
+      ONEISSUER_CSRF_TTL: ${ONEISSUER_CSRF_TTL:-15m}
+      ONEISSUER_AUTH_TRANSACTION_TTL: ${ONEISSUER_AUTH_TRANSACTION_TTL:-10m}
+      ONEISSUER_LOGIN_REAUTH_WINDOW: ${ONEISSUER_LOGIN_REAUTH_WINDOW:-15m}
+      ONEISSUER_CLEANUP_INTERVAL: ${ONEISSUER_CLEANUP_INTERVAL:-5m}
+      ONEISSUER_REGISTRATION_ENABLED: ${ONEISSUER_REGISTRATION_ENABLED:-false}
+      ONEISSUER_PASSWORD_MIN_LENGTH: ${ONEISSUER_PASSWORD_MIN_LENGTH:-15}
+      ONEISSUER_PASSWORD_MAX_BYTES: ${ONEISSUER_PASSWORD_MAX_BYTES:-1024}
+      ONEISSUER_ARGON2_MEMORY_KIB: ${ONEISSUER_ARGON2_MEMORY_KIB:-65536}
+      ONEISSUER_ARGON2_TIME: ${ONEISSUER_ARGON2_TIME:-3}
+      ONEISSUER_ARGON2_THREADS: ${ONEISSUER_ARGON2_THREADS:-2}
+      ONEISSUER_ARGON2_MAX_CONCURRENT: ${ONEISSUER_ARGON2_MAX_CONCURRENT:-2}
+    ports:
+      - "127.0.0.1:${ONEISSUER_HTTP_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -T 2 -O - http://127.0.0.1:8080/health/ready >/dev/null || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    # Leave the container runtime a small margin beyond the app's 15s default
+    # so OneIssuer, rather than SIGKILL, owns timeout reporting.
+    stop_grace_period: ${ONEISSUER_CONTAINER_STOP_GRACE_PERIOD:-20s}
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

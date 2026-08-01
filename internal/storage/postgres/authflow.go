@@ -1,0 +1,113 @@
+package postgres
+
+import (
+	"context"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/oneissuer/oneissuer/internal/audit"
+	"github.com/oneissuer/oneissuer/internal/authflow"
+	"github.com/oneissuer/oneissuer/internal/storage/postgres/sqlcgen"
+)
+
+// CreateAuthTransaction atomically inserts a transaction and audit event.
+func (s *Store) CreateAuthTransaction(ctx context.Context, transaction authflow.Transaction, event audit.Event) error {
+	return s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
+		if err := queries.CreateAuthTransaction(ctx, authTransactionParams(transaction)); err != nil {
+			return wrapError("create authorization transaction", ErrorKindQuery, err)
+		}
+		return insertAudit(ctx, queries, event)
+	})
+}
+
+// FindAuthTransaction resolves a transaction by opaque-token digest.
+func (s *Store) FindAuthTransaction(ctx context.Context, tokenHash []byte) (authflow.Transaction, error) {
+	row, err := s.queries.GetAuthTransactionByTokenHash(ctx, tokenHash)
+	if isNoRows(err) {
+		return authflow.Transaction{}, authflow.ErrNotFound
+	}
+	if err != nil {
+		return authflow.Transaction{}, wrapError("find authorization transaction", ErrorKindQuery, err)
+	}
+	return mapAuthTransaction(row), nil
+}
+
+// ConsumeAuthTransaction marks a transaction used once and appends audit atomically.
+func (s *Store) ConsumeAuthTransaction(ctx context.Context, id uuid.UUID, now time.Time, event audit.Event) (authflow.Transaction, error) {
+	var result authflow.Transaction
+	err := s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
+		row, err := queries.ConsumeAuthTransaction(ctx, sqlcgen.ConsumeAuthTransactionParams{ConsumedAt: timestamp(now), ID: id})
+		if isNoRows(err) {
+			return authflow.ErrConsumed
+		}
+		if err != nil {
+			return wrapError("consume authorization transaction", ErrorKindQuery, err)
+		}
+		if err := insertAudit(ctx, queries, event); err != nil {
+			return err
+		}
+		result = mapAuthTransaction(row)
+		return nil
+	})
+	return result, err
+}
+
+// ExpireAuthTransactions marks elapsed live transactions expired.
+func (s *Store) ExpireAuthTransactions(ctx context.Context, now time.Time) (int64, error) {
+	var count int64
+	err := s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
+		ids, err := queries.ExpireAuthTransactions(ctx, timestamp(now))
+		if err != nil {
+			return wrapError("expire authorization transactions", ErrorKindQuery, err)
+		}
+		for _, id := range ids {
+			event, eventErr := audit.New(audit.AuthorizationTransactionExpired, audit.ResultSuccess, nil, audit.TargetAuthTransaction, &id, "", nil, now)
+			if eventErr != nil {
+				return eventErr
+			}
+			if err := insertAudit(ctx, queries, event); err != nil {
+				return err
+			}
+		}
+		count = int64(len(ids))
+		return nil
+	})
+	return count, err
+}
+
+// CleanupAuthTransactions deletes terminal transactions older than the cutoff.
+func (s *Store) CleanupAuthTransactions(ctx context.Context, cutoff time.Time) (int64, error) {
+	count, err := s.queries.DeleteRetiredAuthTransactions(ctx, timestamp(cutoff))
+	if err != nil {
+		return 0, wrapError("clean authorization transactions", ErrorKindQuery, err)
+	}
+	return count, nil
+}
+
+func authTransactionParams(value authflow.Transaction) sqlcgen.CreateAuthTransactionParams {
+	return sqlcgen.CreateAuthTransactionParams{
+		ID: value.ID, TokenHash: value.TokenHash, TransactionKind: string(value.Kind), ClientID: value.ClientID,
+		RedirectUri: pointerString(value.RedirectURI), Scopes: value.Scopes,
+		PkceChallenge: pointerString(value.PKCEChallenge), PkceMethod: pointerString(value.PKCEMethod),
+		StateValue: pointerString(value.State), NonceValue: pointerString(value.Nonce), PromptCreate: value.PromptCreate,
+		CreatedAt: timestamp(value.CreatedAt), ExpiresAt: timestamp(value.ExpiresAt),
+	}
+}
+
+func mapAuthTransaction(row sqlcgen.AuthTransaction) authflow.Transaction {
+	return authflow.Transaction{
+		ID: row.ID, TokenHash: row.TokenHash, Kind: authflow.Kind(row.TransactionKind), ClientID: row.ClientID,
+		RedirectURI: valueString(row.RedirectUri), Scopes: row.Scopes, PKCEChallenge: valueString(row.PkceChallenge),
+		PKCEMethod: valueString(row.PkceMethod), State: valueString(row.StateValue), Nonce: valueString(row.NonceValue),
+		PromptCreate: row.PromptCreate, CreatedAt: requiredTime(row.CreatedAt), ExpiresAt: requiredTime(row.ExpiresAt),
+		ConsumedAt: optionalTime(row.ConsumedAt), FailureReason: valueString(row.FailureReason),
+	}
+}
+
+func valueString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}

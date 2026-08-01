@@ -1,0 +1,6 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Private security report
+    url: https://github.com/oneissuer/oneissuer/security/advisories/new
+    about: Never disclose an unfixed vulnerability in a public issue.
+

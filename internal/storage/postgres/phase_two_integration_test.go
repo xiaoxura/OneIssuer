@@ -615,6 +615,50 @@ func testPhaseThreeAuthorizationLifecycle(ctx context.Context, t *testing.T, sto
 		}
 		return issued
 	}
+	assertIssueRolledBack := func(transactionValue authflow.Transaction, label string) {
+		t.Helper()
+		var intact bool
+		if err := database.QueryRowContext(ctx, `
+				SELECT txrow.consumed_at IS NULL
+				       AND NOT EXISTS (SELECT 1 FROM authorization_codes WHERE auth_transaction_id=txrow.id)
+				FROM auth_transactions AS txrow WHERE txrow.id=$1`, transactionValue.ID).Scan(&intact); err != nil {
+			t.Fatalf("inspect %s authorization rollback: %v", label, err)
+		}
+		if !intact {
+			t.Fatalf("%s authorization failure consumed its transaction or created a Code", label)
+		}
+	}
+
+	userPageTransaction := createTransactionFor(createdClient.Client, []string{"openid"}, "p3-user-disabled-before-issue", base.Add(11*time.Second+100*time.Millisecond))
+	if _, err := database.ExecContext(ctx, `UPDATE users SET status='disabled', updated_at=$2 WHERE id=$1`, principal.User.ID, base.Add(11*time.Second+150*time.Millisecond)); err != nil {
+		t.Fatalf("disable User before Code issue: %v", err)
+	}
+	if issued, issueErr := services.authorization.Issue(ctx, userPageTransaction, principal.User.ID, principal.AuthenticatedAt, true, "p3-user-disabled-before-issue", base.Add(11*time.Second+200*time.Millisecond)); !errors.Is(issueErr, authorization.ErrInactive) || issued.Code != "" {
+		t.Fatalf("disabled User Code issue=%+v error=%v", issued, issueErr)
+	}
+	assertIssueRolledBack(userPageTransaction, "disabled User")
+	if _, err := database.ExecContext(ctx, `UPDATE users SET status='active', updated_at=$2 WHERE id=$1`, principal.User.ID, base.Add(11*time.Second+300*time.Millisecond)); err != nil {
+		t.Fatalf("restore User after failed Code issue: %v", err)
+	}
+	if issued, issueErr := services.authorization.Issue(ctx, userPageTransaction, principal.User.ID, principal.AuthenticatedAt, true, "p3-user-restored-before-issue", base.Add(11*time.Second+400*time.Millisecond)); issueErr != nil || issued.Code == "" {
+		t.Fatalf("User-disabled transaction did not recover: issued=%+v error=%v", issued, issueErr)
+	}
+
+	clientPageTransaction := createTransactionFor(createdClient.Client, []string{"openid"}, "p3-client-disabled-before-issue", base.Add(11*time.Second+500*time.Millisecond))
+	if _, err := database.ExecContext(ctx, `UPDATE oidc_clients SET status='disabled', updated_at=$2 WHERE id=$1`, createdClient.Client.ID, base.Add(11*time.Second+550*time.Millisecond)); err != nil {
+		t.Fatalf("disable Client before Code issue: %v", err)
+	}
+	if issued, issueErr := services.authorization.Issue(ctx, clientPageTransaction, principal.User.ID, principal.AuthenticatedAt, true, "p3-client-disabled-before-issue", base.Add(11*time.Second+600*time.Millisecond)); !errors.Is(issueErr, authorization.ErrInactive) || issued.Code != "" {
+		t.Fatalf("disabled Client Code issue=%+v error=%v", issued, issueErr)
+	}
+	assertIssueRolledBack(clientPageTransaction, "disabled Client")
+	if _, err := database.ExecContext(ctx, `UPDATE oidc_clients SET status='active', updated_at=$2 WHERE id=$1`, createdClient.Client.ID, base.Add(11*time.Second+700*time.Millisecond)); err != nil {
+		t.Fatalf("restore Client after failed Code issue: %v", err)
+	}
+	if issued, issueErr := services.authorization.Issue(ctx, clientPageTransaction, principal.User.ID, principal.AuthenticatedAt, true, "p3-client-restored-before-issue", base.Add(11*time.Second+800*time.Millisecond)); issueErr != nil || issued.Code == "" {
+		t.Fatalf("Client-disabled transaction did not recover: issued=%+v error=%v", issued, issueErr)
+	}
+
 	exchangeIssued := func(issued authorization.Issued, clientValue clientdomain.Client, redirect, requestID, verifierValue string, at time.Time, service *tokendomain.Service) (tokendomain.Response, error) {
 		hash, digestErr := authorization.DigestPresentedCode(issued.Code)
 		if digestErr != nil {
@@ -636,6 +680,98 @@ func testPhaseThreeAuthorizationLifecycle(ctx context.Context, t *testing.T, sto
 	}
 	if response, exchangeErr := exchangeIssued(rollbackCode, createdClient.Client, createdClient.Client.RedirectURIs[0], "p3-after-signer-failure", verifier, base.Add(17*time.Second), protocolTokens); exchangeErr != nil || response.AccessToken == "" {
 		t.Fatalf("Code did not roll back after signer failure: response=%+v error=%v", response, exchangeErr)
+	}
+
+	assertFailedExchangeRolledBack := func(issued authorization.Issued, requestID, failureKind string) {
+		t.Helper()
+		hash, digestErr := authorization.DigestPresentedCode(issued.Code)
+		if digestErr != nil {
+			t.Fatalf("digest %s rollback Code: %v", failureKind, digestErr)
+		}
+		var unconsumed bool
+		var accessMetadata, exchangeAudits int
+		if queryErr := database.QueryRowContext(ctx, `
+				SELECT code.consumed_at IS NULL,
+				       (SELECT count(*)::int FROM access_tokens WHERE authorization_code_id=code.id),
+				       (SELECT count(*)::int FROM audit_events WHERE request_id=$2)
+				FROM authorization_codes AS code WHERE code.code_hash=$1`, hash, requestID).Scan(&unconsumed, &accessMetadata, &exchangeAudits); queryErr != nil {
+			t.Fatalf("inspect %s rollback: %v", failureKind, queryErr)
+		}
+		if !unconsumed || accessMetadata != 0 || exchangeAudits != 0 {
+			t.Fatalf("%s rollback unconsumed=%v access_metadata=%d audits=%d", failureKind, unconsumed, accessMetadata, exchangeAudits)
+		}
+	}
+
+	auditRollbackCode := issueFor(createdClient.Client, []string{"openid"}, "p3-audit-rollback", base.Add(18*time.Second))
+	if _, err := database.ExecContext(ctx, `
+		CREATE FUNCTION oneissuer_test_reject_exchange_audit() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.request_id = 'p3-audit-failure' THEN
+				RAISE EXCEPTION 'injected audit insert failure';
+			END IF;
+			RETURN NEW;
+		END
+		$$`); err != nil {
+		t.Fatalf("create Audit failure trigger function: %v", err)
+	}
+	if _, err := database.ExecContext(ctx, `
+		CREATE TRIGGER oneissuer_test_reject_exchange_audit
+		BEFORE INSERT ON audit_events
+		FOR EACH ROW EXECUTE FUNCTION oneissuer_test_reject_exchange_audit()`); err != nil {
+		t.Fatalf("create Audit failure trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = database.ExecContext(context.Background(), `DROP TRIGGER IF EXISTS oneissuer_test_reject_exchange_audit ON audit_events`)
+		_, _ = database.ExecContext(context.Background(), `DROP FUNCTION IF EXISTS oneissuer_test_reject_exchange_audit()`)
+	})
+	if response, exchangeErr := exchangeIssued(auditRollbackCode, createdClient.Client, createdClient.Client.RedirectURIs[0], "p3-audit-failure", verifier, base.Add(20*time.Second), protocolTokens); exchangeErr == nil || response != (tokendomain.Response{}) {
+		t.Fatalf("Audit failure response=%+v error=%v", response, exchangeErr)
+	}
+	assertFailedExchangeRolledBack(auditRollbackCode, "p3-audit-failure", "Audit failure")
+	if _, err := database.ExecContext(ctx, `DROP TRIGGER oneissuer_test_reject_exchange_audit ON audit_events`); err != nil {
+		t.Fatalf("drop Audit failure trigger: %v", err)
+	}
+	if _, err := database.ExecContext(ctx, `DROP FUNCTION oneissuer_test_reject_exchange_audit()`); err != nil {
+		t.Fatalf("drop Audit failure trigger function: %v", err)
+	}
+	if response, exchangeErr := exchangeIssued(auditRollbackCode, createdClient.Client, createdClient.Client.RedirectURIs[0], "p3-after-audit-failure", verifier, base.Add(21*time.Second), protocolTokens); exchangeErr != nil || response.AccessToken == "" {
+		t.Fatalf("Code did not roll back after Audit failure: response=%+v error=%v", response, exchangeErr)
+	}
+
+	commitRollbackCode := issueFor(createdClient.Client, []string{"openid"}, "p3-commit-rollback", base.Add(22*time.Second))
+	if _, err := database.ExecContext(ctx, `
+		CREATE FUNCTION oneissuer_test_reject_exchange_commit() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			RAISE EXCEPTION 'injected deferred commit failure';
+		END
+		$$`); err != nil {
+		t.Fatalf("create Commit failure trigger function: %v", err)
+	}
+	if _, err := database.ExecContext(ctx, `
+		CREATE CONSTRAINT TRIGGER oneissuer_test_reject_exchange_commit
+		AFTER INSERT ON access_tokens
+		DEFERRABLE INITIALLY DEFERRED
+		FOR EACH ROW EXECUTE FUNCTION oneissuer_test_reject_exchange_commit()`); err != nil {
+		t.Fatalf("create deferred Commit failure trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = database.ExecContext(context.Background(), `DROP TRIGGER IF EXISTS oneissuer_test_reject_exchange_commit ON access_tokens`)
+		_, _ = database.ExecContext(context.Background(), `DROP FUNCTION IF EXISTS oneissuer_test_reject_exchange_commit()`)
+	})
+	if response, exchangeErr := exchangeIssued(commitRollbackCode, createdClient.Client, createdClient.Client.RedirectURIs[0], "p3-commit-failure", verifier, base.Add(24*time.Second), protocolTokens); exchangeErr == nil || response != (tokendomain.Response{}) {
+		t.Fatalf("Commit failure response=%+v error=%v", response, exchangeErr)
+	}
+	assertFailedExchangeRolledBack(commitRollbackCode, "p3-commit-failure", "Commit failure")
+	if _, err := database.ExecContext(ctx, `DROP TRIGGER oneissuer_test_reject_exchange_commit ON access_tokens`); err != nil {
+		t.Fatalf("drop deferred Commit failure trigger: %v", err)
+	}
+	if _, err := database.ExecContext(ctx, `DROP FUNCTION oneissuer_test_reject_exchange_commit()`); err != nil {
+		t.Fatalf("drop Commit failure trigger function: %v", err)
+	}
+	if response, exchangeErr := exchangeIssued(commitRollbackCode, createdClient.Client, createdClient.Client.RedirectURIs[0], "p3-after-commit-failure", verifier, base.Add(25*time.Second), protocolTokens); exchangeErr != nil || response.AccessToken == "" {
+		t.Fatalf("Code did not roll back after Commit failure: response=%+v error=%v", response, exchangeErr)
 	}
 
 	bindingCode := issueFor(createdClient.Client, []string{"openid"}, "p3-binding-code", base.Add(18*time.Second))
@@ -775,6 +911,7 @@ func testPhaseThreeAuthorizationLifecycle(ctx context.Context, t *testing.T, sto
 	}
 	reopened.Close()
 
+	testProtocolCleanupRollback(ctx, t, store, database, base.Add(48*time.Hour))
 	if cleaned, cleanupErr := store.CleanupProtocolArtifacts(ctx, base.Add(48*time.Hour)); cleanupErr != nil || cleaned == 0 {
 		t.Fatalf("protocol cleanup count=%d error=%v", cleaned, cleanupErr)
 	}

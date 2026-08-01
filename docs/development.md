@@ -143,13 +143,15 @@ build metadata or a Docker build argument.
   authentication; JWT claims/signatures; UserInfo; audit/privacy; metrics;
   request IDs; proxy trust; panic recovery; and shutdown bounds;
 - real PostgreSQL/Testcontainers tests cover all ten production migrations,
-  version-5 upgrade semantics, identity/Client/Session/Audit lifecycle,
-  transaction/Grant/Code atomicity, concurrent approval and exchange, disabled
-  User/Client checks, audit/signing failure rollback, retention, and reopen
+  a populated version-5 authority upgrade, identity/Client/Session/Audit
+  lifecycle, transaction/Grant/Code atomicity, concurrent approval and
+  exchange, mid-flow disabled User/Client checks, signer/Audit/deferred-Commit
+  rollback, canceled/deadline cleanup rollback, retention, and reopen
   persistence;
 - `scripts/smoke-compose.sh` exercises an empty volume, explicit migration,
-  Bootstrap, Public A and Confidential B, `prompt=create`, Session reuse,
-  separate Consent, S256 exchange, ID Token/UserInfo, replay/concurrency,
+  Bootstrap, Public A and Confidential B, `prompt=create/none/login/consent`,
+  Session reuse/rotation, separate Consent, S256 exchange, ID Token/UserInfo,
+  missing/wrong verifier and real Code expiry, replay/concurrent metadata,
   disabled principals, restart, database outage/recovery, privacy surfaces,
   non-root/read-only containers, and graceful shutdown;
 - `conformance/phase-3/` records the pinned, applicable non-certification OpenID

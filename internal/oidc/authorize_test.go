@@ -74,6 +74,43 @@ func TestParseAuthorizationRequestValidProfile(t *testing.T) {
 	}
 }
 
+func TestParseAuthorizationRequestAcceptsOnlyFrozenPromptCombinations(t *testing.T) {
+	t.Parallel()
+
+	resolver, base := validAuthorizeFixture()
+	tests := []struct {
+		name string
+		raw  string
+		want []string
+	}{
+		{name: "missing"},
+		{name: "none", raw: "none", want: []string{"none"}},
+		{name: "login", raw: "login", want: []string{"login"}},
+		{name: "consent", raw: "consent", want: []string{"consent"}},
+		{name: "create", raw: "create", want: []string{"create"}},
+		{name: "login consent", raw: "login consent", want: []string{"consent", "login"}},
+		{name: "create consent", raw: "create consent", want: []string{"consent", "create"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			values := cloneValues(base)
+			if test.raw == "" {
+				values.Del("prompt")
+			} else {
+				values.Set("prompt", test.raw)
+			}
+			request, err := ParseAuthorizationRequest(context.Background(), values.Encode(), resolver)
+			if err != nil {
+				t.Fatalf("ParseAuthorizationRequest(prompt=%q) error = %v", test.raw, err)
+			}
+			if got := request.Prompts.Values(); !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("prompt=%q canonical values=%v, want %v", test.raw, got, test.want)
+			}
+		})
+	}
+}
+
 func TestAuthorizationRedirectTrustBoundary(t *testing.T) {
 	t.Parallel()
 

@@ -74,3 +74,33 @@ func TestMetricsPreinitializeBoundedOIDCMatrix(t *testing.T) {
 		t.Errorf("metric family %q is missing before protocol traffic", name)
 	}
 }
+
+func TestOIDCMetricsFoldUnrecognizedLabelsWithoutLeakingInput(t *testing.T) {
+	t.Parallel()
+
+	metrics := NewMetrics(NewBuildInfo("test", "commit", "now"))
+	const operationCanary = "client-controlled-operation-canary"
+	const resultCanary = "client-controlled-result-canary"
+	metrics.Authorization(operationCanary, resultCanary)
+	metrics.Token(operationCanary, resultCanary)
+
+	if value := testutil.ToFloat64(metrics.authorizations.WithLabelValues("other", "other")); value != 1 {
+		t.Fatalf("folded authorization counter = %v, want 1", value)
+	}
+	if value := testutil.ToFloat64(metrics.tokenOperations.WithLabelValues("other", "other")); value != 1 {
+		t.Fatalf("folded token counter = %v, want 1", value)
+	}
+	families, err := metrics.Gatherer().Gather()
+	if err != nil {
+		t.Fatalf("Gather() error = %v", err)
+	}
+	for _, family := range families {
+		for _, metric := range family.GetMetric() {
+			for _, label := range metric.GetLabel() {
+				if label.GetValue() == operationCanary || label.GetValue() == resultCanary {
+					t.Fatalf("metric %q leaked a client-controlled label: %s=%q", family.GetName(), label.GetName(), label.GetValue())
+				}
+			}
+		}
+	}
+}

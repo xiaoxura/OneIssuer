@@ -99,6 +99,14 @@ safely makes old phase-two authorization transactions terminal; they cannot be
 resumed because they lack the new frozen context. Users, credentials, Sessions,
 Clients, and Audit history remain in their original authoritative tables.
 
+The PostgreSQL suite builds a real schema-5 authority from the production
+00001–00005 migration bytes, inserts representative User/Credential, Public
+Client children, active Session, pre-auth state, Audit, and legacy authorization
+rows, and then applies the production schema-10 upgrade twice. It verifies exact
+authority preservation through both SQL and the login, Client, Session, and
+authorization services; the legacy authorization is safely terminal after the
+upgrade.
+
 New sqlc sources are `queries/authorization.sql`, `queries/consent.sql`, and
 `queries/token.sql`. Expected schema version is 10.
 
@@ -114,7 +122,17 @@ not deleted by application cleanup.
   Code consumption, and Audit commit in one transaction;
 - concurrent approval produces at most one Code;
 - concurrent Code exchange commits at most one Token Response state;
+- disabling either the User or Client while an authorization page is open
+  leaves the transaction unconsumed with no Code; restoring authority allows
+  that same live transaction to complete only after every check passes again;
 - signing, Audit, database, or commit failure leaves no partial authority;
+- real PostgreSQL trigger injection covers Audit insertion failure and a
+  deferred constraint-trigger failure at Commit, after minting has begun; both
+  leave the Code unconsumed with zero Access metadata/Audit rows, and the same
+  Code can succeed after the fault is removed;
+- cleanup cancellation (the shutdown path) and an operation deadline are
+  injected after Access metadata deletion but before Code deletion; both roll
+  the transaction back without a partial cleanup;
 - consumed-Code replay Audit is bounded to at most one rejection row per Code.
 
 HTTP response delivery remains at-most-once. If commit succeeds but the Client
@@ -243,14 +261,14 @@ authoritative repeat on push and pull requests.
 | --- | --- | --- |
 | Module, formatting, and whitespace | `GOPROXY='https://goproxy.cn,direct' go mod tidy`; `make fmt-check`; `git diff --check` | **PASS** — tidy produced no unexpected dependency change and all Go/whitespace checks passed |
 | Unit and race tests | `go test ./...`; `go test -race ./...` | **PASS** — every package passed, including the strict example RP and PostgreSQL suites |
-| Real PostgreSQL | `go test -run '^TestPostgresIntegration$' -count=1 ./internal/storage/postgres` | **PASS** — migration, upgrade, transaction, concurrency, restart, outage, and recovery contracts passed |
+| Real PostgreSQL | `go test -run '^TestPostgresIntegration$' -count=1 ./internal/storage/postgres` | **PASS** — real schema-5→10 authority upgrade, signer/Audit/deferred-Commit rollback, canceled/deadline cleanup rollback, concurrency, restart, outage, and recovery contracts passed |
 | Vet, lint, and bounded Fuzz | `go vet ./...`; `.tools/bin/golangci-lint run ./...`; `ONEISSUER_FUZZ_TIME=1s ./scripts/fuzz-smoke.sh` | **PASS** — golangci-lint `v2.12.2` reported `0 issues`; all 11 Fuzz targets passed |
 | Reachable Go vulnerabilities | `GOTELEMETRY=off .tools/bin/govulncheck ./...` | **PASS** — 0 reachable vulnerabilities; the non-reachable imported-package/module advisories remain documented in the dependency Spike |
 | Schema and generated code | `./scripts/check-migrations.sh`; `./scripts/check-generated.sh "$PWD/.tools/bin/sqlc"` | **PASS** — migrations 1–10 matched, including unchanged 1–5 checksums, and sqlc regeneration had no drift |
 | Privacy and recorded evidence | `./scripts/check-sensitive-examples.sh`; `./scripts/check-conformance-record.py` | **PASS** — examples were secret-free and the committed matrix/result digests validated |
 | Workflow, docs, and OpenAPI | `make workflow-check`; `./scripts/check-doc-links.py`; `REDOCLY_VERSION=2.43.2 ./scripts/check-openapi.sh` | **PASS** — actionlint `v1.7.7` reported no issue, 83 links across 31 Markdown files resolved, and OpenAPI 3.1 validated |
 | Web prototype | `cd web && npm ci && npm run check && npm audit --audit-level=high ...` | **PASS** — oxlint, TypeScript, and Vite passed; npm reported 0 vulnerabilities |
-| Compose configuration and E2E | `docker compose -f deploy/docker-compose.yml config --quiet`; `ONEISSUER_BUILD_GOPROXY='https://goproxy.cn,direct' make phase-3-smoke` | **PASS** — empty-volume migration/Bootstrap, both S256 Client profiles, registration, Consent/SSO, Token/UserInfo, negative/concurrent/restart/privacy/outage/graceful-shutdown checks passed |
+| Compose configuration and E2E | `docker compose -f deploy/docker-compose.yml config --quiet`; `ONEISSUER_BUILD_GOPROXY='https://goproxy.cn,direct' make phase-3-smoke` | **PASS** — empty-volume migration/Bootstrap, both S256 Client profiles, prompt/Consent/SSO, missing/wrong verifier, real Code expiry, wrong Secret/replay, exact concurrent metadata, disabled authority, restart/privacy/outage/graceful-shutdown checks passed |
 | Final image supply chain | `make container-check` | **PASS** — CycloneDX SBOM validated 162 components, private key material was absent, and pinned Trivy found no fixable High/Critical image vulnerability |
 | Static binary metadata | `make build`; `./bin/oneissuer version` | **PASS** — static build reported `v0.1.0-dev.3` with Go `1.26.5` |
 | Final repository review | `git diff --check`; `git status`; ignored-artifact and sensitive-pattern review | **PASS** — no tracked private JWK/JWKS, runtime Client Secret, raw Conformance export, `.env`, or generated supply-chain artifact is included |

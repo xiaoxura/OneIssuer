@@ -104,6 +104,10 @@ func TestPostgresIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("real phase two authority upgrades safely to phase three", func(t *testing.T) {
+		testPhaseTwoUpgrade(ctx, t, databaseURL)
+	})
+
 	t.Run("test-only migration supports down and up", func(t *testing.T) {
 		database := openSQLDatabase(ctx, t, databaseURL)
 		defer func() { _ = database.Close() }()

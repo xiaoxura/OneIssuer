@@ -13,11 +13,15 @@ import (
 
 type Querier interface {
 	ConsumeAuthTransaction(ctx context.Context, arg ConsumeAuthTransactionParams) (AuthTransaction, error)
+	ConsumeAuthorizationCode(ctx context.Context, arg ConsumeAuthorizationCodeParams) (AuthorizationCode, error)
 	ConsumePreAuthSession(ctx context.Context, arg ConsumePreAuthSessionParams) (uuid.UUID, error)
 	CountActiveAdmins(ctx context.Context) (int64, error)
 	CountActiveLoginSessions(ctx context.Context, now pgtype.Timestamptz) (int64, error)
+	CreateAccessToken(ctx context.Context, arg CreateAccessTokenParams) error
 	CreateAuditEvent(ctx context.Context, arg CreateAuditEventParams) error
 	CreateAuthTransaction(ctx context.Context, arg CreateAuthTransactionParams) error
+	CreateAuthorizationCode(ctx context.Context, arg CreateAuthorizationCodeParams) error
+	CreateConsentGrant(ctx context.Context, arg CreateConsentGrantParams) (ConsentGrant, error)
 	CreateCredential(ctx context.Context, arg CreateCredentialParams) error
 	CreateLoginSession(ctx context.Context, arg CreateLoginSessionParams) error
 	CreateOIDCClient(ctx context.Context, arg CreateOIDCClientParams) (OidcClient, error)
@@ -31,18 +35,24 @@ type Querier interface {
 	DeleteOIDCClientLogoutURIs(ctx context.Context, clientID uuid.UUID) error
 	DeleteOIDCClientRedirectURIs(ctx context.Context, clientID uuid.UUID) error
 	DeleteOIDCClientScopes(ctx context.Context, clientID uuid.UUID) error
+	DeleteRetiredAccessTokens(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error)
 	DeleteRetiredAuthTransactions(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error)
+	DeleteRetiredAuthorizationCodes(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error)
 	DeleteRetiredLoginSessions(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error)
 	ExpireAuthTransactions(ctx context.Context, now pgtype.Timestamptz) ([]uuid.UUID, error)
 	FindCredentialForLogin(ctx context.Context, identifier string) (FindCredentialForLoginRow, error)
+	GetAccessTokenByJTIHash(ctx context.Context, jtiHash []byte) (AccessToken, error)
 	GetAuthTransactionByID(ctx context.Context, id uuid.UUID) (AuthTransaction, error)
 	GetAuthTransactionByTokenHash(ctx context.Context, tokenHash []byte) (AuthTransaction, error)
+	GetAuthorizationCodeByHash(ctx context.Context, codeHash []byte) (AuthorizationCode, error)
+	GetConsentGrantByUserClient(ctx context.Context, arg GetConsentGrantByUserClientParams) (ConsentGrant, error)
 	GetLoginSessionByTokenHash(ctx context.Context, tokenHash []byte) (GetLoginSessionByTokenHashRow, error)
 	GetOIDCClientByClientID(ctx context.Context, clientID string) (OidcClient, error)
 	GetOIDCClientByID(ctx context.Context, id uuid.UUID) (OidcClient, error)
 	GetPreAuthSessionByTokenHash(ctx context.Context, tokenHash []byte) (PreauthSession, error)
 	GetUserByID(ctx context.Context, id uuid.UUID) (User, error)
 	HasAdmin(ctx context.Context) (bool, error)
+	HasAuthorizationCodeExchangeRejection(ctx context.Context, authorizationCodeID *uuid.UUID) (bool, error)
 	ListActiveOIDCClientSecretHashes(ctx context.Context, clientID uuid.UUID) ([][]byte, error)
 	ListAuditEvents(ctx context.Context, arg ListAuditEventsParams) ([]AuditEvent, error)
 	ListLoginSessionsAdmin(ctx context.Context, arg ListLoginSessionsAdminParams) ([]ListLoginSessionsAdminRow, error)
@@ -53,12 +63,16 @@ type Querier interface {
 	ListUserLoginSessions(ctx context.Context, arg ListUserLoginSessionsParams) ([]ListUserLoginSessionsRow, error)
 	ListUsers(ctx context.Context, arg ListUsersParams) ([]User, error)
 	LockAdminSet(ctx context.Context) error
+	LockAuthTransactionByID(ctx context.Context, id uuid.UUID) (AuthTransaction, error)
+	LockAuthorizationCodeByHash(ctx context.Context, codeHash []byte) (AuthorizationCode, error)
+	LockConsentGrantByUserClient(ctx context.Context, arg LockConsentGrantByUserClientParams) (ConsentGrant, error)
 	LockLoginIdentifier(ctx context.Context, identifier string) error
 	LockOIDCClientByID(ctx context.Context, id uuid.UUID) (OidcClient, error)
 	LockUserByID(ctx context.Context, id uuid.UUID) (User, error)
 	LoginIdentifierExists(ctx context.Context, identifier string) (bool, error)
 	LoginIdentifierOwnedByOther(ctx context.Context, arg LoginIdentifierOwnedByOtherParams) (bool, error)
 	Ping(ctx context.Context) (int32, error)
+	RejectAuthTransaction(ctx context.Context, arg RejectAuthTransactionParams) (AuthTransaction, error)
 	RevokeActiveOIDCClientSecrets(ctx context.Context, arg RevokeActiveOIDCClientSecretsParams) ([]uuid.UUID, error)
 	RevokeAllUserLoginSessions(ctx context.Context, arg RevokeAllUserLoginSessionsParams) ([]uuid.UUID, error)
 	RevokeLoginSessionAdmin(ctx context.Context, arg RevokeLoginSessionAdminParams) (RevokeLoginSessionAdminRow, error)
@@ -67,6 +81,7 @@ type Querier interface {
 	RevokeOtherLoginSessions(ctx context.Context, arg RevokeOtherLoginSessionsParams) ([]uuid.UUID, error)
 	RotateLoginSessionCSRF(ctx context.Context, arg RotateLoginSessionCSRFParams) error
 	TouchLoginSession(ctx context.Context, arg TouchLoginSessionParams) error
+	UpdateConsentGrantScopes(ctx context.Context, arg UpdateConsentGrantScopesParams) (ConsentGrant, error)
 	UpdateCredentialHash(ctx context.Context, arg UpdateCredentialHashParams) error
 	UpdateLastLogin(ctx context.Context, arg UpdateLastLoginParams) error
 	UpdateOIDCClient(ctx context.Context, arg UpdateOIDCClientParams) (OidcClient, error)

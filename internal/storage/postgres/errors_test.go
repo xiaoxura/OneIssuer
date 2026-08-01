@@ -35,7 +35,7 @@ func TestErrorClass(t *testing.T) {
 func TestExpectedVersion(t *testing.T) {
 	t.Parallel()
 
-	if got := expectedVersion(productionMigrations); got != 5 {
+	if got := expectedVersion(productionMigrations); got != 10 {
 		t.Fatalf("expectedVersion(production) = %d", got)
 	}
 }

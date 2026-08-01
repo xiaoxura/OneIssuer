@@ -125,6 +125,7 @@ type UpdateInput struct {
 type Repository interface {
 	CreateClient(context.Context, Client, *SecretRecord, audit.Event) error
 	GetClient(context.Context, uuid.UUID) (Client, error)
+	GetClientByPublicID(context.Context, string) (Client, error)
 	ListClients(context.Context, pagination.Cursor, int) ([]Client, error)
 	UpdateClient(context.Context, Client, audit.Event) error
 	RotateClientSecret(context.Context, uuid.UUID, SecretRecord, time.Time, audit.Event) error
@@ -180,6 +181,34 @@ func (s *Service) Create(ctx context.Context, actor uuid.UUID, input CreateInput
 // Get returns a credential-free client representation.
 func (s *Service) Get(ctx context.Context, id uuid.UUID) (Client, error) {
 	return s.repository.GetClient(ctx, id)
+}
+
+// GetActive returns one active, internally consistent Client by its immutable
+// database identifier. Protocol continuation paths use this after restoring a
+// server-side authorization transaction; browser input never selects this ID.
+func (s *Service) GetActive(ctx context.Context, id uuid.UUID) (Client, error) {
+	if id == uuid.Nil {
+		return Client{}, ErrNotFound
+	}
+	value, err := s.repository.GetClient(ctx, id)
+	if err != nil || !activeClientRecord(value) {
+		return Client{}, ErrNotFound
+	}
+	return value, nil
+}
+
+// ResolveActive returns an active credential-free Client by its public
+// client_id. Unknown, malformed, disabled, and internally inconsistent records
+// deliberately share ErrNotFound so protocol callers cannot enumerate policy.
+func (s *Service) ResolveActive(ctx context.Context, publicID string) (Client, error) {
+	if !validClientID(publicID) {
+		return Client{}, ErrNotFound
+	}
+	value, err := s.repository.GetClientByPublicID(ctx, publicID)
+	if err != nil || !activeClientRecord(value) {
+		return Client{}, ErrNotFound
+	}
+	return value, nil
 }
 
 // List returns a bounded page of credential-free clients.
@@ -477,6 +506,20 @@ func validSecret(clearSecret string) bool {
 	}
 	value, err := base64.RawURLEncoding.Strict().DecodeString(strings.TrimPrefix(clearSecret, "ois_sec_v1_"))
 	return err == nil && len(value) == 32
+}
+
+func validClientID(value string) bool {
+	if !strings.HasPrefix(value, "ois_cli_") || strings.TrimSpace(value) != value {
+		return false
+	}
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(strings.TrimPrefix(value, "ois_cli_"))
+	return err == nil && len(decoded) == 24
+}
+
+func activeClientRecord(value Client) bool {
+	return value.ID != uuid.Nil && value.Status == StatusActive &&
+		((value.Type == TypePublic && value.TokenEndpointAuthMethod == AuthMethodNone) ||
+			(value.Type == TypeConfidential && value.TokenEndpointAuthMethod == AuthMethodClientSecretBasic))
 }
 
 func canonical(values []string) []string {

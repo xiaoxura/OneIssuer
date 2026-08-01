@@ -96,6 +96,18 @@ type PasswordConfig struct {
 	MaxConcurrent   int
 }
 
+// OIDCConfig contains the phase-three protocol lifetimes and references to the
+// startup-loaded signing key ring. Key file paths are deliberately omitted from
+// SafeMap and must never be logged.
+type OIDCConfig struct {
+	SigningKeyFile       string
+	VerificationKeysFile string
+	AuthorizationCodeTTL time.Duration
+	IDTokenTTL           time.Duration
+	AccessTokenTTL       time.Duration
+	ClockSkew            time.Duration
+}
+
 // Config is the complete service configuration.
 type Config struct {
 	Environment     Environment
@@ -105,6 +117,7 @@ type Config struct {
 	Log             LogConfig
 	Browser         BrowserConfig
 	Password        PasswordConfig
+	OIDC            OIDCConfig
 	ShutdownTimeout time.Duration
 	TrustedProxies  []netip.Prefix
 }
@@ -220,6 +233,14 @@ func (c Config) SafeMap() map[string]any {
 			"argon2_time":           c.Password.Argon2Time,
 			"argon2_threads":        c.Password.Argon2Threads,
 			"argon2_max_concurrent": c.Password.MaxConcurrent,
+		},
+		"oidc": map[string]any{
+			"signing_key_configured":       strings.TrimSpace(c.OIDC.SigningKeyFile) != "",
+			"verification_keys_configured": strings.TrimSpace(c.OIDC.VerificationKeysFile) != "",
+			"authorization_code_ttl":       c.OIDC.AuthorizationCodeTTL.String(),
+			"id_token_ttl":                 c.OIDC.IDTokenTTL.String(),
+			"access_token_ttl":             c.OIDC.AccessTokenTTL.String(),
+			"clock_skew":                   c.OIDC.ClockSkew.String(),
 		},
 		"http": map[string]any{
 			"read_header_timeout": c.HTTP.ReadHeaderTimeout.String(),

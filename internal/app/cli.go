@@ -18,6 +18,7 @@ import (
 	"github.com/oneissuer/oneissuer/internal/audit"
 	"github.com/oneissuer/oneissuer/internal/config"
 	"github.com/oneissuer/oneissuer/internal/identity"
+	"github.com/oneissuer/oneissuer/internal/keystore"
 	"github.com/oneissuer/oneissuer/internal/observability"
 	"github.com/oneissuer/oneissuer/internal/storage/postgres"
 	"golang.org/x/term"
@@ -29,9 +30,11 @@ Usage:
   oneissuer serve
   oneissuer migrate up
   oneissuer migrate status
-  oneissuer migrate version
-	oneissuer config check
-	oneissuer admin bootstrap --username <name> --email <address> [--password-stdin]
+	  oneissuer migrate version
+		oneissuer config check
+		oneissuer keys generate --alg RS256 --out <private-jwk>
+		oneissuer keys public --in <private-jwk> --out <public-jwks>
+		oneissuer admin bootstrap --username <name> --email <address> [--password-stdin]
 	oneissuer version
 `
 
@@ -90,6 +93,8 @@ func ExecuteWithInput(
 		return exitSuccess
 	case "config":
 		return executeConfig(args[1:], lookup, stdout, stderr)
+	case "keys":
+		return executeKeys(args[1:], stdout, stderr)
 	case "migrate":
 		return executeMigration(ctx, args[1:], lookup, stdout, stderr)
 	case "admin":
@@ -256,7 +261,22 @@ func executeConfig(args []string, lookup config.LookupEnv, stdout, stderr io.Wri
 		writeCLIError(stderr, err)
 		return exitUsage
 	}
-	result := map[string]any{"status": "ok", "config": cfg.SafeMap()}
+	keyStore, err := keystore.Load(cfg.OIDC.SigningKeyFile, cfg.OIDC.VerificationKeysFile)
+	if err != nil {
+		writeCLIError(stderr, fmt.Errorf("key store validation failed: %w", err))
+		return exitUsage
+	}
+	keyMetadata := keyStore.Metadata()
+	result := map[string]any{
+		"status": "ok",
+		"config": cfg.SafeMap(),
+		"key_store": map[string]any{
+			"valid":          true,
+			"algorithm":      keystore.Algorithm,
+			"active_kid":     keyMetadata.ActiveKeyID,
+			"published_keys": keyMetadata.PublishedKeys,
+		},
+	}
 	encoder := json.NewEncoder(stdout)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(result); err != nil {
@@ -264,6 +284,73 @@ func executeConfig(args []string, lookup config.LookupEnv, stdout, stderr io.Wri
 		return exitRuntime
 	}
 	return exitSuccess
+}
+
+func executeKeys(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		_, _ = io.WriteString(stderr, "usage: oneissuer keys {generate|public}\n")
+		return exitUsage
+	}
+
+	switch args[0] {
+	case "generate":
+		flags := flag.NewFlagSet("keys generate", flag.ContinueOnError)
+		flags.SetOutput(stderr)
+		algorithm := flags.String("alg", "", "signing algorithm (RS256)")
+		output := flags.String("out", "", "new private JWK file")
+		flags.Usage = func() {
+			_, _ = io.WriteString(stderr, "usage: oneissuer keys generate --alg RS256 --out <private-jwk>\n")
+		}
+		if err := flags.Parse(args[1:]); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return exitSuccess
+			}
+			return exitUsage
+		}
+		if flags.NArg() != 0 || *algorithm != keystore.Algorithm || strings.TrimSpace(*output) == "" {
+			flags.Usage()
+			return exitUsage
+		}
+		metadata, err := keystore.Generate(*output, keystore.DefaultRSABits, nil)
+		if err != nil {
+			writeCLIError(stderr, fmt.Errorf("key generation failed: %w", err))
+			return exitRuntime
+		}
+		_, _ = fmt.Fprintf(stdout, "status=created\nalgorithm=%s\nactive_kid=%s\npublished_keys=%d\n",
+			keystore.Algorithm, metadata.ActiveKeyID, metadata.PublishedKeys)
+		return exitSuccess
+
+	case "public":
+		flags := flag.NewFlagSet("keys public", flag.ContinueOnError)
+		flags.SetOutput(stderr)
+		input := flags.String("in", "", "private JWK file")
+		output := flags.String("out", "", "new public JWKS file")
+		flags.Usage = func() {
+			_, _ = io.WriteString(stderr, "usage: oneissuer keys public --in <private-jwk> --out <public-jwks>\n")
+		}
+		if err := flags.Parse(args[1:]); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return exitSuccess
+			}
+			return exitUsage
+		}
+		if flags.NArg() != 0 || strings.TrimSpace(*input) == "" || strings.TrimSpace(*output) == "" {
+			flags.Usage()
+			return exitUsage
+		}
+		metadata, err := keystore.WritePublic(*input, *output)
+		if err != nil {
+			writeCLIError(stderr, fmt.Errorf("public key export failed: %w", err))
+			return exitRuntime
+		}
+		_, _ = fmt.Fprintf(stdout, "status=created\nalgorithm=%s\nactive_kid=%s\npublished_keys=%d\n",
+			keystore.Algorithm, metadata.ActiveKeyID, metadata.PublishedKeys)
+		return exitSuccess
+
+	default:
+		_, _ = io.WriteString(stderr, "usage: oneissuer keys {generate|public}\n")
+		return exitUsage
+	}
 }
 
 func executeMigration(ctx context.Context, args []string, lookup config.LookupEnv, stdout, stderr io.Writer) int {

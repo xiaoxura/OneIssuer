@@ -13,15 +13,22 @@ import (
 )
 
 const (
-	defaultIssuer          = "http://localhost:8080"
-	defaultMaxHeaderBytes  = 1 << 20
-	maxShutdownTimeout     = 5 * time.Minute
-	maxHTTPTimeout         = 10 * time.Minute
-	maxHeaderBytes         = 16 << 20
-	maxDatabaseConnections = 100
-	maxSessionTTL          = 30 * 24 * time.Hour
-	maxCSRFTTL             = time.Hour
-	maxAuthTransactionTTL  = time.Hour
+	defaultIssuer           = "http://localhost:8080"
+	defaultMaxHeaderBytes   = 1 << 20
+	maxShutdownTimeout      = 5 * time.Minute
+	maxHTTPTimeout          = 10 * time.Minute
+	maxHeaderBytes          = 16 << 20
+	maxDatabaseConnections  = 100
+	maxSessionTTL           = 30 * 24 * time.Hour
+	maxCSRFTTL              = time.Hour
+	maxAuthTransactionTTL   = time.Hour
+	minAuthorizationCodeTTL = 30 * time.Second
+	maxAuthorizationCodeTTL = 5 * time.Minute
+	minIDTokenTTL           = time.Minute
+	maxIDTokenTTL           = 15 * time.Minute
+	minAccessTokenTTL       = time.Minute
+	maxAccessTokenTTL       = 30 * time.Minute
+	maxOIDCClockSkew        = 2 * time.Minute
 )
 
 var cookieNamePattern = regexp.MustCompile(`^[!#$%&'*+.^_` + "`" + `|~0-9A-Za-z-]+$`)
@@ -101,6 +108,9 @@ func LoadFrom(lookup LookupEnv, scope Scope) (Config, error) {
 	} else {
 		cfg.Issuer = issuer
 	}
+	if issuer != nil && issuer.Scheme == "http" && !isLoopbackIssuerHost(issuer.Hostname()) {
+		problems = append(problems, Problem{"ONEISSUER_ISSUER", "may use http only with an explicit loopback host"})
+	}
 	if cfg.Environment == EnvironmentProduction {
 		if !issuerSet {
 			problems = append(problems, Problem{"ONEISSUER_ISSUER", "must be explicitly set in production"})
@@ -130,6 +140,7 @@ func LoadFrom(lookup LookupEnv, scope Scope) (Config, error) {
 
 	parseTrustedProxies(lookup, &cfg, &problems)
 	parseBrowserConfig(lookup, &cfg, &problems)
+	parseOIDCConfig(lookup, &cfg, &problems)
 
 	if len(problems) > 0 {
 		return Config{}, &ValidationError{Problems: problems}
@@ -174,6 +185,12 @@ func defaults() Config {
 			Argon2Threads:   2,
 			MaxConcurrent:   2,
 		},
+		OIDC: OIDCConfig{
+			AuthorizationCodeTTL: time.Minute,
+			IDTokenTTL:           5 * time.Minute,
+			AccessTokenTTL:       10 * time.Minute,
+			ClockSkew:            30 * time.Second,
+		},
 		ShutdownTimeout: 15 * time.Second,
 		TrustedProxies:  []netip.Prefix{},
 	}
@@ -188,8 +205,11 @@ func valueOrDefault(lookup LookupEnv, name, fallback string) (string, bool) {
 }
 
 func validateIssuer(raw string) (*url.URL, error) {
+	if raw == "" || raw != strings.TrimSpace(raw) {
+		return nil, fmt.Errorf("must be a canonical origin URL without surrounding whitespace")
+	}
 	parsed, err := url.Parse(raw)
-	if err != nil || !parsed.IsAbs() || parsed.Host == "" {
+	if err != nil || !parsed.IsAbs() || parsed.Opaque != "" || parsed.Host == "" {
 		return nil, fmt.Errorf("must be an absolute http or https URL")
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
@@ -198,10 +218,33 @@ func validateIssuer(raw string) (*url.URL, error) {
 	if parsed.User != nil {
 		return nil, fmt.Errorf("must not contain user information")
 	}
-	if parsed.RawQuery != "" || parsed.Fragment != "" {
+	if parsed.Path != "" || parsed.RawPath != "" {
+		return nil, fmt.Errorf("must be an origin URL without a path or trailing slash")
+	}
+	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || strings.Contains(raw, "#") {
 		return nil, fmt.Errorf("must not contain a query or fragment")
 	}
+	if parsed.Hostname() == "" || strings.HasSuffix(parsed.Host, ":") {
+		return nil, fmt.Errorf("must contain a valid host and optional port")
+	}
+	if port := parsed.Port(); port != "" {
+		portNumber, portErr := strconv.Atoi(port)
+		if portErr != nil || portNumber < 1 || portNumber > 65535 {
+			return nil, fmt.Errorf("must contain a port between 1 and 65535")
+		}
+	}
+	if parsed.String() != raw {
+		return nil, fmt.Errorf("must use its canonical scheme and host encoding")
+	}
 	return parsed, nil
+}
+
+func isLoopbackIssuerHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	address, err := netip.ParseAddr(host)
+	return err == nil && address.IsLoopback()
 }
 
 func validateHTTPAddr(addr string) error {
@@ -392,6 +435,58 @@ func parseBrowserConfig(lookup LookupEnv, cfg *Config, problems *[]Problem) {
 			*problems = append(*problems, Problem{"ONEISSUER_REGISTRATION_ENABLED", "must be explicitly set in production"})
 		}
 	}
+}
+
+func parseOIDCConfig(lookup LookupEnv, cfg *Config, problems *[]Problem) {
+	signingKeyFile, signingKeySet := lookup("ONEISSUER_SIGNING_KEY_FILE")
+	if !signingKeySet || strings.TrimSpace(signingKeyFile) == "" {
+		*problems = append(*problems, Problem{"ONEISSUER_SIGNING_KEY_FILE", "is required"})
+	} else if signingKeyFile != strings.TrimSpace(signingKeyFile) || strings.ContainsRune(signingKeyFile, '\x00') {
+		*problems = append(*problems, Problem{"ONEISSUER_SIGNING_KEY_FILE", "must be a non-empty file reference without surrounding whitespace"})
+	} else {
+		cfg.OIDC.SigningKeyFile = signingKeyFile
+	}
+
+	verificationKeysFile, verificationKeysSet := lookup("ONEISSUER_VERIFICATION_KEYS_FILE")
+	if verificationKeysSet && strings.TrimSpace(verificationKeysFile) != "" {
+		if verificationKeysFile != strings.TrimSpace(verificationKeysFile) || strings.ContainsRune(verificationKeysFile, '\x00') {
+			*problems = append(*problems, Problem{"ONEISSUER_VERIFICATION_KEYS_FILE", "must be a file reference without surrounding whitespace"})
+		} else {
+			cfg.OIDC.VerificationKeysFile = verificationKeysFile
+		}
+	}
+
+	parseDurationRange(lookup, "ONEISSUER_AUTHORIZATION_CODE_TTL", cfg.OIDC.AuthorizationCodeTTL,
+		minAuthorizationCodeTTL, maxAuthorizationCodeTTL, false, &cfg.OIDC.AuthorizationCodeTTL, problems)
+	parseDurationRange(lookup, "ONEISSUER_ID_TOKEN_TTL", cfg.OIDC.IDTokenTTL,
+		minIDTokenTTL, maxIDTokenTTL, false, &cfg.OIDC.IDTokenTTL, problems)
+	parseDurationRange(lookup, "ONEISSUER_ACCESS_TOKEN_TTL", cfg.OIDC.AccessTokenTTL,
+		minAccessTokenTTL, maxAccessTokenTTL, false, &cfg.OIDC.AccessTokenTTL, problems)
+	parseDurationRange(lookup, "ONEISSUER_OIDC_CLOCK_SKEW", cfg.OIDC.ClockSkew,
+		0, maxOIDCClockSkew, true, &cfg.OIDC.ClockSkew, problems)
+}
+
+func parseDurationRange(
+	lookup LookupEnv,
+	name string,
+	fallback time.Duration,
+	minimum time.Duration,
+	maximum time.Duration,
+	allowZero bool,
+	target *time.Duration,
+	problems *[]Problem,
+) {
+	raw, set := lookup(name)
+	if !set {
+		*target = fallback
+		return
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil || value < minimum || value > maximum || (!allowZero && value == 0) {
+		*problems = append(*problems, Problem{name, fmt.Sprintf("must be between %s and %s", minimum, maximum)})
+		return
+	}
+	*target = value
 }
 
 func parseTrustedProxies(lookup LookupEnv, cfg *Config, problems *[]Problem) {

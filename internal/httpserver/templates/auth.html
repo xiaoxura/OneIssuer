@@ -24,7 +24,7 @@
       {{end}}
       <button type="submit">{{.SubmitLabel}}</button>
     </form>
-    <p><a href="{{.SwitchURL}}">{{.SwitchLabel}}</a></p>
+    {{if .SwitchURL}}<p><a href="{{.SwitchURL}}">{{.SwitchLabel}}</a></p>{{end}}
   </main>
 </body>
 </html>

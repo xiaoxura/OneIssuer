@@ -53,6 +53,29 @@ func (s *Store) ConsumeAuthTransaction(ctx context.Context, id uuid.UUID, now ti
 	return result, err
 }
 
+// RejectAuthTransaction terminally consumes one live transaction with a fixed
+// protocol reason and appends the supplied value-free audit event atomically.
+func (s *Store) RejectAuthTransaction(ctx context.Context, id uuid.UUID, reason string, now time.Time, event audit.Event) (authflow.Transaction, error) {
+	var result authflow.Transaction
+	err := s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
+		row, err := queries.RejectAuthTransaction(ctx, sqlcgen.RejectAuthTransactionParams{
+			ConsumedAt: timestamp(now), FailureReason: pointerString(reason), ID: id,
+		})
+		if isNoRows(err) {
+			return authflow.ErrConsumed
+		}
+		if err != nil {
+			return wrapError("reject authorization transaction", ErrorKindQuery, err)
+		}
+		if err := insertAudit(ctx, queries, event); err != nil {
+			return err
+		}
+		result = mapAuthTransaction(row)
+		return nil
+	})
+	return result, err
+}
+
 // ExpireAuthTransactions marks elapsed live transactions expired.
 func (s *Store) ExpireAuthTransactions(ctx context.Context, now time.Time) (int64, error) {
 	var count int64
@@ -91,6 +114,8 @@ func authTransactionParams(value authflow.Transaction) sqlcgen.CreateAuthTransac
 		RedirectUri: pointerString(value.RedirectURI), Scopes: value.Scopes,
 		PkceChallenge: pointerString(value.PKCEChallenge), PkceMethod: pointerString(value.PKCEMethod),
 		StateValue: pointerString(value.State), NonceValue: pointerString(value.Nonce), PromptCreate: value.PromptCreate,
+		ResponseType: pointerString(value.ResponseType), ResponseMode: pointerString(value.ResponseMode),
+		PromptValues: append([]string{}, value.Prompts...), MaxAgeSeconds: uint32ToInt64(value.MaxAgeSeconds),
 		CreatedAt: timestamp(value.CreatedAt), ExpiresAt: timestamp(value.ExpiresAt),
 	}
 }
@@ -100,9 +125,27 @@ func mapAuthTransaction(row sqlcgen.AuthTransaction) authflow.Transaction {
 		ID: row.ID, TokenHash: row.TokenHash, Kind: authflow.Kind(row.TransactionKind), ClientID: row.ClientID,
 		RedirectURI: valueString(row.RedirectUri), Scopes: row.Scopes, PKCEChallenge: valueString(row.PkceChallenge),
 		PKCEMethod: valueString(row.PkceMethod), State: valueString(row.StateValue), Nonce: valueString(row.NonceValue),
-		PromptCreate: row.PromptCreate, CreatedAt: requiredTime(row.CreatedAt), ExpiresAt: requiredTime(row.ExpiresAt),
+		PromptCreate: row.PromptCreate, ResponseType: valueString(row.ResponseType), ResponseMode: valueString(row.ResponseMode),
+		Prompts: append([]string(nil), row.PromptValues...), MaxAgeSeconds: int64ToUint32(row.MaxAgeSeconds),
+		CreatedAt: requiredTime(row.CreatedAt), ExpiresAt: requiredTime(row.ExpiresAt),
 		ConsumedAt: optionalTime(row.ConsumedAt), FailureReason: valueString(row.FailureReason),
 	}
+}
+
+func uint32ToInt64(value *uint32) *int64 {
+	if value == nil {
+		return nil
+	}
+	converted := int64(*value)
+	return &converted
+}
+
+func int64ToUint32(value *int64) *uint32 {
+	if value == nil || *value < 0 || *value > int64(^uint32(0)) {
+		return nil
+	}
+	converted := uint32(*value)
+	return &converted
 }
 
 func valueString(value *string) string {

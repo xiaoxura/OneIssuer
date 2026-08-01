@@ -4,9 +4,18 @@ x-oneissuer-build: &oneissuer-build
   context: ..
   dockerfile: Dockerfile
   args:
-    VERSION: ${ONEISSUER_VERSION:-v0.1.0-dev.2}
+    VERSION: ${ONEISSUER_VERSION:-v0.1.0-dev.3}
     COMMIT: ${ONEISSUER_COMMIT:-local}
     BUILD_TIME: ${ONEISSUER_BUILD_TIME:-local}
+    GOPROXY: ${ONEISSUER_BUILD_GOPROXY:-https://proxy.golang.org,direct}
+
+x-example-build: &example-build
+  context: ..
+  dockerfile: examples/oidc-client/Dockerfile
+  args:
+    VERSION: ${ONEISSUER_VERSION:-v0.1.0-dev.3}
+    COMMIT: ${ONEISSUER_COMMIT:-local}
+    GOPROXY: ${ONEISSUER_BUILD_GOPROXY:-https://proxy.golang.org,direct}
 
 services:
   postgres:
@@ -29,7 +38,7 @@ services:
 
   migrate:
     build: *oneissuer-build
-    image: oneissuer:${ONEISSUER_VERSION:-v0.1.0-dev.2}
+    image: oneissuer:${ONEISSUER_VERSION:-v0.1.0-dev.3}
     command: ["migrate", "up"]
     environment:
       ONEISSUER_DATABASE_URL: postgresql://${POSTGRES_USER:-oneissuer}:${POSTGRES_PASSWORD:-oneissuer-local-only}@postgres:5432/${POSTGRES_DB:-oneissuer}?sslmode=disable
@@ -44,13 +53,19 @@ services:
 
   oneissuer:
     build: *oneissuer-build
-    image: oneissuer:${ONEISSUER_VERSION:-v0.1.0-dev.2}
+    image: oneissuer:${ONEISSUER_VERSION:-v0.1.0-dev.3}
     environment:
       ONEISSUER_ENV: ${ONEISSUER_ENV:-development}
       ONEISSUER_ISSUER: ${ONEISSUER_ISSUER:-http://localhost:8080}
       ONEISSUER_HTTP_ADDR: :8080
       ONEISSUER_DATABASE_URL: postgresql://${POSTGRES_USER:-oneissuer}:${POSTGRES_PASSWORD:-oneissuer-local-only}@postgres:5432/${POSTGRES_DB:-oneissuer}?sslmode=disable
       ONEISSUER_DATABASE_MAX_CONNS: ${ONEISSUER_DATABASE_MAX_CONNS:-10}
+      ONEISSUER_SIGNING_KEY_FILE: /run/secrets/oneissuer-signing-key.jwk
+      ONEISSUER_VERIFICATION_KEYS_FILE: ${ONEISSUER_VERIFICATION_KEYS_FILE:-}
+      ONEISSUER_AUTHORIZATION_CODE_TTL: ${ONEISSUER_AUTHORIZATION_CODE_TTL:-1m}
+      ONEISSUER_ID_TOKEN_TTL: ${ONEISSUER_ID_TOKEN_TTL:-5m}
+      ONEISSUER_ACCESS_TOKEN_TTL: ${ONEISSUER_ACCESS_TOKEN_TTL:-10m}
+      ONEISSUER_OIDC_CLOCK_SKEW: ${ONEISSUER_OIDC_CLOCK_SKEW:-30s}
       ONEISSUER_LOG_LEVEL: ${ONEISSUER_LOG_LEVEL:-info}
       ONEISSUER_LOG_FORMAT: ${ONEISSUER_LOG_FORMAT:-json}
       ONEISSUER_SHUTDOWN_TIMEOUT: ${ONEISSUER_SHUTDOWN_TIMEOUT:-15s}
@@ -58,7 +73,7 @@ services:
       ONEISSUER_HTTP_READ_TIMEOUT: ${ONEISSUER_HTTP_READ_TIMEOUT:-10s}
       ONEISSUER_HTTP_WRITE_TIMEOUT: ${ONEISSUER_HTTP_WRITE_TIMEOUT:-30s}
       ONEISSUER_HTTP_IDLE_TIMEOUT: ${ONEISSUER_HTTP_IDLE_TIMEOUT:-60s}
-      ONEISSUER_HTTP_MAX_HEADER_BYTES: ${ONEISSUER_HTTP_MAX_HEADER_BYTES:-1048576}
+      ONEISSUER_HTTP_MAX_HEADER_BYTES: ${ONEISSUER_HTTP_MAX_HEADER_BYTES:-65536}
       ONEISSUER_TRUSTED_PROXIES: ${ONEISSUER_TRUSTED_PROXIES:-}
       ONEISSUER_COOKIE_NAME: ${ONEISSUER_COOKIE_NAME:-oneissuer_session}
       ONEISSUER_COOKIE_SECURE: ${ONEISSUER_COOKIE_SECURE:-false}
@@ -77,6 +92,11 @@ services:
       ONEISSUER_ARGON2_MAX_CONCURRENT: ${ONEISSUER_ARGON2_MAX_CONCURRENT:-2}
     ports:
       - "127.0.0.1:${ONEISSUER_HTTP_PORT:-8080}:8080"
+    volumes:
+      - type: bind
+        source: ${ONEISSUER_SIGNING_KEY_HOST_FILE:-../.oneissuer-dev/signing-key.jwk}
+        target: /run/secrets/oneissuer-signing-key.jwk
+        read_only: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -96,6 +116,74 @@ services:
     # Leave the container runtime a small margin beyond the app's 15s default
     # so OneIssuer, rather than SIGKILL, owns timeout reporting.
     stop_grace_period: ${ONEISSUER_CONTAINER_STOP_GRACE_PERIOD:-20s}
+    restart: unless-stopped
+
+  client-a:
+    profiles: ["oidc-demo"]
+    build: *example-build
+    image: oneissuer-oidc-example:${ONEISSUER_VERSION:-v0.1.0-dev.3}
+    environment:
+      EXAMPLE_NAME: OneIssuer Client A (Public)
+      EXAMPLE_HTTP_ADDR: :8080
+      EXAMPLE_ISSUER: ${ONEISSUER_ISSUER:-http://localhost:8080}
+      EXAMPLE_PROVIDER_BACKCHANNEL: http://oneissuer:8080
+      EXAMPLE_CLIENT_ID: ${EXAMPLE_CLIENT_A_ID:-}
+      EXAMPLE_REDIRECT_URI: ${EXAMPLE_CLIENT_A_REDIRECT_URI:-http://127.0.0.1:8081/callback}
+      EXAMPLE_SCOPES: openid profile email
+      EXAMPLE_COOKIE_NAME: oneissuer_example_a
+      EXAMPLE_COOKIE_SECURE: "false"
+    ports:
+      - "127.0.0.1:${EXAMPLE_CLIENT_A_PORT:-8081}:8080"
+    depends_on:
+      oneissuer:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -T 2 -O - http://127.0.0.1:8080/health/ready >/dev/null || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  client-b:
+    profiles: ["oidc-demo"]
+    build: *example-build
+    image: oneissuer-oidc-example:${ONEISSUER_VERSION:-v0.1.0-dev.3}
+    environment:
+      EXAMPLE_NAME: OneIssuer Client B (Confidential)
+      EXAMPLE_HTTP_ADDR: :8080
+      EXAMPLE_ISSUER: ${ONEISSUER_ISSUER:-http://localhost:8080}
+      EXAMPLE_PROVIDER_BACKCHANNEL: http://oneissuer:8080
+      EXAMPLE_CLIENT_ID: ${EXAMPLE_CLIENT_B_ID:-}
+      EXAMPLE_CLIENT_SECRET_FILE: /run/secrets/example-client-b-secret
+      EXAMPLE_REDIRECT_URI: ${EXAMPLE_CLIENT_B_REDIRECT_URI:-http://127.0.0.1:8082/callback}
+      EXAMPLE_SCOPES: openid profile email
+      EXAMPLE_COOKIE_NAME: oneissuer_example_b
+      EXAMPLE_COOKIE_SECURE: "false"
+    volumes:
+      - type: bind
+        source: ${EXAMPLE_CLIENT_B_SECRET_FILE:-../.oneissuer-dev/client-b-secret}
+        target: /run/secrets/example-client-b-secret
+        read_only: true
+    ports:
+      - "127.0.0.1:${EXAMPLE_CLIENT_B_PORT:-8082}:8080"
+    depends_on:
+      oneissuer:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -T 2 -O - http://127.0.0.1:8080/health/ready >/dev/null || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
 volumes:

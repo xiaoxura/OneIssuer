@@ -9,6 +9,18 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type AccessToken struct {
+	ID                  uuid.UUID          `db:"id"`
+	JtiHash             []byte             `db:"jti_hash"`
+	AuthorizationCodeID uuid.UUID          `db:"authorization_code_id"`
+	ConsentGrantID      uuid.UUID          `db:"consent_grant_id"`
+	UserID              uuid.UUID          `db:"user_id"`
+	ClientID            uuid.UUID          `db:"client_id"`
+	Scopes              []string           `db:"scopes"`
+	IssuedAt            pgtype.Timestamptz `db:"issued_at"`
+	ExpiresAt           pgtype.Timestamptz `db:"expires_at"`
+}
+
 type AuditEvent struct {
 	ID            uuid.UUID          `db:"id"`
 	EventType     string             `db:"event_type"`
@@ -37,6 +49,37 @@ type AuthTransaction struct {
 	ExpiresAt       pgtype.Timestamptz `db:"expires_at"`
 	ConsumedAt      pgtype.Timestamptz `db:"consumed_at"`
 	FailureReason   *string            `db:"failure_reason"`
+	ResponseType    *string            `db:"response_type"`
+	ResponseMode    *string            `db:"response_mode"`
+	PromptValues    []string           `db:"prompt_values"`
+	MaxAgeSeconds   *int64             `db:"max_age_seconds"`
+}
+
+type AuthorizationCode struct {
+	ID                uuid.UUID          `db:"id"`
+	CodeHash          []byte             `db:"code_hash"`
+	AuthTransactionID uuid.UUID          `db:"auth_transaction_id"`
+	ConsentGrantID    uuid.UUID          `db:"consent_grant_id"`
+	UserID            uuid.UUID          `db:"user_id"`
+	ClientID          uuid.UUID          `db:"client_id"`
+	RedirectUri       string             `db:"redirect_uri"`
+	Scopes            []string           `db:"scopes"`
+	PkceChallenge     string             `db:"pkce_challenge"`
+	PkceMethod        string             `db:"pkce_method"`
+	NonceValue        *string            `db:"nonce_value"`
+	AuthTime          pgtype.Timestamptz `db:"auth_time"`
+	CreatedAt         pgtype.Timestamptz `db:"created_at"`
+	ExpiresAt         pgtype.Timestamptz `db:"expires_at"`
+	ConsumedAt        pgtype.Timestamptz `db:"consumed_at"`
+}
+
+type ConsentGrant struct {
+	ID        uuid.UUID          `db:"id"`
+	UserID    uuid.UUID          `db:"user_id"`
+	ClientID  uuid.UUID          `db:"client_id"`
+	Scopes    []string           `db:"scopes"`
+	CreatedAt pgtype.Timestamptz `db:"created_at"`
+	UpdatedAt pgtype.Timestamptz `db:"updated_at"`
 }
 
 type Credential struct {

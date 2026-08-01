@@ -1,6 +1,6 @@
 # OneIssuer 第三阶段开发计划：OIDC 主流程
 
-> 状态：Planned（Draft for review；尚未开始实现）  
+> 状态：Implemented and verified；2026-08-01 Definition of Done 全项通过
 > 计划日期：2026-08-01  
 > 对应总体方案：[`go-backend-design.md`](./go-backend-design.md) 的“阶段三：OIDC 主流程”  
 > 冻结输入：[`phase-3-handoff.md`](./phase-3-handoff.md)（阶段二边界已验收）  
@@ -899,6 +899,9 @@ digest。
 | `P3-11` | 示例 Client 与 Compose E2E | A/B RP、完整注册/SSO/重启演示 | P3-09 | 1.5–2 天 |
 | `P3-12` | 运维、接入与 Release 文档 | Key Runbook、升级、排障、Release Notes | P3-10、P3-11 | 1–1.5 天 |
 
+验收结论（2026-08-01）：`P3-01`–`P3-12` 已全部实现并通过最终仓库级门禁；命令、
+结果和限制记录在 [`phase-3-release-notes.md`](./phase-3-release-notes.md)。
+
 工作量不包含等待外部安全审阅、公开部署 Conformance 环境和发现重大协议库不适配后的重构。
 P3-01 结束时必须更新剩余估算。
 
@@ -950,34 +953,34 @@ flowchart LR
 
 以下全部满足后，第三阶段才可标记 Implemented and verified：
 
-- [ ] 阶段三 ADR、威胁模型、协议库 Spike 和适用 Conformance 矩阵已评审；
-- [ ] `00001`–`00005` checksum 未变化，`00006+` 空库和阶段二升级测试通过；
-- [ ] Canonical Issuer、Discovery、JWKS、ID Token 和 Access Token `iss` 完全一致；
-- [ ] 无有效 Active signing key 时启动/Ready fail closed，private JWK 未进入镜像、日志或响应；
-- [ ] JWKS 只含公开成员，唯一 `kid`、缓存、预发布和旧 Key overlap 测试通过；
-- [ ] Discovery 只声明本阶段真实实现的 Response/Grant/Scope/Endpoint/算法；
-- [ ] Authorize 严格拒绝重复参数、错误 Client、非精确 Redirect URI 和不支持 response mode；
-- [ ] Public/Confidential Client 都强制 S256，`plain`、缺失和错误 verifier 被拒绝；
-- [ ] Session、`prompt=none/login/consent/create`、`max_age` 和 `auth_time` 语义有正负测试；
-- [ ] 注册只能恢复服务器授权事务，不能接受浏览器提供的任意回跳或协议上下文；
-- [ ] Consent 首次、复用、扩展、强制提示和拒绝语义通过，页面有 CSRF/CSP/转义保护；
-- [ ] 授权事务消费、Grant 更新和 Code 创建原子；并发批准最多一个 Code；
-- [ ] Code 只存摘要、短 TTL、一次性；并发交换最多一个成功 Token Response；
-- [ ] Token Endpoint 只接受 form Code Grant，Client auth 无降级/枚举/重复通道；
-- [ ] ID Token Header/Claim、Scope 映射、nonce、Audience 和时钟边界符合冻结剖面；
-- [ ] RFC 9068 Access Token 只面向 UserInfo，元数据是 UserInfo 接受条件；
-- [ ] UserInfo 校验签名/Issuer/Audience/状态/Scope，不泄露内部 User/Admin 字段；
-- [ ] Token Response 没有 Refresh Token，`offline_access` 被拒绝且 Discovery 未声明；
-- [ ] Redirect URI 未验证前没有外跳；验证后的 OAuth/OIDC Error 和 State 往返正确；
-- [ ] private key、Secret、Cookie、State、Nonce、PKCE、Code、verifier、JWT 不在日志/Audit/指标；
-- [ ] 新增 Audit 仍是固定白名单，Metrics 没有高基数或用户可控 Label；
-- [ ] 数据库故障、签名故障、Audit 故障、Client/User 中途禁用均 fail closed 且无半状态；
-- [ ] `go test -race ./...`、Vet、lint、govulncheck、Fuzz smoke、Trivy、SBOM 和生成检查通过；
-- [ ] 适用 OpenID Conformance 测试通过并保存版本、配置和结果；不作认证声明；
-- [ ] 示例 Client A/B 完成注册、Consent、Code、Token、UserInfo 和 SSO 演示；
-- [ ] Compose 从空卷启动、显式迁移、重启持久性、Key 挂载和隐私扫描通过；
-- [ ] README、配置、迁移、运维、排障、接入和阶段三 Release Notes 与实现一致；
-- [ ] Refresh、Revoke、Introspection、RP Logout 等阶段四能力没有伪成功或错误 Metadata 声明。
+- [x] 阶段三 ADR、威胁模型、协议库 Spike 和适用 Conformance 矩阵已评审；
+- [x] `00001`–`00005` checksum 未变化，`00006+` 空库和阶段二升级测试通过；
+- [x] Canonical Issuer、Discovery、JWKS、ID Token 和 Access Token `iss` 完全一致；
+- [x] 无有效 Active signing key 时启动/Ready fail closed，private JWK 未进入镜像、日志或响应；
+- [x] JWKS 只含公开成员，唯一 `kid`、缓存、预发布和旧 Key overlap 测试通过；
+- [x] Discovery 只声明本阶段真实实现的 Response/Grant/Scope/Endpoint/算法；
+- [x] Authorize 严格拒绝重复参数、错误 Client、非精确 Redirect URI 和不支持 response mode；
+- [x] Public/Confidential Client 都强制 S256，`plain`、缺失和错误 verifier 被拒绝；
+- [x] Session、`prompt=none/login/consent/create`、`max_age` 和 `auth_time` 语义有正负测试；
+- [x] 注册只能恢复服务器授权事务，不能接受浏览器提供的任意回跳或协议上下文；
+- [x] Consent 首次、复用、扩展、强制提示和拒绝语义通过，页面有 CSRF/CSP/转义保护；
+- [x] 授权事务消费、Grant 更新和 Code 创建原子；并发批准最多一个 Code；
+- [x] Code 只存摘要、短 TTL、一次性；并发交换最多一个成功 Token Response；
+- [x] Token Endpoint 只接受 form Code Grant，Client auth 无降级/枚举/重复通道；
+- [x] ID Token Header/Claim、Scope 映射、nonce、Audience 和时钟边界符合冻结剖面；
+- [x] RFC 9068 Access Token 只面向 UserInfo，元数据是 UserInfo 接受条件；
+- [x] UserInfo 校验签名/Issuer/Audience/状态/Scope，不泄露内部 User/Admin 字段；
+- [x] Token Response 没有 Refresh Token，`offline_access` 被拒绝且 Discovery 未声明；
+- [x] Redirect URI 未验证前没有外跳；验证后的 OAuth/OIDC Error 和 State 往返正确；
+- [x] private key、Secret、Cookie、State、Nonce、PKCE、Code、verifier、JWT 不在日志/Audit/指标；
+- [x] 新增 Audit 仍是固定白名单，Metrics 没有高基数或用户可控 Label；
+- [x] 数据库故障、签名故障、Audit 故障、Client/User 中途禁用均 fail closed 且无半状态；
+- [x] `go test -race ./...`、Vet、lint、govulncheck、Fuzz smoke、Trivy、SBOM 和生成检查通过；
+- [x] 适用 OpenID Conformance 测试通过并保存版本、配置和结果；不作认证声明；
+- [x] 示例 Client A/B 完成注册、Consent、Code、Token、UserInfo 和 SSO 演示；
+- [x] Compose 从空卷启动、显式迁移、重启持久性、Key 挂载和隐私扫描通过；
+- [x] README、配置、迁移、运维、排障、接入和阶段三 Release Notes 与实现一致；
+- [x] Refresh、Revoke、Introspection、RP Logout 等阶段四能力没有伪成功或错误 Metadata 声明。
 
 ## 24. 阶段验收脚本草案
 

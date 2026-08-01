@@ -18,7 +18,7 @@ SET consumed_at = $1
 WHERE id = $2
   AND consumed_at IS NULL
   AND expires_at > $1
-RETURNING id, token_hash, transaction_kind, client_id, redirect_uri, scopes, pkce_challenge, pkce_method, state_value, nonce_value, prompt_create, created_at, expires_at, consumed_at, failure_reason
+RETURNING id, token_hash, transaction_kind, client_id, redirect_uri, scopes, pkce_challenge, pkce_method, state_value, nonce_value, prompt_create, created_at, expires_at, consumed_at, failure_reason, response_type, response_mode, prompt_values, max_age_seconds
 `
 
 type ConsumeAuthTransactionParams struct {
@@ -45,6 +45,10 @@ func (q *Queries) ConsumeAuthTransaction(ctx context.Context, arg ConsumeAuthTra
 		&i.ExpiresAt,
 		&i.ConsumedAt,
 		&i.FailureReason,
+		&i.ResponseType,
+		&i.ResponseMode,
+		&i.PromptValues,
+		&i.MaxAgeSeconds,
 	)
 	return i, err
 }
@@ -53,13 +57,15 @@ const createAuthTransaction = `-- name: CreateAuthTransaction :exec
 INSERT INTO auth_transactions (
     id, token_hash, transaction_kind, client_id, redirect_uri, scopes,
     pkce_challenge, pkce_method, state_value, nonce_value, prompt_create,
+    response_type, response_mode, prompt_values, max_age_seconds,
     created_at, expires_at
 ) VALUES (
     $1, $2, $3,
     $4, $5, $6,
     $7, $8, $9,
     $10, $11, $12,
-    $13
+    $13, $14, $15, $16,
+    $17
 )
 `
 
@@ -75,6 +81,10 @@ type CreateAuthTransactionParams struct {
 	StateValue      *string            `db:"state_value"`
 	NonceValue      *string            `db:"nonce_value"`
 	PromptCreate    bool               `db:"prompt_create"`
+	ResponseType    *string            `db:"response_type"`
+	ResponseMode    *string            `db:"response_mode"`
+	PromptValues    []string           `db:"prompt_values"`
+	MaxAgeSeconds   *int64             `db:"max_age_seconds"`
 	CreatedAt       pgtype.Timestamptz `db:"created_at"`
 	ExpiresAt       pgtype.Timestamptz `db:"expires_at"`
 }
@@ -92,6 +102,10 @@ func (q *Queries) CreateAuthTransaction(ctx context.Context, arg CreateAuthTrans
 		arg.StateValue,
 		arg.NonceValue,
 		arg.PromptCreate,
+		arg.ResponseType,
+		arg.ResponseMode,
+		arg.PromptValues,
+		arg.MaxAgeSeconds,
 		arg.CreatedAt,
 		arg.ExpiresAt,
 	)
@@ -139,7 +153,7 @@ func (q *Queries) ExpireAuthTransactions(ctx context.Context, now pgtype.Timesta
 }
 
 const getAuthTransactionByID = `-- name: GetAuthTransactionByID :one
-SELECT id, token_hash, transaction_kind, client_id, redirect_uri, scopes, pkce_challenge, pkce_method, state_value, nonce_value, prompt_create, created_at, expires_at, consumed_at, failure_reason FROM auth_transactions WHERE id = $1
+SELECT id, token_hash, transaction_kind, client_id, redirect_uri, scopes, pkce_challenge, pkce_method, state_value, nonce_value, prompt_create, created_at, expires_at, consumed_at, failure_reason, response_type, response_mode, prompt_values, max_age_seconds FROM auth_transactions WHERE id = $1
 `
 
 func (q *Queries) GetAuthTransactionByID(ctx context.Context, id uuid.UUID) (AuthTransaction, error) {
@@ -161,12 +175,16 @@ func (q *Queries) GetAuthTransactionByID(ctx context.Context, id uuid.UUID) (Aut
 		&i.ExpiresAt,
 		&i.ConsumedAt,
 		&i.FailureReason,
+		&i.ResponseType,
+		&i.ResponseMode,
+		&i.PromptValues,
+		&i.MaxAgeSeconds,
 	)
 	return i, err
 }
 
 const getAuthTransactionByTokenHash = `-- name: GetAuthTransactionByTokenHash :one
-SELECT id, token_hash, transaction_kind, client_id, redirect_uri, scopes, pkce_challenge, pkce_method, state_value, nonce_value, prompt_create, created_at, expires_at, consumed_at, failure_reason FROM auth_transactions WHERE token_hash = $1
+SELECT id, token_hash, transaction_kind, client_id, redirect_uri, scopes, pkce_challenge, pkce_method, state_value, nonce_value, prompt_create, created_at, expires_at, consumed_at, failure_reason, response_type, response_mode, prompt_values, max_age_seconds FROM auth_transactions WHERE token_hash = $1
 `
 
 func (q *Queries) GetAuthTransactionByTokenHash(ctx context.Context, tokenHash []byte) (AuthTransaction, error) {
@@ -188,6 +206,83 @@ func (q *Queries) GetAuthTransactionByTokenHash(ctx context.Context, tokenHash [
 		&i.ExpiresAt,
 		&i.ConsumedAt,
 		&i.FailureReason,
+		&i.ResponseType,
+		&i.ResponseMode,
+		&i.PromptValues,
+		&i.MaxAgeSeconds,
+	)
+	return i, err
+}
+
+const lockAuthTransactionByID = `-- name: LockAuthTransactionByID :one
+SELECT id, token_hash, transaction_kind, client_id, redirect_uri, scopes, pkce_challenge, pkce_method, state_value, nonce_value, prompt_create, created_at, expires_at, consumed_at, failure_reason, response_type, response_mode, prompt_values, max_age_seconds FROM auth_transactions WHERE id = $1 FOR UPDATE
+`
+
+func (q *Queries) LockAuthTransactionByID(ctx context.Context, id uuid.UUID) (AuthTransaction, error) {
+	row := q.db.QueryRow(ctx, lockAuthTransactionByID, id)
+	var i AuthTransaction
+	err := row.Scan(
+		&i.ID,
+		&i.TokenHash,
+		&i.TransactionKind,
+		&i.ClientID,
+		&i.RedirectUri,
+		&i.Scopes,
+		&i.PkceChallenge,
+		&i.PkceMethod,
+		&i.StateValue,
+		&i.NonceValue,
+		&i.PromptCreate,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+		&i.ConsumedAt,
+		&i.FailureReason,
+		&i.ResponseType,
+		&i.ResponseMode,
+		&i.PromptValues,
+		&i.MaxAgeSeconds,
+	)
+	return i, err
+}
+
+const rejectAuthTransaction = `-- name: RejectAuthTransaction :one
+UPDATE auth_transactions
+SET consumed_at = $1, failure_reason = $2
+WHERE id = $3
+  AND consumed_at IS NULL
+  AND expires_at > $1
+RETURNING id, token_hash, transaction_kind, client_id, redirect_uri, scopes, pkce_challenge, pkce_method, state_value, nonce_value, prompt_create, created_at, expires_at, consumed_at, failure_reason, response_type, response_mode, prompt_values, max_age_seconds
+`
+
+type RejectAuthTransactionParams struct {
+	ConsumedAt    pgtype.Timestamptz `db:"consumed_at"`
+	FailureReason *string            `db:"failure_reason"`
+	ID            uuid.UUID          `db:"id"`
+}
+
+func (q *Queries) RejectAuthTransaction(ctx context.Context, arg RejectAuthTransactionParams) (AuthTransaction, error) {
+	row := q.db.QueryRow(ctx, rejectAuthTransaction, arg.ConsumedAt, arg.FailureReason, arg.ID)
+	var i AuthTransaction
+	err := row.Scan(
+		&i.ID,
+		&i.TokenHash,
+		&i.TransactionKind,
+		&i.ClientID,
+		&i.RedirectUri,
+		&i.Scopes,
+		&i.PkceChallenge,
+		&i.PkceMethod,
+		&i.StateValue,
+		&i.NonceValue,
+		&i.PromptCreate,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+		&i.ConsumedAt,
+		&i.FailureReason,
+		&i.ResponseType,
+		&i.ResponseMode,
+		&i.PromptValues,
+		&i.MaxAgeSeconds,
 	)
 	return i, err
 }

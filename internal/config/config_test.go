@@ -11,6 +11,7 @@ import (
 )
 
 const validDatabaseURL = "postgres://oneissuer:super-secret@localhost:5432/oneissuer?sslmode=disable"
+const validSigningKeyFile = "/run/secrets/oneissuer-signing-key.jwk"
 
 func env(values map[string]string) LookupEnv {
 	return func(name string) (string, bool) {
@@ -22,7 +23,10 @@ func env(values map[string]string) LookupEnv {
 func TestLoadDefaults(t *testing.T) {
 	t.Parallel()
 
-	cfg, err := LoadFrom(env(map[string]string{"ONEISSUER_DATABASE_URL": validDatabaseURL}), ScopeService)
+	cfg, err := LoadFrom(env(map[string]string{
+		"ONEISSUER_DATABASE_URL":     validDatabaseURL,
+		"ONEISSUER_SIGNING_KEY_FILE": validSigningKeyFile,
+	}), ScopeService)
 	if err != nil {
 		t.Fatalf("LoadFrom() error = %v", err)
 	}
@@ -41,6 +45,10 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Password.MinLength != 15 || cfg.Password.MaxBytes < 64 || cfg.Password.Argon2MemoryKiB < 19*1024 {
 		t.Fatalf("unexpected password defaults: %#v", cfg.Password)
 	}
+	if cfg.OIDC.SigningKeyFile != validSigningKeyFile || cfg.OIDC.AuthorizationCodeTTL != time.Minute ||
+		cfg.OIDC.IDTokenTTL != 5*time.Minute || cfg.OIDC.AccessTokenTTL != 10*time.Minute || cfg.OIDC.ClockSkew != 30*time.Second {
+		t.Fatalf("unexpected OIDC defaults: %#v", cfg.OIDC)
+	}
 }
 
 func TestLoadValidOverrides(t *testing.T) {
@@ -48,7 +56,7 @@ func TestLoadValidOverrides(t *testing.T) {
 
 	cfg, err := LoadFrom(env(map[string]string{
 		"ONEISSUER_ENV":                      "test",
-		"ONEISSUER_ISSUER":                   "https://id.example.test/base",
+		"ONEISSUER_ISSUER":                   "https://id.example.test:8443",
 		"ONEISSUER_HTTP_ADDR":                "127.0.0.1:9090",
 		"ONEISSUER_DATABASE_URL":             "postgresql://user:pass@db.example.test/app?sslmode=require",
 		"ONEISSUER_LOG_LEVEL":                "debug",
@@ -61,6 +69,12 @@ func TestLoadValidOverrides(t *testing.T) {
 		"ONEISSUER_HTTP_MAX_HEADER_BYTES":    "2048",
 		"ONEISSUER_DATABASE_MAX_CONNS":       "20",
 		"ONEISSUER_TRUSTED_PROXIES":          "10.0.0.1/8, 2001:db8::/32",
+		"ONEISSUER_SIGNING_KEY_FILE":         validSigningKeyFile,
+		"ONEISSUER_VERIFICATION_KEYS_FILE":   "/run/secrets/oneissuer-verification-keys.jwks",
+		"ONEISSUER_AUTHORIZATION_CODE_TTL":   "2m",
+		"ONEISSUER_ID_TOKEN_TTL":             "10m",
+		"ONEISSUER_ACCESS_TOKEN_TTL":         "20m",
+		"ONEISSUER_OIDC_CLOCK_SKEW":          "0s",
 	}), ScopeService)
 	if err != nil {
 		t.Fatalf("LoadFrom() error = %v", err)
@@ -70,6 +84,9 @@ func TestLoadValidOverrides(t *testing.T) {
 	}
 	if got := fmt.Sprint(cfg.TrustedProxies); got != "[10.0.0.0/8 2001:db8::/32]" {
 		t.Fatalf("TrustedProxies = %q", got)
+	}
+	if cfg.OIDC.AuthorizationCodeTTL != 2*time.Minute || cfg.OIDC.ClockSkew != 0 || cfg.OIDC.VerificationKeysFile == "" {
+		t.Fatalf("OIDC overrides were not applied: %#v", cfg.OIDC)
 	}
 }
 
@@ -92,6 +109,12 @@ func TestLoadReportsAllInvalidSettingsWithoutValues(t *testing.T) {
 		"ONEISSUER_HTTP_MAX_HEADER_BYTES":    "0",
 		"ONEISSUER_DATABASE_MAX_CONNS":       "1000",
 		"ONEISSUER_TRUSTED_PROXIES":          "not-a-cidr",
+		"ONEISSUER_SIGNING_KEY_FILE":         " bad-key-path ",
+		"ONEISSUER_VERIFICATION_KEYS_FILE":   " bad-verification-path ",
+		"ONEISSUER_AUTHORIZATION_CODE_TTL":   "10s",
+		"ONEISSUER_ID_TOKEN_TTL":             "16m",
+		"ONEISSUER_ACCESS_TOKEN_TTL":         "31m",
+		"ONEISSUER_OIDC_CLOCK_SKEW":          "3m",
 	}), ScopeService)
 	if err == nil {
 		t.Fatal("LoadFrom() error = nil")
@@ -100,8 +123,8 @@ func TestLoadReportsAllInvalidSettingsWithoutValues(t *testing.T) {
 	if !errors.As(err, &validationError) {
 		t.Fatalf("error type = %T", err)
 	}
-	if len(validationError.Problems) != 14 {
-		t.Fatalf("problem count = %d, want 14: %v", len(validationError.Problems), err)
+	if len(validationError.Problems) != 20 {
+		t.Fatalf("problem count = %d, want 20: %v", len(validationError.Problems), err)
 	}
 	if strings.Contains(err.Error(), secret) {
 		t.Fatal("validation error leaked a secret")
@@ -119,17 +142,19 @@ func TestProductionSafetyValidation(t *testing.T) {
 		{
 			name: "issuer must be explicit",
 			values: map[string]string{
-				"ONEISSUER_ENV":          "production",
-				"ONEISSUER_DATABASE_URL": "postgres://u:p@db/app?sslmode=require",
+				"ONEISSUER_ENV":              "production",
+				"ONEISSUER_DATABASE_URL":     "postgres://u:p@db/app?sslmode=require",
+				"ONEISSUER_SIGNING_KEY_FILE": validSigningKeyFile,
 			},
 			field: "ONEISSUER_ISSUER",
 		},
 		{
 			name: "issuer must use HTTPS",
 			values: map[string]string{
-				"ONEISSUER_ENV":          "production",
-				"ONEISSUER_ISSUER":       "http://id.example.test",
-				"ONEISSUER_DATABASE_URL": "postgres://u:p@db/app?sslmode=require",
+				"ONEISSUER_ENV":              "production",
+				"ONEISSUER_ISSUER":           "http://id.example.test",
+				"ONEISSUER_DATABASE_URL":     "postgres://u:p@db/app?sslmode=require",
+				"ONEISSUER_SIGNING_KEY_FILE": validSigningKeyFile,
 			},
 			field: "must use https",
 		},
@@ -159,10 +184,11 @@ func TestDatabaseScopeIgnoresUnrelatedSettings(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := LoadFrom(env(map[string]string{
-		"ONEISSUER_DATABASE_URL": "postgres://u:p@db/app?sslmode=disable",
-		"ONEISSUER_ENV":          "invalid",
-		"ONEISSUER_ISSUER":       "invalid",
-		"ONEISSUER_HTTP_ADDR":    "invalid",
+		"ONEISSUER_DATABASE_URL":     "postgres://u:p@db/app?sslmode=disable",
+		"ONEISSUER_SIGNING_KEY_FILE": validSigningKeyFile,
+		"ONEISSUER_ENV":              "invalid",
+		"ONEISSUER_ISSUER":           "invalid",
+		"ONEISSUER_HTTP_ADDR":        "invalid",
 	}), ScopeDatabase)
 	if err != nil {
 		t.Fatalf("LoadFrom() error = %v", err)
@@ -211,10 +237,116 @@ func TestDatabaseURLIsRequired(t *testing.T) {
 	}
 }
 
+func TestServiceSigningKeyReferenceIsRequiredButNarrowScopesIgnoreIt(t *testing.T) {
+	t.Parallel()
+
+	_, err := LoadFrom(env(map[string]string{"ONEISSUER_DATABASE_URL": validDatabaseURL}), ScopeService)
+	if err == nil || !strings.Contains(err.Error(), "ONEISSUER_SIGNING_KEY_FILE: is required") {
+		t.Fatalf("service scope missing-key error = %v", err)
+	}
+	if _, err := LoadFrom(env(map[string]string{"ONEISSUER_DATABASE_URL": validDatabaseURL}), ScopeDatabase); err != nil {
+		t.Fatalf("database scope unexpectedly required a key: %v", err)
+	}
+	if _, err := LoadFrom(env(map[string]string{"ONEISSUER_DATABASE_URL": validDatabaseURL}), ScopeBootstrap); err != nil {
+		t.Fatalf("bootstrap scope unexpectedly required a key: %v", err)
+	}
+}
+
+func TestIssuerMustBeCanonicalOriginAndHTTPMustBeLoopback(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		issuer string
+		valid  bool
+	}{
+		{name: "https origin", issuer: "https://id.example.test", valid: true},
+		{name: "https explicit port", issuer: "https://id.example.test:8443", valid: true},
+		{name: "localhost http", issuer: "http://localhost:8080", valid: true},
+		{name: "IPv4 loopback http", issuer: "http://127.0.0.1:8080", valid: true},
+		{name: "IPv6 loopback http", issuer: "http://[::1]:8080", valid: true},
+		{name: "path", issuer: "https://id.example.test/tenant", valid: false},
+		{name: "trailing slash", issuer: "https://id.example.test/", valid: false},
+		{name: "empty query", issuer: "https://id.example.test?", valid: false},
+		{name: "empty fragment", issuer: "https://id.example.test#", valid: false},
+		{name: "userinfo", issuer: "https://user@id.example.test", valid: false},
+		{name: "uppercase scheme", issuer: "HTTPS://id.example.test", valid: false},
+		{name: "non-loopback http", issuer: "http://id.example.test", valid: false},
+		{name: "empty port", issuer: "https://id.example.test:", valid: false},
+		{name: "surrounding whitespace", issuer: " https://id.example.test", valid: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := LoadFrom(env(map[string]string{
+				"ONEISSUER_DATABASE_URL":     validDatabaseURL,
+				"ONEISSUER_SIGNING_KEY_FILE": validSigningKeyFile,
+				"ONEISSUER_ISSUER":           test.issuer,
+			}), ScopeService)
+			if test.valid && err != nil {
+				t.Fatalf("valid issuer rejected: %v", err)
+			}
+			if !test.valid && (err == nil || !strings.Contains(err.Error(), "ONEISSUER_ISSUER")) {
+				t.Fatalf("invalid issuer accepted/error=%v", err)
+			}
+		})
+	}
+}
+
+func TestOIDCLifetimeBoundsAndSafeMapDoNotExposePaths(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name  string
+		field string
+		value string
+	}{
+		{name: "code below minimum", field: "ONEISSUER_AUTHORIZATION_CODE_TTL", value: "29s"},
+		{name: "code above maximum", field: "ONEISSUER_AUTHORIZATION_CODE_TTL", value: "5m1s"},
+		{name: "id below minimum", field: "ONEISSUER_ID_TOKEN_TTL", value: "59s"},
+		{name: "id above maximum", field: "ONEISSUER_ID_TOKEN_TTL", value: "15m1s"},
+		{name: "access below minimum", field: "ONEISSUER_ACCESS_TOKEN_TTL", value: "59s"},
+		{name: "access above maximum", field: "ONEISSUER_ACCESS_TOKEN_TTL", value: "30m1s"},
+		{name: "negative skew", field: "ONEISSUER_OIDC_CLOCK_SKEW", value: "-1s"},
+		{name: "excessive skew", field: "ONEISSUER_OIDC_CLOCK_SKEW", value: "2m1s"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			values := map[string]string{
+				"ONEISSUER_DATABASE_URL":     validDatabaseURL,
+				"ONEISSUER_SIGNING_KEY_FILE": validSigningKeyFile,
+				test.field:                   test.value,
+			}
+			_, err := LoadFrom(env(values), ScopeService)
+			if err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("out-of-range lifetime error=%v", err)
+			}
+		})
+	}
+
+	const verificationPath = "/private/verification-location.jwks"
+	cfg, err := LoadFrom(env(map[string]string{
+		"ONEISSUER_DATABASE_URL":           validDatabaseURL,
+		"ONEISSUER_SIGNING_KEY_FILE":       validSigningKeyFile,
+		"ONEISSUER_VERIFICATION_KEYS_FILE": verificationPath,
+	}), ScopeService)
+	if err != nil {
+		t.Fatalf("LoadFrom() error = %v", err)
+	}
+	encoded, err := json.Marshal(cfg.SafeMap())
+	if err != nil {
+		t.Fatalf("json.Marshal(SafeMap) error = %v", err)
+	}
+	if strings.Contains(string(encoded), validSigningKeyFile) || strings.Contains(string(encoded), verificationPath) {
+		t.Fatalf("SafeMap leaked a key path: %s", encoded)
+	}
+}
+
 func TestPhaseTwoSecurityConfigurationValidation(t *testing.T) {
 	t.Parallel()
 	_, err := LoadFrom(env(map[string]string{
 		"ONEISSUER_DATABASE_URL":          validDatabaseURL,
+		"ONEISSUER_SIGNING_KEY_FILE":      validSigningKeyFile,
 		"ONEISSUER_SESSION_TTL":           "1h",
 		"ONEISSUER_SESSION_IDLE_TIMEOUT":  "2h",
 		"ONEISSUER_PASSWORD_MIN_LENGTH":   "14",
@@ -243,9 +375,10 @@ func TestPhaseTwoSecurityConfigurationValidation(t *testing.T) {
 func TestProductionBrowserSafetyRequiresExplicitSecureChoices(t *testing.T) {
 	t.Parallel()
 	base := map[string]string{
-		"ONEISSUER_ENV":          "production",
-		"ONEISSUER_ISSUER":       "https://id.example.test",
-		"ONEISSUER_DATABASE_URL": "postgres://u:p@db/app?sslmode=require",
+		"ONEISSUER_ENV":              "production",
+		"ONEISSUER_ISSUER":           "https://id.example.test",
+		"ONEISSUER_DATABASE_URL":     "postgres://u:p@db/app?sslmode=require",
+		"ONEISSUER_SIGNING_KEY_FILE": validSigningKeyFile,
 	}
 	_, err := LoadFrom(env(base), ScopeService)
 	if err == nil || !strings.Contains(err.Error(), "ONEISSUER_COOKIE_SECURE") ||

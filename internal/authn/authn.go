@@ -66,11 +66,12 @@ type LoginInput struct {
 
 // RegisterCommit contains the records written atomically for registration.
 type RegisterCommit struct {
-	User          identity.PreparedUser
-	Session       session.Record
-	PreAuthID     uuid.UUID
-	TransactionID uuid.UUID
-	Events        []audit.Event
+	User               identity.PreparedUser
+	Session            session.Record
+	PreAuthID          uuid.UUID
+	TransactionID      uuid.UUID
+	ConsumeTransaction bool
+	Events             []audit.Event
 }
 
 // LoginCommit contains the records mutated atomically for successful login.
@@ -79,6 +80,7 @@ type LoginCommit struct {
 	Session             session.Record
 	PreAuthID           uuid.UUID
 	TransactionID       uuid.UUID
+	ConsumeTransaction  bool
 	ExistingSessionHash []byte
 	ReplacementHash     string
 	Now                 time.Time
@@ -140,6 +142,9 @@ func (s *Service) Begin(ctx context.Context, mode BeginMode, transactionToken, r
 	if err != nil {
 		return BeginResult{}, ErrInvalidFlow
 	}
+	if mode == BeginLogin && transaction.Kind == authflow.KindAuthorization && transaction.PromptCreate {
+		return BeginResult{}, ErrInvalidFlow
+	}
 	if mode == BeginRegister {
 		if err := s.checkRegistration(ctx, transaction); err != nil {
 			return BeginResult{}, err
@@ -180,12 +185,14 @@ func (s *Service) Register(ctx context.Context, input RegisterInput, now time.Ti
 	if err != nil {
 		return session.Issued{}, err
 	}
-	events, err := successEvents(prepared.User.ID, issued.Record.ID, transaction.ID, input.RequestID, now, true)
+	consumeTransaction := transaction.Kind == authflow.KindLocal
+	events, err := successEvents(prepared.User.ID, issued.Record.ID, transaction.ID, input.RequestID, now, true, consumeTransaction)
 	if err != nil {
 		return session.Issued{}, err
 	}
 	if err := s.repository.CommitRegistration(ctx, RegisterCommit{
-		User: prepared, Session: issued.Record, PreAuthID: preauth.ID, TransactionID: transaction.ID, Events: events,
+		User: prepared, Session: issued.Record, PreAuthID: preauth.ID, TransactionID: transaction.ID,
+		ConsumeTransaction: consumeTransaction, Events: events,
 	}); err != nil {
 		s.observeRegistration("failure")
 		if errors.Is(err, identity.ErrDuplicate) {
@@ -241,13 +248,15 @@ func (s *Service) Login(ctx context.Context, input LoginInput, now time.Time) (s
 	if err != nil {
 		return session.Issued{}, identity.User{}, err
 	}
-	events, err := successEvents(record.User.ID, issued.Record.ID, transaction.ID, input.RequestID, now, false)
+	consumeTransaction := transaction.Kind == authflow.KindLocal
+	events, err := successEvents(record.User.ID, issued.Record.ID, transaction.ID, input.RequestID, now, false, consumeTransaction)
 	if err != nil {
 		return session.Issued{}, identity.User{}, err
 	}
 	commit := LoginCommit{
 		UserID: record.User.ID, Session: issued.Record, PreAuthID: preauth.ID, TransactionID: transaction.ID,
-		ReplacementHash: replacement, Now: now.UTC(), RequestID: input.RequestID, Events: events,
+		ConsumeTransaction: consumeTransaction,
+		ReplacementHash:    replacement, Now: now.UTC(), RequestID: input.RequestID, Events: events,
 	}
 	if input.ExistingSessionToken != "" {
 		commit.ExistingSessionHash = session.HashToken(input.ExistingSessionToken)
@@ -305,7 +314,14 @@ func (s *Service) checkRegistration(ctx context.Context, transaction authflow.Tr
 	return nil
 }
 
-func successEvents(userID, sessionID, transactionID uuid.UUID, requestID string, now time.Time, registration bool) ([]audit.Event, error) {
+// CanRegister reports whether a verified server transaction may enter the
+// hosted registration flow. It accepts no browser-supplied Client policy.
+func (s *Service) CanRegister(ctx context.Context, transaction authflow.Transaction) bool {
+	return s.checkRegistration(ctx, transaction) == nil &&
+		(transaction.Kind == authflow.KindLocal || transaction.PromptCreate)
+}
+
+func successEvents(userID, sessionID, transactionID uuid.UUID, requestID string, now time.Time, registration, consumeTransaction bool) ([]audit.Event, error) {
 	typeValue := audit.LoginSucceeded
 	var changed []string
 	if registration {
@@ -320,11 +336,15 @@ func successEvents(userID, sessionID, transactionID uuid.UUID, requestID string,
 	if err != nil {
 		return nil, err
 	}
-	consumed, err := audit.New(audit.AuthorizationTransactionConsumed, audit.ResultSuccess, &userID, audit.TargetAuthTransaction, &transactionID, requestID, nil, now)
-	if err != nil {
-		return nil, err
+	events := []audit.Event{first, created}
+	if consumeTransaction {
+		consumed, err := audit.New(audit.AuthorizationTransactionConsumed, audit.ResultSuccess, &userID, audit.TargetAuthTransaction, &transactionID, requestID, nil, now)
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, consumed)
 	}
-	return []audit.Event{first, created, consumed}, nil
+	return events, nil
 }
 
 func (s *Service) recordRejected(ctx context.Context, eventType audit.EventType, requestID string, now time.Time) {

@@ -46,6 +46,27 @@ func (s *Store) GetClient(ctx context.Context, id uuid.UUID) (clientdomain.Clien
 	return result, err
 }
 
+// GetClientByPublicID returns one credential-free Client by protocol client_id.
+func (s *Store) GetClientByPublicID(ctx context.Context, publicID string) (clientdomain.Client, error) {
+	var result clientdomain.Client
+	err := s.inTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(queries *sqlcgen.Queries) error {
+		row, err := queries.GetOIDCClientByClientID(ctx, publicID)
+		if isNoRows(err) {
+			return clientdomain.ErrNotFound
+		}
+		if err != nil {
+			return wrapError("get client by public identifier", ErrorKindQuery, err)
+		}
+		value := mapClient(row)
+		if err := loadClientChildren(ctx, queries, &value); err != nil {
+			return err
+		}
+		result = value
+		return nil
+	})
+	return result, err
+}
+
 // ListClients returns credential-free clients using keyset pagination.
 func (s *Store) ListClients(ctx context.Context, cursor pagination.Cursor, limit int) ([]clientdomain.Client, error) {
 	result := make([]clientdomain.Client, 0)

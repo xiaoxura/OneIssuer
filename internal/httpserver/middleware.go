@@ -75,7 +75,8 @@ func metricMethod(method string) string {
 
 func routeLabel(path string) string {
 	switch path {
-	case "/health/live", "/health/ready", "/metrics", "/login", "/register", "/logout", "/auth/complete",
+	case "/health/live", "/health/ready", "/metrics", "/login", "/register", "/consent", "/logout", "/auth/complete",
+		"/.well-known/openid-configuration", "/oauth2/jwks", "/oauth2/authorize", "/oauth2/authorize/continue", "/oauth2/token", "/oauth2/userinfo",
 		"/api/v1/me", "/api/v1/me/sessions", "/api/v1/me/sessions/revoke-others",
 		"/api/admin/v1/me", "/api/admin/v1/users", "/api/admin/v1/clients",
 		"/api/admin/v1/sessions", "/api/admin/v1/audit-events":

@@ -5,8 +5,8 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 spec="$root/api/openapi.yaml"
 redocly_version=${REDOCLY_VERSION:-2.43.2}
 
-if [ "$(grep -c '^  version: 0\.1\.0-dev\.2$' "$spec")" -ne 1 ]; then
-  echo "OpenAPI info.version must be exactly 0.1.0-dev.2" >&2
+if [ "$(grep -c '^  version: 0\.1\.0-dev\.3$' "$spec")" -ne 1 ]; then
+  echo "OpenAPI info.version must be exactly 0.1.0-dev.3" >&2
   exit 1
 fi
 
@@ -35,11 +35,11 @@ do
 done
 
 if grep -Eq '^  /(\.well-known|oauth2|userinfo|connect)(/|:)' "$spec"; then
-  echo "OpenAPI advertises an unimplemented OIDC/OAuth path" >&2
+  echo "management OpenAPI must not duplicate standard OIDC/OAuth protocol paths" >&2
   exit 1
 fi
 if grep -Eiq '^[[:space:]]+(examples?|x-example):' "$spec"; then
-  echo "OpenAPI examples are forbidden in phase two to prevent credential fixtures" >&2
+  echo "OpenAPI examples are forbidden to prevent credential fixtures" >&2
   exit 1
 fi
 if grep -Eiq '^[[:space:]]+(password_hash|secret_hash|token_hash|csrf_hash|credential_hash):' "$spec"; then

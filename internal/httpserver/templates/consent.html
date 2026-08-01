@@ -1,0 +1,27 @@
+{{- /* Embedded hosted Consent page. html/template escapes every restored server value. */ -}}
+<!doctype html>
+<html lang="{{.Lang}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+</head>
+<body>
+  <main>
+    <h1>{{.Title}}</h1>
+    <p><strong>{{.ClientName}}</strong></p>
+    <p>{{.Intro}}</p>
+    <ul>
+      {{range .Scopes}}
+      <li><strong>{{.Name}}</strong> — {{.Description}} <small>({{.Status}})</small></li>
+      {{end}}
+    </ul>
+    <form method="post" action="/consent">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <input type="hidden" name="transaction" value="{{.TransactionToken}}">
+      <button type="submit" name="decision" value="approve">{{.ApproveLabel}}</button>
+      <button type="submit" name="decision" value="deny">{{.DenyLabel}}</button>
+    </form>
+  </main>
+</body>
+</html>

@@ -9,17 +9,33 @@ trap 'rm -f "$temporary"' EXIT HUP INT TERM
 # fixtures intentionally contain synthetic secrets and are covered by runtime
 # privacy assertions instead.
 set -- \
+  "$root/.env.example" \
   "$root/README.md" \
+  "$root/SECURITY.md" \
   "$root/api/openapi.yaml" \
+  "$root/docs/README.md" \
+  "$root/docs/development.md" \
   "$root/docs/configuration.md" \
   "$root/docs/migrations.md" \
   "$root/docs/troubleshooting.md" \
   "$root/docs/operations.md" \
+  "$root/docs/key-rotation-runbook.md" \
+  "$root/docs/oidc-client-integration.md" \
   "$root/docs/phase-2-release-notes.md" \
   "$root/docs/phase-2-threat-model.md" \
   "$root/docs/phase-3-handoff.md" \
   "$root/docs/phase-3-development-plan.md" \
-  "$root/docs/adr/0001-phase-two-identity-and-client-security.md"
+  "$root/docs/phase-3-threat-model.md" \
+  "$root/docs/phase-3-dependency-spike.md" \
+  "$root/docs/phase-3-conformance.md" \
+  "$root/docs/phase-3-release-notes.md" \
+  "$root/examples/oidc-client/README.md" \
+  "$root/conformance/phase-3/matrix.json" \
+  "$root/conformance/phase-3/public-config.template.json" \
+  "$root/conformance/phase-3/confidential-config.template.json" \
+  "$root/conformance/phase-3/results/2026-08-01.json" \
+  "$root/docs/adr/0001-phase-two-identity-and-client-security.md" \
+  "$root/docs/adr/0002-phase-three-oidc-security-profile.md"
 
 : > "$temporary"
 for file in "$@"; do

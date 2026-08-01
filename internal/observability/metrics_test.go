@@ -35,6 +35,8 @@ func TestMetricsExposeRequiredFamilies(t *testing.T) {
 		"oneissuer_http_in_flight_requests",
 		"oneissuer_database_pool_connections",
 		"oneissuer_readiness_status",
+		"oneissuer_oidc_authorization_total",
+		"oneissuer_oidc_token_operations_total",
 	} {
 		if !found[name] {
 			t.Errorf("metric family %q is missing", name)
@@ -42,5 +44,33 @@ func TestMetricsExposeRequiredFamilies(t *testing.T) {
 	}
 	if value := testutil.ToFloat64(metrics.readiness); value != 1 {
 		t.Fatalf("readiness gauge = %v, want 1", value)
+	}
+}
+
+func TestMetricsPreinitializeBoundedOIDCMatrix(t *testing.T) {
+	t.Parallel()
+
+	metrics := NewMetrics(NewBuildInfo("test", "commit", "now"))
+	families, err := metrics.Gatherer().Gather()
+	if err != nil {
+		t.Fatalf("Gather() error = %v", err)
+	}
+
+	wantSeries := map[string]int{
+		"oneissuer_oidc_authorization_total":    2 * 3,
+		"oneissuer_oidc_token_operations_total": 3 * 3,
+	}
+	for _, family := range families {
+		want, ok := wantSeries[family.GetName()]
+		if !ok {
+			continue
+		}
+		if got := len(family.GetMetric()); got != want {
+			t.Errorf("metric family %q has %d series, want %d", family.GetName(), got, want)
+		}
+		delete(wantSeries, family.GetName())
+	}
+	for name := range wantSeries {
+		t.Errorf("metric family %q is missing before protocol traffic", name)
 	}
 }

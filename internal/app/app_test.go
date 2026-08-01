@@ -6,12 +6,71 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/oneissuer/oneissuer/internal/audit"
+	"github.com/oneissuer/oneissuer/internal/config"
 	"github.com/oneissuer/oneissuer/internal/httpserver"
+	"github.com/oneissuer/oneissuer/internal/observability"
 )
+
+func TestServeFailsClosedOnSigningKeyBeforeDatabaseOrListener(t *testing.T) {
+	t.Parallel()
+
+	privatePath := filepath.Join(t.TempDir(), "must-not-appear-in-error.jwk")
+	cfg := config.Config{
+		OIDC:     config.OIDCConfig{SigningKeyFile: privatePath},
+		Database: config.DatabaseConfig{URL: config.SecretURL{}, MaxConns: 1},
+	}
+	err := Serve(context.Background(), cfg, observability.NewBuildInfo("", "", ""), nil)
+	if err == nil || !strings.Contains(err.Error(), "signing key store startup check") {
+		t.Fatalf("Serve() error = %v", err)
+	}
+	if strings.Contains(err.Error(), privatePath) || strings.Contains(err.Error(), "database") {
+		t.Fatalf("startup check order/path safety error = %v", err)
+	}
+}
+
+type startupAuditRecorder struct {
+	event audit.Event
+	err   error
+}
+
+func (r *startupAuditRecorder) AppendAudit(_ context.Context, event audit.Event) error {
+	r.event = event
+	return r.err
+}
+
+func TestAppendSigningKeyLoadedUsesValueFreeFixedEvent(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 1, 9, 30, 0, 0, time.UTC)
+	recorder := &startupAuditRecorder{}
+	if err := appendSigningKeyLoaded(context.Background(), recorder, now); err != nil {
+		t.Fatalf("appendSigningKeyLoaded() error = %v", err)
+	}
+	event := recorder.event
+	if event.Type != audit.SigningKeyLoaded || event.Result != audit.ResultSuccess || !event.OccurredAt.Equal(now) {
+		t.Fatalf("unexpected startup event: %+v", event)
+	}
+	if event.ActorUserID != nil || event.TargetType != nil || event.TargetID != nil || event.RequestID != "" || len(event.ChangedFields) != 0 {
+		t.Fatalf("startup event contains contextual values: %+v", event)
+	}
+}
+
+func TestAppendSigningKeyLoadedFailsClosedOnAuditError(t *testing.T) {
+	t.Parallel()
+
+	want := errors.New("audit unavailable")
+	err := appendSigningKeyLoaded(context.Background(), &startupAuditRecorder{err: want}, time.Now())
+	if !errors.Is(err, want) {
+		t.Fatalf("appendSigningKeyLoaded() error = %v, want %v", err, want)
+	}
+}
 
 func TestSuperviseHTTPWaitsForInflightRequestAndDisablesReadinessFirst(t *testing.T) {
 	t.Parallel()

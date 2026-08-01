@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"context"
 	"crypto/subtle"
 	"embed"
 	"errors"
@@ -17,10 +18,14 @@ import (
 	"github.com/oneissuer/oneissuer/internal/admin"
 	"github.com/oneissuer/oneissuer/internal/authflow"
 	"github.com/oneissuer/oneissuer/internal/authn"
+	"github.com/oneissuer/oneissuer/internal/authorization"
 	clientdomain "github.com/oneissuer/oneissuer/internal/client"
+	"github.com/oneissuer/oneissuer/internal/consent"
 	"github.com/oneissuer/oneissuer/internal/identity"
+	"github.com/oneissuer/oneissuer/internal/oidc"
 	"github.com/oneissuer/oneissuer/internal/pagination"
 	"github.com/oneissuer/oneissuer/internal/session"
+	"github.com/oneissuer/oneissuer/internal/token"
 )
 
 const maxAuthBodyBytes = 64 << 10
@@ -30,25 +35,53 @@ var templateFiles embed.FS
 
 // ApplicationOptions supplies browser and JSON API dependencies.
 type ApplicationOptions struct {
-	Authn    *authn.Service
-	Sessions *session.Service
-	Admin    *admin.Service
-	Cookies  session.CookieManager
-	Issuer   *url.URL
-	Now      func() time.Time
+	Authn         *authn.Service
+	Sessions      *session.Service
+	Admin         *admin.Service
+	Clients       *clientdomain.Service
+	Transactions  *authflow.Service
+	Consents      *consent.Service
+	Authorization *authorization.Service
+	Tokens        ProtocolTokenService
+	Cookies       session.CookieManager
+	Issuer        *url.URL
+	PublicKeys    PublicKeySet
+	Now           func() time.Time
+}
+
+// ProtocolTokenService is the narrow HTTP boundary for Code exchange and
+// UserInfo. It deliberately exposes neither signing keys nor persistence.
+type ProtocolTokenService interface {
+	Exchange(context.Context, token.ExchangeInput) (token.Response, error)
+	UserInfoForAccessToken(context.Context, string, time.Time) (token.UserInfo, error)
+}
+
+// PublicKeySet is the intentionally narrow HTTP view of the immutable key
+// store. It cannot expose or serialize active private key material.
+type PublicKeySet interface {
+	PublicJWKS() []byte
+	ETag() string
 }
 
 type applicationHandler struct {
-	authn     *authn.Service
-	sessions  *session.Service
-	admin     *admin.Service
-	cookies   session.CookieManager
-	issuer    *url.URL
-	now       func() time.Time
-	templates *template.Template
+	authn         *authn.Service
+	sessions      *session.Service
+	admin         *admin.Service
+	clients       *clientdomain.Service
+	tokenClients  oidc.TokenClientResolver
+	transactions  *authflow.Service
+	consents      *consent.Service
+	authorization *authorization.Service
+	tokens        ProtocolTokenService
+	cookies       session.CookieManager
+	issuer        *url.URL
+	publicKeys    PublicKeySet
+	metadata      []byte
+	now           func() time.Time
+	templates     *template.Template
 }
 
-// NewApplicationHandler creates the phase-two browser and management router.
+// NewApplicationHandler creates the hosted browser, protocol, and management router.
 func NewApplicationHandler(options ApplicationOptions) (http.Handler, error) {
 	if options.Authn == nil || options.Sessions == nil || options.Admin == nil || options.Issuer == nil {
 		return nil, errors.New("application HTTP dependencies are incomplete")
@@ -60,14 +93,71 @@ func NewApplicationHandler(options ApplicationOptions) (http.Handler, error) {
 	if options.Now == nil {
 		options.Now = time.Now
 	}
+	metadata, err := oidc.BuildProviderMetadata(options.Issuer)
+	if err != nil {
+		return nil, errors.New("OIDC provider metadata configuration is invalid")
+	}
+	encodedMetadata, err := oidc.MarshalProviderMetadata(metadata)
+	if err != nil {
+		return nil, errors.New("OIDC provider metadata could not be initialized")
+	}
 	return &applicationHandler{
 		authn: options.Authn, sessions: options.Sessions, admin: options.Admin,
-		cookies: options.Cookies, issuer: options.Issuer, now: options.Now, templates: templates,
+		clients: options.Clients, tokenClients: options.Clients, transactions: options.Transactions, consents: options.Consents, authorization: options.Authorization, tokens: options.Tokens,
+		cookies: options.Cookies, issuer: options.Issuer, publicKeys: options.PublicKeys, metadata: encodedMetadata, now: options.Now, templates: templates,
 	}, nil
 }
 
 func (a *applicationHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	switch request.URL.Path {
+	case oidc.AuthorizePath, oidc.AuthorizeContinuePath:
+		if !a.oidcAuthorizationReady() {
+			writeError(writer, request, http.StatusNotFound, "not_found", "resource not found")
+			return
+		}
+		if request.URL.Path == oidc.AuthorizePath {
+			a.handleAuthorize(writer, request)
+		} else {
+			a.handleAuthorizeContinuation(writer, request)
+		}
+	case "/consent":
+		if !a.oidcAuthorizationReady() {
+			writeError(writer, request, http.StatusNotFound, "not_found", "resource not found")
+			return
+		}
+		if request.Method == http.MethodGet {
+			a.getConsent(writer, request)
+			return
+		}
+		if request.Method == http.MethodPost {
+			a.postConsent(writer, request)
+			return
+		}
+		methodNotAllowed(writer, request, http.MethodGet, http.MethodPost)
+	case oidc.TokenPath:
+		if a.tokenClients == nil || a.tokens == nil {
+			writeError(writer, request, http.StatusNotFound, "not_found", "resource not found")
+			return
+		}
+		a.handleToken(writer, request)
+	case oidc.UserInfoPath:
+		if a.tokens == nil {
+			writeError(writer, request, http.StatusNotFound, "not_found", "resource not found")
+			return
+		}
+		a.handleUserInfo(writer, request)
+	case oidc.DiscoveryPath:
+		if !a.oidcProviderReady() {
+			writeError(writer, request, http.StatusNotFound, "not_found", "resource not found")
+			return
+		}
+		a.handleDiscovery(writer, request)
+	case oidc.JWKSPath:
+		if a.publicKeys == nil {
+			writeError(writer, request, http.StatusNotFound, "not_found", "resource not found")
+			return
+		}
+		a.handleJWKS(writer, request)
 	case "/login":
 		if request.Method == http.MethodGet {
 			a.getAuthForm(writer, request, authn.BeginLogin)
@@ -122,6 +212,14 @@ func (a *applicationHandler) ServeHTTP(writer http.ResponseWriter, request *http
 		}
 		writeError(writer, request, http.StatusNotFound, "not_found", "resource not found")
 	}
+}
+
+func (a *applicationHandler) oidcAuthorizationReady() bool {
+	return a.clients != nil && a.transactions != nil && a.consents != nil && a.authorization != nil
+}
+
+func (a *applicationHandler) oidcProviderReady() bool {
+	return a.oidcAuthorizationReady() && a.tokenClients != nil && a.tokens != nil && a.publicKeys != nil && len(a.metadata) != 0
 }
 
 func (a *applicationHandler) serveDynamic(writer http.ResponseWriter, request *http.Request) bool {

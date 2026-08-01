@@ -88,7 +88,7 @@ func TestPostgresIntegration(t *testing.T) {
 		if migrationErr := postgres.RunMigrationCommand(ctx, databaseURL, postgres.MigrationUp, io.Discard); migrationErr != nil {
 			t.Fatalf("second migration up error = %v", migrationErr)
 		}
-		if !strings.Contains(output.String(), "version 5") {
+		if !strings.Contains(output.String(), "version 10") {
 			t.Fatalf("migration output = %q", output.String())
 		}
 		if checkErr := store.CheckMigrations(ctx); checkErr != nil {
@@ -99,7 +99,7 @@ func TestPostgresIntegration(t *testing.T) {
 		if statusErr := postgres.RunMigrationCommand(ctx, databaseURL, postgres.MigrationStatus, &output); statusErr != nil {
 			t.Fatalf("migration status error = %v", statusErr)
 		}
-		if !strings.Contains(output.String(), "current_version=5 expected_version=5 status=current") {
+		if !strings.Contains(output.String(), "current_version=10 expected_version=10 status=current") {
 			t.Fatalf("migration status = %q", output.String())
 		}
 	})
@@ -132,7 +132,7 @@ func TestPostgresIntegration(t *testing.T) {
 	t.Run("all production migrations support test down and up", func(t *testing.T) {
 		database := openSQLDatabase(ctx, t, databaseURL)
 		defer func() { _ = database.Close() }()
-		for range 5 {
+		for range 10 {
 			if migrationErr := postgres.MigrateDown(ctx, database, productionmigrations.FS, "."); migrationErr != nil {
 				t.Fatalf("production MigrateDown() error = %v", migrationErr)
 			}
@@ -220,6 +220,10 @@ func TestPostgresIntegration(t *testing.T) {
 
 	t.Run("phase two identity client session and audit lifecycle", func(t *testing.T) {
 		testPhaseTwoLifecycle(ctx, t, store, databaseURL)
+	})
+
+	t.Run("phase three Consent and atomic Authorization Code lifecycle", func(t *testing.T) {
+		testPhaseThreeAuthorizationLifecycle(ctx, t, store, databaseURL)
 	})
 
 	store.Close()

@@ -22,6 +22,9 @@ func (f *fakeRepository) CreateClient(_ context.Context, value Client, secret *S
 	return nil
 }
 func (f *fakeRepository) GetClient(context.Context, uuid.UUID) (Client, error) { return f.created, nil }
+func (f *fakeRepository) GetClientByPublicID(context.Context, string) (Client, error) {
+	return f.created, nil
+}
 func (f *fakeRepository) ListClients(context.Context, pagination.Cursor, int) ([]Client, error) {
 	return []Client{f.created}, nil
 }
@@ -56,6 +59,20 @@ func TestClientTypeURIAndSecretRules(t *testing.T) {
 	if string(repository.secret.SecretHash) == confidential.Secret {
 		t.Fatal("clear secret was stored as its digest")
 	}
+	resolved, err := service.ResolveActive(context.Background(), confidential.Client.ClientID)
+	if err != nil || resolved.ClientID != confidential.Client.ClientID {
+		t.Fatalf("ResolveActive()=%+v err=%v", resolved, err)
+	}
+	for _, malformed := range []string{"", "client", confidential.Client.ClientID + "x", " " + confidential.Client.ClientID} {
+		if _, err := service.ResolveActive(context.Background(), malformed); !errors.Is(err, ErrNotFound) {
+			t.Errorf("ResolveActive(%q) error=%v", malformed, err)
+		}
+	}
+	repository.created.Status = StatusDisabled
+	if _, err := service.ResolveActive(context.Background(), confidential.Client.ClientID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("disabled ResolveActive() error=%v", err)
+	}
+	repository.created.Status = StatusActive
 	if !service.RedirectURIMatches(confidential.Client, "https://app.example/callback?x=1") ||
 		service.RedirectURIMatches(confidential.Client, "https://app.example/callback?x=2") {
 		t.Fatal("redirect URI matching was not exact")

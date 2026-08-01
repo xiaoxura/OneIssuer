@@ -92,12 +92,14 @@ func (s *Store) CommitRegistration(ctx context.Context, commit authn.RegisterCom
 		} else if err != nil {
 			return wrapError("consume registration pre-auth", ErrorKindQuery, err)
 		}
-		if _, err := queries.ConsumeAuthTransaction(ctx, sqlcgen.ConsumeAuthTransactionParams{
-			ConsumedAt: timestamp(commit.Session.CreatedAt), ID: commit.TransactionID,
-		}); isNoRows(err) {
-			return authflow.ErrConsumed
-		} else if err != nil {
-			return wrapError("consume registration transaction", ErrorKindQuery, err)
+		if commit.ConsumeTransaction {
+			if _, err := queries.ConsumeAuthTransaction(ctx, sqlcgen.ConsumeAuthTransactionParams{
+				ConsumedAt: timestamp(commit.Session.CreatedAt), ID: commit.TransactionID,
+			}); isNoRows(err) {
+				return authflow.ErrConsumed
+			} else if err != nil {
+				return wrapError("consume registration transaction", ErrorKindQuery, err)
+			}
 		}
 		for _, event := range commit.Events {
 			if err := insertAudit(ctx, queries, event); err != nil {
@@ -128,12 +130,14 @@ func (s *Store) CommitLogin(ctx context.Context, commit authn.LoginCommit) error
 		} else if err != nil {
 			return wrapError("consume login pre-auth", ErrorKindQuery, err)
 		}
-		if _, err := queries.ConsumeAuthTransaction(ctx, sqlcgen.ConsumeAuthTransactionParams{
-			ConsumedAt: timestamp(commit.Now), ID: commit.TransactionID,
-		}); isNoRows(err) {
-			return authflow.ErrConsumed
-		} else if err != nil {
-			return wrapError("consume login transaction", ErrorKindQuery, err)
+		if commit.ConsumeTransaction {
+			if _, err := queries.ConsumeAuthTransaction(ctx, sqlcgen.ConsumeAuthTransactionParams{
+				ConsumedAt: timestamp(commit.Now), ID: commit.TransactionID,
+			}); isNoRows(err) {
+				return authflow.ErrConsumed
+			} else if err != nil {
+				return wrapError("consume login transaction", ErrorKindQuery, err)
+			}
 		}
 		if len(commit.ExistingSessionHash) > 0 {
 			revoked, revokeErr := queries.RevokeLoginSessionByHash(ctx, sqlcgen.RevokeLoginSessionByHashParams{

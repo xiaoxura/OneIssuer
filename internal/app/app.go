@@ -12,18 +12,26 @@ import (
 	"time"
 
 	"github.com/oneissuer/oneissuer/internal/admin"
+	"github.com/oneissuer/oneissuer/internal/audit"
 	"github.com/oneissuer/oneissuer/internal/authflow"
 	"github.com/oneissuer/oneissuer/internal/authn"
+	"github.com/oneissuer/oneissuer/internal/authorization"
 	clientdomain "github.com/oneissuer/oneissuer/internal/client"
 	"github.com/oneissuer/oneissuer/internal/config"
+	"github.com/oneissuer/oneissuer/internal/consent"
 	"github.com/oneissuer/oneissuer/internal/httpserver"
 	"github.com/oneissuer/oneissuer/internal/identity"
+	"github.com/oneissuer/oneissuer/internal/keystore"
 	"github.com/oneissuer/oneissuer/internal/observability"
 	"github.com/oneissuer/oneissuer/internal/session"
 	"github.com/oneissuer/oneissuer/internal/storage/postgres"
+	"github.com/oneissuer/oneissuer/internal/token"
 )
 
-const startupTimeout = 10 * time.Second
+const (
+	startupTimeout            = 10 * time.Second
+	protocolArtifactRetention = 24 * time.Hour
+)
 
 // ErrShutdownTimeout indicates that in-flight HTTP work exceeded the configured
 // graceful-shutdown budget and had to be force-closed.
@@ -32,6 +40,17 @@ var ErrShutdownTimeout = errors.New("graceful shutdown timed out")
 // Serve assembles PostgreSQL, migration checks, metrics, and HTTP in the
 // documented order. No listener is opened before all startup checks pass.
 func Serve(ctx context.Context, cfg config.Config, build observability.BuildInfo, logger *slog.Logger) error {
+	keyStore, err := keystore.Load(cfg.OIDC.SigningKeyFile, cfg.OIDC.VerificationKeysFile)
+	if err != nil {
+		return fmt.Errorf("signing key store startup check: %w", err)
+	}
+	if logger != nil {
+		logger.InfoContext(ctx, "signing key store loaded",
+			slog.String("algorithm", keystore.Algorithm),
+			slog.Int("published_keys", keyStore.Metadata().PublishedKeys),
+		)
+	}
+
 	startupCtx, cancelStartup := context.WithTimeout(ctx, startupTimeout)
 	store, err := postgres.Open(startupCtx, cfg.Database.URL.UnsafeValue(), cfg.Database.MaxConns)
 	cancelStartup()
@@ -45,6 +64,13 @@ func Serve(ctx context.Context, cfg config.Config, build observability.BuildInfo
 	cancelMigrationCheck()
 	if err != nil {
 		return fmt.Errorf("database migration check: %w", err)
+	}
+
+	auditCtx, cancelStartupAudit := context.WithTimeout(ctx, startupTimeout)
+	err = appendSigningKeyLoaded(auditCtx, store, time.Now().UTC())
+	cancelStartupAudit()
+	if err != nil {
+		return fmt.Errorf("record signing key startup audit: %w", err)
 	}
 
 	metrics := observability.NewMetrics(build)
@@ -64,13 +90,30 @@ func Serve(ctx context.Context, cfg config.Config, build observability.BuildInfo
 	if err != nil {
 		return fmt.Errorf("initialize authorization transaction service: %w", err)
 	}
+	consentService, err := consent.NewService(store)
+	if err != nil {
+		return fmt.Errorf("initialize consent service: %w", err)
+	}
+	authorizationService, err := authorization.NewService(store, nil, cfg.OIDC.AuthorizationCodeTTL, metrics)
+	if err != nil {
+		return fmt.Errorf("initialize authorization service: %w", err)
+	}
+	protocolTokenService, err := token.NewService(
+		store, keyStore, nil, cfg.Issuer.String(), cfg.OIDC.IDTokenTTL,
+		cfg.OIDC.AccessTokenTTL, cfg.OIDC.ClockSkew, metrics,
+	)
+	if err != nil {
+		return fmt.Errorf("initialize token service: %w", err)
+	}
 	authnService := authn.NewService(store, identityService, tokenManager, authflowService, clientService, cfg.Browser.RegistrationEnabled, metrics)
 	sessionService := session.NewService(store, tokenManager, metrics)
 	adminService := admin.NewService(store, identityService, clientService, cfg.Browser.LoginReauthWindow)
 	cookies := session.NewCookieManager(cfg.Browser.CookieName, cfg.Browser.CookieSecure, cfg.Browser.SessionTTL, cfg.Browser.CSRFTTL)
 	application, err := httpserver.NewApplicationHandler(httpserver.ApplicationOptions{
 		Authn: authnService, Sessions: sessionService, Admin: adminService,
-		Cookies: cookies, Issuer: cfg.Issuer,
+		Clients: clientService, Transactions: authflowService,
+		Consents: consentService, Authorization: authorizationService, Tokens: protocolTokenService,
+		Cookies: cookies, Issuer: cfg.Issuer, PublicKeys: keyStore,
 	})
 	if err != nil {
 		return fmt.Errorf("initialize application HTTP routes: %w", err)
@@ -122,8 +165,21 @@ func Serve(ctx context.Context, cfg config.Config, build observability.BuildInfo
 	return serveErr
 }
 
+type startupAuditStore interface {
+	AppendAudit(context.Context, audit.Event) error
+}
+
+func appendSigningKeyLoaded(ctx context.Context, store startupAuditStore, now time.Time) error {
+	event, err := audit.New(audit.SigningKeyLoaded, audit.ResultSuccess, nil, "", nil, "", nil, now)
+	if err != nil {
+		return err
+	}
+	return store.AppendAudit(ctx, event)
+}
+
 type cleanupStore interface {
 	CountActiveSessions(context.Context, time.Time) (int64, error)
+	CleanupProtocolArtifacts(context.Context, time.Time) (int64, error)
 }
 
 func startCleanupLoop(
@@ -145,6 +201,9 @@ func startCleanupLoop(
 		}
 		if _, err := transactions.Cleanup(operationCtx, now); err != nil && !errors.Is(err, context.Canceled) && logger != nil {
 			logger.Warn("authorization transaction cleanup failed", slog.String("error_class", postgres.ErrorClass(err)))
+		}
+		if _, err := store.CleanupProtocolArtifacts(operationCtx, now.Add(-protocolArtifactRetention)); err != nil && !errors.Is(err, context.Canceled) && logger != nil {
+			logger.Warn("OIDC protocol metadata cleanup failed", slog.String("error_class", postgres.ErrorClass(err)))
 		}
 		if count, err := store.CountActiveSessions(operationCtx, now); err == nil {
 			metrics.SetActiveSessions(count)

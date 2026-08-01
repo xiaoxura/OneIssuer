@@ -4,8 +4,9 @@
 
 - Go 1.26.x (the container builder is fixed to 1.26.5);
 - Node.js 22.12+ and npm for `web/`;
-- Docker Engine with Compose for PostgreSQL and integration tests;
-- Make, a POSIX shell, and curl.
+- Docker Engine with Compose for PostgreSQL, integration tests, examples, image
+  scans, and acceptance tests;
+- Make, a POSIX shell, Python 3, and curl.
 
 Windows contributors should use WSL2 so the same Make and shell commands apply.
 
@@ -13,93 +14,190 @@ Windows contributors should use WSL2 so the same Make and shell commands apply.
 
 ```bash
 cp .env.example .env
+mkdir -p .oneissuer-dev
+go run ./cmd/oneissuer keys generate \
+  --alg RS256 --out .oneissuer-dev/signing-key.jwk
+
+set -a
+. ./.env
+set +a
+
 make tools
 docker compose -f deploy/docker-compose.yml up -d postgres
-make migrate-up
-make dev
+go run ./cmd/oneissuer migrate up
+go run ./cmd/oneissuer serve
 ```
 
-The service listens on `http://localhost:8080`; the Web prototype is separate:
+The service listens on `http://localhost:8080`. Verify the complete protocol
+surface only through its actual Discovery document:
+
+```bash
+curl --fail http://localhost:8080/.well-known/openid-configuration
+curl --fail http://localhost:8080/oauth2/jwks
+```
+
+The React prototype is separate:
 
 ```bash
 make web
 # http://localhost:5173
 ```
 
-The phase-two login/registration forms are served by Go on the configured Issuer
-origin. The Vite mock UI remains separate and must never receive a real password.
-Do not add permissive CORS around authentication or management APIs.
+Hosted login, registration, and Consent are served by Go on the configured
+Issuer origin. The Vite mock must never receive a real password, Session, Code,
+Token, Client Secret, or private key and is not a source of identity/protocol
+state. Do not add permissive CORS around authentication, protocol, or management
+routes.
 
 ## Configuration loading
 
 The Go process reads environment variables only. It does not discover or load
-`.env`. `make dev`, `make migrate-up`, and `make migrate-status` source the file
-explicitly as a local convenience. See [configuration.md](./configuration.md).
+`.env`. `make dev`, `make migrate-up`, and `make migrate-status` source it as a
+local convenience. See [configuration.md](./configuration.md).
+
+Key files under `.oneissuer-dev/` are ignored local material. Never use a checked-
+in deterministic key outside a test fixture. The service loader requires a
+regular, non-symlink private file with mode `0600`; Compose additionally needs
+runtime UID/GID `65532` to own/read the mount. See
+[key-rotation-runbook.md](./key-rotation-runbook.md).
 
 ## Quality workflow
 
-Before opening a pull request:
+Before opening a pull request, run the relevant focused tests while iterating,
+then the complete release gates:
 
 ```bash
 make generate
+make contract-check
 make check
-make compose-smoke
+make phase-3-smoke
+make container-check
+git diff --check
 ```
 
-`make check` verifies formatting, generated code, `go vet`, golangci-lint,
-race-enabled Go tests, `govulncheck`, a static binary build, Web lint,
-TypeScript/Vite build, and high-severity npm audit results. Integration tests
-use a real disposable PostgreSQL through Testcontainers when Docker is
-available.
+`make check` verifies formatting, generated sqlc code, migration checksums,
+sensitive public examples, `go vet`, golangci-lint, race-enabled Go tests,
+bounded Fuzz smoke, `govulncheck`, a static binary build, Web lint/typecheck/build,
+high-severity npm audit results, and the management OpenAPI document.
 
-Phase-two CI additionally validates migration checksums, OpenAPI `0.1.0-dev.2`,
-privacy-sensitive examples, and bounded fuzz smoke targets. Run the pinned
-scripts rather than an unversioned global OpenAPI/Fuzz tool.
+`make contract-check` additionally validates the secret-free Conformance record.
+It also runs pinned actionlint over GitHub Actions workflows and checks local
+Markdown link targets.
+`make phase-3-smoke` is the disposable real-PostgreSQL A/B OIDC acceptance gate.
+`make container-check` generates a CycloneDX SBOM, rejects private-key artifacts,
+and rejects fixable High/Critical findings in the final runtime image. Reports go
+under ignored `.artifacts/`; do not publish a raw Conformance export until it has
+been reviewed for runtime Client Secrets and other clear values.
 
-Generated files under `internal/storage/postgres/sqlcgen/` must never be edited
-by hand. Change `queries/*.sql`, run `make generate`, and commit both source and
-generated output. `make generate-check` copies queries and production migrations
-and regenerates into a temporary directory,
-so it does not mutate the worktree.
+Useful individual commands:
+
+```bash
+go test ./...
+go test -race ./...
+go test -run '^TestPostgresIntegration$' -count=1 \
+  ./internal/storage/postgres
+go vet ./...
+.tools/bin/golangci-lint run ./...
+ONEISSUER_FUZZ_TIME=1s ./scripts/fuzz-smoke.sh
+.tools/bin/govulncheck ./...
+./scripts/check-migrations.sh
+./scripts/check-generated.sh "$PWD/.tools/bin/sqlc"
+./scripts/check-sensitive-examples.sh
+./scripts/check-conformance-record.py
+./scripts/check-openapi.sh
+docker compose -f deploy/docker-compose.yml config
+```
+
+The real PostgreSQL integration and Compose gates require a working Docker
+socket. Unit-only results are not a substitute.
+
+## Generated code and migration discipline
+
+Files under `internal/storage/postgres/sqlcgen/` must never be edited by hand.
+Change `queries/*.sql`, add rather than rewrite a migration, run `make generate`,
+and commit source plus generated output. `make generate-check` regenerates into a
+temporary directory without mutating the worktree.
+
+Production migrations 00001–00005 are frozen phase-two input. The checksum gate
+must prove their bytes are unchanged. Phase three's expected schema is version
+10; see [migrations.md](./migrations.md).
 
 ## Build metadata
 
 ```bash
-make build VERSION=v0.1.0-dev.2 COMMIT="$(git rev-parse --short HEAD)"
+make build VERSION=v0.1.0-dev.3 \
+  COMMIT="$(git rev-parse --short=12 HEAD)"
 ./bin/oneissuer version
 ```
 
-The Makefile and Dockerfile inject version, commit, and UTC build time using
+The Makefile and Dockerfile inject version, commit, and UTC build time through
 linker values. Process logs and `oneissuer_build_info` expose the same bounded
-metadata.
+metadata. Never inject a key, Secret, credential, database URL, Code, or Token as
+build metadata or a Docker build argument.
 
 ## Test organization
 
-- package unit/Fuzz tests cover normalization, Argon2id, Client URI/scope/Secret,
-  opaque cursors/tokens, Cookie/CSRF, audit whitelist, configuration, request IDs,
-  proxy trust, metrics, panic privacy, and shutdown bounds;
-- PostgreSQL/Testcontainers tests cover all five production migrations,
-  registration/login, concurrent uniqueness/Bootstrap, Session ownership and
-  revocation, Client Secret rotation, final-admin protection, audit privacy, and
-  reopen persistence;
-- `scripts/smoke-compose.sh` verifies the final non-root empty-volume phase-two
-  behavior, including initial/repeated migration, one-shot Bootstrap, hosted
-  registration/login, Session rotation/CSRF/revocation/logout, Public and
-  Confidential Client/Secret handling, audit persistence, restart, database
-  outage recovery, graceful shutdown, and clear-value log/read-model privacy.
+- unit/table/Fuzz tests cover configuration and Issuer canonicalization; key/JWK
+  validation; Client URI/scope/Secret rules; Session/Cookie/CSRF; Authorize
+  parsing, redirect safety, prompt/max-age; Consent; Code/PKCE; Basic Client
+  authentication; JWT claims/signatures; UserInfo; audit/privacy; metrics;
+  request IDs; proxy trust; panic recovery; and shutdown bounds;
+- real PostgreSQL/Testcontainers tests cover all ten production migrations,
+  version-5 upgrade semantics, identity/Client/Session/Audit lifecycle,
+  transaction/Grant/Code atomicity, concurrent approval and exchange, disabled
+  User/Client checks, audit/signing failure rollback, retention, and reopen
+  persistence;
+- `scripts/smoke-compose.sh` exercises an empty volume, explicit migration,
+  Bootstrap, Public A and Confidential B, `prompt=create`, Session reuse,
+  separate Consent, S256 exchange, ID Token/UserInfo, replay/concurrency,
+  disabled principals, restart, database outage/recovery, privacy surfaces,
+  non-root/read-only containers, and graceful shutdown;
+- `conformance/phase-3/` records the pinned, applicable non-certification OpenID
+  Conformance Suite subset and its limitations;
+- `scripts/container-security.sh` inspects the final runtime image and writes
+  reproducible tool/version/digest evidence.
 
-Tests must not depend on global ports or shared databases. Test-only migrations
-live under `internal/storage/postgres/testdata/migrations` and are absent from
-the final image.
+Tests must not depend on shared ports or databases. Test-only migrations live in
+`internal/storage/postgres/testdata/migrations` and are absent from the final
+image. Test keys must be clearly synthetic and must not be copied into examples,
+Compose, release artifacts, or production.
+
+## Example Relying Party development
+
+`examples/oidc-client/` is built as a separate server-side executable. It keeps
+state, nonce, and verifier in an in-memory server Session; uses Discovery;
+requires S256; validates RS256 signature and ID Token claims; compares UserInfo
+`sub`; and keys its mock JIT identity by `(iss, sub)`. It never renders or logs
+Tokens.
+
+Run the tested A/B form through `make phase-3-smoke`. Do not turn this example
+into a generic SDK by adding loose metadata parsing, disabled verification,
+browser localStorage, or a fallback Client authentication method.
+
+## Conformance updates
+
+The current reviewed suite release, source commit, container digests, selected
+modules, configuration placeholders, results, and non-applicable categories are
+documented in [phase-3-conformance.md](./phase-3-conformance.md). A rerun must:
+
+1. use a temporary HTTPS Issuer and throwaway static Clients;
+2. keep clear Client Secrets out of Git and console output;
+3. export raw evidence into permission-restricted `.artifacts/conformance/`;
+4. record SHA-256 digests and secret-free summaries under `conformance/phase-3/`;
+5. rerun `./scripts/check-conformance-record.py`;
+6. never claim OpenID Foundation certification.
+
+Do not weaken mandatory S256 or advertise an unimplemented feature merely to make
+an upstream test module runnable.
 
 ## Shutdown behavior
 
 On SIGINT or SIGTERM, the process:
 
-1. sets readiness to false;
+1. sets readiness false;
 2. stops accepting new connections;
 3. waits for active HTTP work within `ONEISSUER_SHUTDOWN_TIMEOUT`;
 4. force-closes and exits non-zero if that deadline is exceeded;
-5. closes the PostgreSQL pool after HTTP shutdown.
+5. stops the cleanup loop and closes PostgreSQL after HTTP shutdown.
 
 Use `docker compose stop oneissuer` or `Ctrl+C` to exercise the normal path.

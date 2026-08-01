@@ -6,8 +6,10 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/oneissuer/oneissuer/internal/authflow"
 	"github.com/oneissuer/oneissuer/internal/authn"
 	"github.com/oneissuer/oneissuer/internal/identity"
+	"github.com/oneissuer/oneissuer/internal/oidc"
 	"github.com/oneissuer/oneissuer/internal/session"
 )
 
@@ -116,7 +118,7 @@ func (a *applicationHandler) postLogin(writer http.ResponseWriter, request *http
 		return
 	}
 	a.cookies.SetAuthenticated(writer, issued)
-	writer.Header().Set("Location", "/auth/complete")
+	writer.Header().Set("Location", a.authenticationSuccessLocation(request, form.Get("transaction")))
 	writer.WriteHeader(http.StatusSeeOther)
 }
 
@@ -145,8 +147,19 @@ func (a *applicationHandler) postRegister(writer http.ResponseWriter, request *h
 		return
 	}
 	a.cookies.SetAuthenticated(writer, issued)
-	writer.Header().Set("Location", "/auth/complete")
+	writer.Header().Set("Location", a.authenticationSuccessLocation(request, form.Get("transaction")))
 	writer.WriteHeader(http.StatusSeeOther)
+}
+
+func (a *applicationHandler) authenticationSuccessLocation(request *http.Request, transactionToken string) string {
+	if a.transactions == nil || transactionToken == "" {
+		return "/auth/complete"
+	}
+	transaction, err := a.transactions.Resolve(request.Context(), transactionToken, a.now().UTC())
+	if err != nil || transaction.Kind != authflow.KindAuthorization {
+		return "/auth/complete"
+	}
+	return (&url.URL{Path: oidc.AuthorizeContinuePath, RawQuery: url.Values{"transaction": {transactionToken}}.Encode()}).String()
 }
 
 func (a *applicationHandler) getComplete(writer http.ResponseWriter, request *http.Request) {
@@ -213,7 +226,15 @@ func (a *applicationHandler) renderAuthForm(writer http.ResponseWriter, request 
 	escapedTransaction := url.QueryEscape(transaction)
 	if register {
 		data.Title, data.Action, data.SubmitLabel, data.SwitchLabel = text.RegisterTitle, "/register", text.RegisterSubmit, text.ToLogin
-		data.SwitchURL = "/login?transaction=" + escapedTransaction
+		allowSwitch := true
+		if transaction != "" && a.transactions != nil {
+			if flow, err := a.transactions.Resolve(request.Context(), transaction, a.now().UTC()); err == nil && flow.Kind == authflow.KindAuthorization && flow.PromptCreate {
+				allowSwitch = false
+			}
+		}
+		if allowSwitch {
+			data.SwitchURL = "/login?transaction=" + escapedTransaction
+		}
 	} else {
 		data.Title, data.Action, data.SubmitLabel, data.SwitchLabel = text.LoginTitle, "/login", text.LoginSubmit, text.ToRegister
 		data.SwitchURL = "/register?transaction=" + escapedTransaction

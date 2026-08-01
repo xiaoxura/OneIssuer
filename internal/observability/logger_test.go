@@ -87,12 +87,12 @@ func TestWithProcessFields(t *testing.T) {
 	var output bytes.Buffer
 	logger := WithProcessFields(
 		NewLogger(&output, config.LogConfig{Level: config.LogLevelInfo, Format: config.LogFormatJSON}),
-		NewBuildInfo("v0.1.0-dev.2", "abc123", "2026-01-01T00:00:00Z"),
+		NewBuildInfo("v0.1.0-dev.3", "abc123", "2026-01-01T00:00:00Z"),
 		config.EnvironmentTest,
 	)
 	logger.Info("started")
 
-	for _, fragment := range []string{`"version":"v0.1.0-dev.2"`, `"commit":"abc123"`, `"environment":"test"`} {
+	for _, fragment := range []string{`"version":"v0.1.0-dev.3"`, `"commit":"abc123"`, `"environment":"test"`} {
 		if !strings.Contains(output.String(), fragment) {
 			t.Fatalf("process log missing %s: %s", fragment, output.String())
 		}

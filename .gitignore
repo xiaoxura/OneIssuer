@@ -1,8 +1,11 @@
 .env
+.oneissuer-dev/
+*.jwk
+*.jwks
 .tools/
+.artifacts/
 bin/
 coverage/
 *.out
 *.test
 .DS_Store
-

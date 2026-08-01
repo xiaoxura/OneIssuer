@@ -12,7 +12,10 @@
 
 - [ ] `make generate-check`
 - [ ] `make check`
-- [ ] `make compose-smoke` (or explain why not applicable)
+- [ ] `make contract-check`
+- [ ] `make phase-3-smoke` (or explain why not applicable)
+- [ ] `make container-check` (or explain why no final-image behavior changed)
+- [ ] `git diff --check`
 
 Commands/results:
 
@@ -23,4 +26,3 @@ Commands/results:
 ## Security and operations
 
 <!-- Secrets/logging, metrics cardinality, migration, readiness, shutdown, container impact. -->
-

@@ -1,20 +1,21 @@
 openapi: 3.1.0
 info:
-  title: OneIssuer Phase Two Identity and Client API
-  version: 0.1.0-dev.2
+  title: OneIssuer Identity and Client Management API
+  version: 0.1.0-dev.3
   license:
     name: Apache License 2.0
     identifier: Apache-2.0
   description: |-
-    Implemented phase-two JSON contract for a self-hosted, single-Issuer
+    Implemented management/current-user JSON contract for a self-hosted, single-Issuer
     deployment. It covers health, current-user session management, and the
     administrator Users, Clients, Sessions, and Audit APIs.
 
     Browser authentication is hosted as HTML at `/login`, `/register`,
     `/logout`, and `/auth/complete`; those form interactions are intentionally
     not represented as JSON operations here. Discovery, JWKS, Authorize, Token,
-    UserInfo, Revocation, and Introspection are not implemented and are not part
-    of this contract.
+    and UserInfo are implemented standard protocol surfaces but intentionally
+    remain outside this management API description. Revocation, Introspection,
+    Refresh Token, and RP-Initiated Logout are not implemented.
 
     Authenticated JSON calls use a server-side session cookie. State-changing
     calls additionally require the clear CSRF value returned in the

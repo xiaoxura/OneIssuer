@@ -1,0 +1,65 @@
+{
+  "record_version": 1,
+  "executed_at": "2026-08-01T11:10:00+08:00",
+  "retest_due_on_or_before": "2026-11-01",
+  "target_version": "v0.1.0-dev.3",
+  "target_issuer_class": "temporary local HTTPS reverse proxy; no production credentials",
+  "suite": {
+    "release": "release-v5.2.1",
+    "source_commit": "932b46f1e507871eb0b34621aaef65ff04442e6f",
+    "server_image": "registry.gitlab.com/openid/conformance-suite@sha256:b1942bd82cd08bef7e81fb3370124141c044d913a096056a8d9b68f0b4fee720",
+    "nginx_image": "registry.gitlab.com/openid/conformance-suite/nginx@sha256:496a11f6d11514945d5c90dc87aa7c04e223d915b2b4a53844d68d73440f926b",
+    "mongo_image": "mongo@sha256:b415b12f638e2685d06c58ab7fb5943577c50fadec6d9340ef67d21aeac72070",
+    "plan": "oidcc-test-plan"
+  },
+  "configuration_templates": [
+    "conformance/phase-3/public-config.template.json",
+    "conformance/phase-3/confidential-config.template.json"
+  ],
+  "results": [
+    {
+      "test_module": "oidcc-discovery-endpoint-verification",
+      "module_id": "xQE2fnqPaU7ymSS",
+      "variants": {
+        "client_auth_type": "none",
+        "server_metadata": "discovery",
+        "client_registration": "static_client",
+        "response_type": "code",
+        "response_mode": "default"
+      },
+      "result": "PASSED",
+      "raw_export": ".artifacts/conformance/2026-08-01/final/final-discovery-xQE2fnqPaU7ymSS.zip",
+      "raw_export_sha256": "5072eeddbb1355601cab2fcedbbfd8a21a133308c3f5d33f9dd065cddc6134bc"
+    },
+    {
+      "test_module": "oidcc-ensure-request-with-valid-pkce-succeeds",
+      "module_id": "DfkEM7EHpMoKA1z",
+      "variants": {
+        "client_auth_type": "none",
+        "server_metadata": "discovery",
+        "client_registration": "static_client",
+        "response_type": "code",
+        "response_mode": "default"
+      },
+      "result": "PASSED",
+      "raw_export": ".artifacts/conformance/2026-08-01/final/final-public-pkce-DfkEM7EHpMoKA1z.zip",
+      "raw_export_sha256": "c16152ee892a6d1cec4b8ce1e7feac813a01ba56afbd28c2788119d24f753ad2"
+    },
+    {
+      "test_module": "oidcc-ensure-request-with-valid-pkce-succeeds",
+      "module_id": "s87ygoiKOOu6JtQ",
+      "variants": {
+        "client_auth_type": "client_secret_basic",
+        "server_metadata": "discovery",
+        "client_registration": "static_client",
+        "response_type": "code",
+        "response_mode": "default"
+      },
+      "result": "PASSED",
+      "raw_export": ".artifacts/conformance/2026-08-01/final/final-confidential-pkce-s87ygoiKOOu6JtQ.zip",
+      "raw_export_sha256": "6602485e17825b440cdbf2fc79ccb86aa4cfa8d1726531ed47e267ab20e1b09a"
+    }
+  ],
+  "assessment": "All modules applicable to the phase-three mandatory-S256 profile passed. Unselected categories and upstream non-PKCE harness constraints are recorded in matrix.json.",
+  "certification_claim": false
+}

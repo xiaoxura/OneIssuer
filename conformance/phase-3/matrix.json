@@ -1,0 +1,142 @@
+{
+  "record_version": 1,
+  "target_profile": "OneIssuer phase-three Authorization Code plus mandatory S256 PKCE",
+  "suite": {
+    "release": "release-v5.2.1",
+    "source_commit": "932b46f1e507871eb0b34621aaef65ff04442e6f",
+    "plan": "oidcc-test-plan",
+    "plan_display_name": "OpenID Connect Core: Comprehensive Authorization server test (not part of certification program)"
+  },
+  "common_variants": {
+    "server_metadata": "discovery",
+    "client_registration": "static_client",
+    "response_type": "code",
+    "response_mode": "default"
+  },
+  "applicable_modules": [
+    {
+      "test_module": "oidcc-discovery-endpoint-verification",
+      "client_auth_type": "none",
+      "coverage": [
+        "HTTPS issuer and endpoints",
+        "Discovery schema and exact capability declarations",
+        "JWKS retrieval and public-key validity"
+      ]
+    },
+    {
+      "test_module": "oidcc-ensure-request-with-valid-pkce-succeeds",
+      "client_auth_type": "none",
+      "coverage": [
+        "public static client",
+        "Authorization Code Flow",
+        "S256 PKCE",
+        "state and nonce",
+        "RS256 ID Token",
+        "Bearer Access Token and UserInfo"
+      ]
+    },
+    {
+      "test_module": "oidcc-ensure-request-with-valid-pkce-succeeds",
+      "client_auth_type": "client_secret_basic",
+      "coverage": [
+        "confidential static client",
+        "client_secret_basic",
+        "Authorization Code Flow",
+        "S256 PKCE",
+        "state and nonce",
+        "RS256 ID Token",
+        "Bearer Access Token and UserInfo"
+      ]
+    }
+  ],
+  "not_applicable_categories": [
+    {
+      "category": "phase-four token and session lifecycle",
+      "modules": [
+        "oidcc-refresh-token",
+        "oidcc-refresh-token-rp-key-rotation"
+      ],
+      "reason": "Refresh Token and online lifecycle/rotation are explicitly outside phase three."
+    },
+    {
+      "category": "dynamic registration",
+      "modules": [
+        "oidcc-registration-jwks-uri",
+        "oidcc-registration-logo-uri",
+        "oidcc-registration-policy-uri",
+        "oidcc-registration-sector-uri",
+        "oidcc-registration-tos-uri",
+        "oidcc-registration-sector-bad"
+      ],
+      "reason": "OneIssuer phase three uses administrator-managed static registration only."
+    },
+    {
+      "category": "unsupported request types and client authentication",
+      "modules": [
+        "oidcc-unsigned-request-object-supported-correctly-or-rejected-as-unsupported",
+        "oidcc-request-uri-unsigned",
+        "oidcc-request-uri-signed-rs256",
+        "oidcc-ensure-request-object-with-redirect-uri",
+        "oidcc-ensure-client-assertion-with-iss-aud-succeeds"
+      ],
+      "reason": "Request Object, Request URI, and JWT client authentication are outside the frozen profile."
+    },
+    {
+      "category": "unsupported claims and presentation hints",
+      "modules": [
+        "oidcc-claims-essential",
+        "oidcc-scope-address",
+        "oidcc-scope-phone",
+        "oidcc-scope-all",
+        "oidcc-claims-locales",
+        "oidcc-id-token-hint",
+        "oidcc-login-hint",
+        "oidcc-ensure-request-with-acr-values-succeeds",
+        "oidcc-ui-locales",
+        "oidcc-display-page",
+        "oidcc-display-popup"
+      ],
+      "reason": "Phase three exposes only openid/profile/email and does not advertise these optional request features."
+    },
+    {
+      "category": "online key rotation",
+      "modules": [
+        "oidcc-server-rotate-keys"
+      ],
+      "reason": "Phase three supports documented restart-style key overlap, not online rotation."
+    }
+  ],
+  "upstream_modules_not_runnable_without_weakening_pkce": {
+    "modules": [
+      "oidcc-server",
+      "oidcc-ensure-request-without-nonce-succeeds-for-code-flow",
+      "oidcc-idtoken-rs256",
+      "oidcc-idtoken-signature",
+      "oidcc-idtoken-unsigned",
+      "oidcc-scope-email",
+      "oidcc-scope-profile",
+      "oidcc-alternate-happy-flow",
+      "oidcc-prompt-login",
+      "oidcc-prompt-none-logged-in",
+      "oidcc-prompt-none-not-logged-in",
+      "oidcc-max-age-1",
+      "oidcc-max-age-10000",
+      "oidcc-userinfo-get",
+      "oidcc-userinfo-post-header",
+      "oidcc-codereuse",
+      "oidcc-codereuse-30seconds",
+      "oidcc-ensure-redirect-uri-in-authorization-request",
+      "oidcc-ensure-registered-redirect-uri",
+      "oidcc-redirect-uri-query-added",
+      "oidcc-redirect-uri-query-mismatch",
+      "oidcc-redirect-uri-regfrag",
+      "oidcc-response-type-missing"
+    ],
+    "reason": "These upstream OIDCC modules construct their main Code Flow request without a code_challenge/code_verifier. OneIssuer deliberately requires S256 for every public and confidential client, so the unmodified modules are rejected before they can exercise their named assertion. The server was not weakened and Discovery was not expanded to make those modules run; equivalent positive, negative, concurrent, and restart behavior is covered by first-party PostgreSQL, HTTP, fuzz, and Compose gates."
+  },
+  "certification_plan": {
+    "plan": "oidcc-basic-certification-test-plan",
+    "applicable": false,
+    "reason": "The certification plan requires client_secret_post and additional profile behavior that phase three intentionally does not implement."
+  }
+}

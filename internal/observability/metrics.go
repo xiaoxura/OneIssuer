@@ -32,12 +32,14 @@ type Metrics struct {
 	sessionsRevoked  *prometheus.CounterVec
 	clientOperations *prometheus.CounterVec
 	authTransactions *prometheus.CounterVec
+	authorizations   *prometheus.CounterVec
+	tokenOperations  *prometheus.CounterVec
 	auditEvents      *prometheus.CounterVec
 	sessionsActive   prometheus.Gauge
 }
 
 // NewMetrics creates an isolated registry, including Go runtime and process
-// collectors plus the phase-one and phase-two application metrics.
+// collectors plus the phase-one through phase-three application metrics.
 func NewMetrics(build BuildInfo) *Metrics {
 	registry := prometheus.NewRegistry()
 	metrics := &Metrics{
@@ -73,6 +75,8 @@ func NewMetrics(build BuildInfo) *Metrics {
 		sessionsRevoked:  prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "sessions", Name: "revoked_total", Help: "Login sessions revoked by bounded reason."}, []string{"reason"}),
 		clientOperations: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "client", Name: "operations_total", Help: "Client registry operations by bounded operation and result."}, []string{"operation", "result"}),
 		authTransactions: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "auth", Name: "transactions_total", Help: "Authorization transaction operations by bounded operation and result."}, []string{"operation", "result"}),
+		authorizations:   prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "oidc", Name: "authorization_total", Help: "OIDC authorization decisions by bounded operation and result."}, []string{"operation", "result"}),
+		tokenOperations:  prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "oidc", Name: "token_operations_total", Help: "OIDC Token and UserInfo operations by bounded operation and result."}, []string{"operation", "result"}),
 		auditEvents:      prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "audit", Name: "events_total", Help: "Audit event appends by bounded event and result."}, []string{"event", "result"}),
 		sessionsActive:   prometheus.NewGauge(prometheus.GaugeOpts{Namespace: "oneissuer", Subsystem: "sessions", Name: "active", Help: "Current active, unexpired login sessions."}),
 	}
@@ -83,6 +87,21 @@ func NewMetrics(build BuildInfo) *Metrics {
 		Help:      "Static OneIssuer build information.",
 	}, []string{"version", "commit", "build_time", "go_version"})
 	buildInfo.WithLabelValues(build.Version, build.Commit, build.BuildTime, build.GoVersion).Set(1)
+
+	// Pre-initialize the phase-three protocol matrix. CounterVec collectors do
+	// not expose a metric family until at least one label set has been observed;
+	// creating every bounded combination here makes a freshly started process
+	// observable without manufacturing protocol traffic first.
+	for _, operation := range []string{"issue", "deny"} {
+		for _, result := range []string{"success", "rejected", "failure"} {
+			metrics.authorizations.WithLabelValues(operation, result).Add(0)
+		}
+	}
+	for _, operation := range []string{"exchange", "issuance", "userinfo"} {
+		for _, result := range []string{"success", "rejected", "failure"} {
+			metrics.tokenOperations.WithLabelValues(operation, result).Add(0)
+		}
+	}
 
 	registry.MustRegister(
 		buildInfo,
@@ -97,6 +116,8 @@ func NewMetrics(build BuildInfo) *Metrics {
 		metrics.sessionsRevoked,
 		metrics.clientOperations,
 		metrics.authTransactions,
+		metrics.authorizations,
+		metrics.tokenOperations,
 		metrics.auditEvents,
 		metrics.sessionsActive,
 		collectors.NewGoCollector(),
@@ -153,7 +174,24 @@ func (m *Metrics) ClientOperation(operation, result string) {
 // AuthTransaction records bounded authorization-transaction labels.
 func (m *Metrics) AuthTransaction(operation, result string) {
 	m.authTransactions.WithLabelValues(
-		bounded(operation, map[string]bool{"create": true, "resolve": true, "consume": true, "expire": true, "cleanup": true}),
+		bounded(operation, map[string]bool{"create": true, "resolve": true, "consume": true, "reject": true, "expire": true, "cleanup": true}),
+		bounded(result, resultLabels),
+	).Inc()
+}
+
+// Authorization records bounded consent/Code issuance outcomes.
+func (m *Metrics) Authorization(operation, result string) {
+	m.authorizations.WithLabelValues(
+		bounded(operation, map[string]bool{"issue": true, "deny": true}),
+		bounded(result, resultLabels),
+	).Inc()
+}
+
+// Token records bounded Code exchange, committed issuance, and UserInfo
+// outcomes. No Client, Subject, scope, kid, jti, or error value is a label.
+func (m *Metrics) Token(operation, result string) {
+	m.tokenOperations.WithLabelValues(
+		bounded(operation, map[string]bool{"exchange": true, "issuance": true, "userinfo": true}),
 		bounded(result, resultLabels),
 	).Inc()
 }

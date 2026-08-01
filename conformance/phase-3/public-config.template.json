@@ -1,0 +1,13 @@
+{
+  "alias": "<unique-public-alias>",
+  "description": "OneIssuer v0.1.0-dev.3 applicable OIDCC subset (public)",
+  "server": {
+    "discoveryUrl": "https://<issuer-host>/.well-known/openid-configuration"
+  },
+  "client": {
+    "client_id": "<runtime-public-client-id>"
+  },
+  "client2": {
+    "client_id": "<runtime-public-client-id>"
+  }
+}

@@ -15,4 +15,10 @@ run_target ./internal/identity FuzzIdentityNormalization
 run_target ./internal/client FuzzClientURIAndScopes
 run_target ./internal/authflow FuzzAuthorizationTransactionToken
 run_target ./internal/httpserver FuzzAuthenticationFormParsing
+run_target ./internal/httpserver FuzzTokenFormParsing
+run_target ./internal/httpserver FuzzUserInfoBearerParsing
+run_target ./internal/oidc FuzzParseAuthorizationRequest
+run_target ./internal/oidc FuzzTokenRequestAndBasicParsing
+run_target ./internal/token FuzzAccessTokenVerification
+run_target ./internal/keystore FuzzPrivateJWKLoading
 run_target ./internal/pagination FuzzOpaqueCursor

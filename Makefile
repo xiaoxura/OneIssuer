@@ -1,6 +1,6 @@
 SHELL := /bin/sh
 
-VERSION ?= v0.1.0-dev.2
+VERSION ?= v0.1.0-dev.3
 COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -9,16 +9,18 @@ SQLC_VERSION := v1.31.1
 GOOSE_VERSION := v3.27.3
 GOLANGCI_LINT_VERSION := v2.12.2
 GOVULNCHECK_VERSION := v1.6.0
+ACTIONLINT_VERSION := v1.7.7
 REDOCLY_VERSION := 2.43.2
 SQLC := $(TOOLS_DIR)/sqlc
 GOOSE := $(TOOLS_DIR)/goose
 GOLANGCI_LINT := $(TOOLS_DIR)/golangci-lint
 GOVULNCHECK := $(TOOLS_DIR)/govulncheck
+ACTIONLINT := $(TOOLS_DIR)/actionlint
 LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildTime=$(BUILD_TIME)
 
-.PHONY: tools generate generate-check migration-check openapi-check sensitive-check fuzz-smoke fmt fmt-check go-lint lint test integration-test vuln build go-check web-install web-check contract-check check migrate-up migrate-status dev web compose-up compose-down compose-smoke clean
+.PHONY: tools generate generate-check migration-check openapi-check sensitive-check conformance-record-check doc-link-check workflow-check fuzz-smoke fmt fmt-check go-lint lint test integration-test vuln build go-check web-install web-check contract-check check migrate-up migrate-status dev web compose-up compose-down compose-smoke phase-3-smoke container-scan sbom container-check clean
 
-tools: $(SQLC) $(GOOSE) $(GOLANGCI_LINT) $(GOVULNCHECK)
+tools: $(SQLC) $(GOOSE) $(GOLANGCI_LINT) $(GOVULNCHECK) $(ACTIONLINT)
 
 $(TOOLS_DIR):
 	mkdir -p $@
@@ -35,6 +37,9 @@ $(GOLANGCI_LINT): | $(TOOLS_DIR)
 $(GOVULNCHECK): | $(TOOLS_DIR)
 	GOBIN=$(TOOLS_DIR) go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
 
+$(ACTIONLINT): | $(TOOLS_DIR)
+	GOBIN=$(TOOLS_DIR) GOTELEMETRY=off go install github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
+
 generate: $(SQLC)
 	$(SQLC) generate
 
@@ -50,14 +55,23 @@ openapi-check:
 sensitive-check:
 	./scripts/check-sensitive-examples.sh
 
+conformance-record-check:
+	./scripts/check-conformance-record.py
+
+doc-link-check:
+	./scripts/check-doc-links.py
+
+workflow-check: $(ACTIONLINT)
+	$(ACTIONLINT)
+
 fuzz-smoke:
 	./scripts/fuzz-smoke.sh
 
 fmt:
-	gofmt -w $$(find cmd internal -type f -name '*.go' -not -path '*/sqlcgen/*')
+	gofmt -w $$(find cmd internal examples -type f -name '*.go' -not -path '*/sqlcgen/*')
 
 fmt-check:
-	@files=$$(gofmt -l $$(find cmd internal -type f -name '*.go')); \
+	@files=$$(gofmt -l $$(find cmd internal examples -type f -name '*.go')); \
 	if [ -n "$$files" ]; then echo "Go files need gofmt:"; echo "$$files"; exit 1; fi
 
 go-lint: tools fmt-check generate-check
@@ -74,7 +88,7 @@ integration-test:
 	go test -race -run Integration ./internal/storage/postgres ./internal/httpserver ./internal/app
 
 vuln: $(GOVULNCHECK)
-	$(GOVULNCHECK) ./...
+	GOTELEMETRY=off $(GOVULNCHECK) ./...
 
 build:
 	mkdir -p bin
@@ -85,7 +99,7 @@ go-check: tools fmt-check generate-check migration-check sensitive-check
 	$(GOLANGCI_LINT) run ./...
 	go test -race ./...
 	$(MAKE) fuzz-smoke
-	$(GOVULNCHECK) ./...
+	GOTELEMETRY=off $(GOVULNCHECK) ./...
 	$(MAKE) build
 
 web-install:
@@ -95,7 +109,7 @@ web-check: web-install
 	cd web && npm run check
 	cd web && npm audit --audit-level=high --fetch-retries=5 --fetch-retry-mintimeout=1000 --fetch-retry-maxtimeout=10000 --fetch-timeout=30000
 
-contract-check: migration-check sensitive-check openapi-check
+contract-check: migration-check sensitive-check conformance-record-check doc-link-check workflow-check openapi-check
 
 check: go-check web-check openapi-check
 
@@ -120,5 +134,16 @@ compose-down:
 compose-smoke:
 	./scripts/smoke-compose.sh
 
+phase-3-smoke: compose-smoke
+
+container-scan:
+	ONEISSUER_IMAGE=$${ONEISSUER_IMAGE:-oneissuer:$(VERSION)} ./scripts/container-security.sh scan
+
+sbom:
+	ONEISSUER_IMAGE=$${ONEISSUER_IMAGE:-oneissuer:$(VERSION)} ./scripts/container-security.sh sbom
+
+container-check:
+	ONEISSUER_IMAGE=$${ONEISSUER_IMAGE:-oneissuer:$(VERSION)} ./scripts/container-security.sh all
+
 clean:
-	rm -rf bin .tools coverage web/dist
+	rm -rf bin .tools .artifacts coverage web/dist

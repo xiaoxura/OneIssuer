@@ -52,6 +52,10 @@ type Transaction struct {
 	State         string
 	Nonce         string
 	PromptCreate  bool
+	ResponseType  string
+	ResponseMode  string
+	Prompts       []string
+	MaxAgeSeconds *uint32
 	CreatedAt     time.Time
 	ExpiresAt     time.Time
 	ConsumedAt    *time.Time
@@ -68,6 +72,10 @@ type VerifiedInput struct {
 	State         string
 	Nonce         string
 	PromptCreate  bool
+	ResponseType  string
+	ResponseMode  string
+	Prompts       []string
+	MaxAgeSeconds *uint32
 }
 
 // Repository is the persistence boundary for short-lived transactions.
@@ -75,6 +83,7 @@ type Repository interface {
 	CreateAuthTransaction(context.Context, Transaction, audit.Event) error
 	FindAuthTransaction(context.Context, []byte) (Transaction, error)
 	ConsumeAuthTransaction(context.Context, uuid.UUID, time.Time, audit.Event) (Transaction, error)
+	RejectAuthTransaction(context.Context, uuid.UUID, string, time.Time, audit.Event) (Transaction, error)
 	ExpireAuthTransactions(context.Context, time.Time) (int64, error)
 	CleanupAuthTransactions(context.Context, time.Time) (int64, error)
 }
@@ -110,16 +119,26 @@ func (s *Service) CreateLocal(ctx context.Context, requestID string, now time.Ti
 
 // CreateVerified persists context already validated by a protocol adapter.
 func (s *Service) CreateVerified(ctx context.Context, input VerifiedInput, requestID string, now time.Time) (string, Transaction, error) {
-	if input.ClientID == uuid.Nil || !validAbsoluteURI(input.RedirectURI) || len(input.Scopes) == 0 || len(input.Scopes) > 32 {
+	input.Scopes = canonicalStrings(input.Scopes)
+	if input.ClientID == uuid.Nil || !validAbsoluteURI(input.RedirectURI) || input.ResponseType != "code" || input.ResponseMode != "query" ||
+		len(input.Scopes) == 0 || len(input.Scopes) > 3 || !validOIDCScopes(input.Scopes) {
 		return "", Transaction{}, ErrInvalid
 	}
-	if input.PKCEChallenge != "" && (len(input.PKCEChallenge) < 43 || len(input.PKCEChallenge) > 128) {
+	if !validS256Challenge(input.PKCEChallenge) {
 		return "", Transaction{}, ErrInvalid
 	}
 	if len(input.State) > 1024 || len(input.Nonce) > 1024 {
 		return "", Transaction{}, ErrInvalid
 	}
-	input.Scopes = canonicalStrings(input.Scopes)
+	if input.PromptCreate && len(input.Prompts) == 0 {
+		input.Prompts = []string{"create"}
+	}
+	if !validPrompts(input.Prompts) || input.PromptCreate != contains(input.Prompts, "create") {
+		return "", Transaction{}, ErrInvalid
+	}
+	if input.MaxAgeSeconds != nil && *input.MaxAgeSeconds > 30*24*60*60 {
+		return "", Transaction{}, ErrInvalid
+	}
 	return s.create(ctx, KindAuthorization, input, requestID, now)
 }
 
@@ -138,7 +157,9 @@ func (s *Service) create(ctx context.Context, kind Kind, input VerifiedInput, re
 	transaction := Transaction{
 		ID: id, TokenHash: HashToken(token), Kind: kind, RedirectURI: input.RedirectURI,
 		Scopes: append([]string{}, input.Scopes...), PKCEChallenge: input.PKCEChallenge, State: input.State,
-		Nonce: input.Nonce, PromptCreate: input.PromptCreate, CreatedAt: now, ExpiresAt: now.Add(s.ttl),
+		Nonce: input.Nonce, PromptCreate: input.PromptCreate, ResponseType: input.ResponseType, ResponseMode: input.ResponseMode,
+		Prompts: append([]string{}, input.Prompts...), MaxAgeSeconds: cloneUint32(input.MaxAgeSeconds),
+		CreatedAt: now, ExpiresAt: now.Add(s.ttl),
 	}
 	if kind == KindAuthorization {
 		clientID := input.ClientID
@@ -194,6 +215,26 @@ func (s *Service) Consume(ctx context.Context, transaction Transaction, actor *u
 		return Transaction{}, err
 	}
 	s.observe("consume", "success")
+	return result, nil
+}
+
+// Reject terminally consumes a live transaction with one fixed reason and a
+// value-free audit event. Retrying the browser transaction can never mint
+// authority after this transition.
+func (s *Service) Reject(ctx context.Context, transaction Transaction, reason string, actor *uuid.UUID, requestID string, now time.Time) (Transaction, error) {
+	if !validFailureReason(reason) {
+		return Transaction{}, ErrInvalid
+	}
+	event, err := audit.New(audit.AuthorizationTransactionRejected, audit.ResultRejected, actor, audit.TargetAuthTransaction, &transaction.ID, requestID, nil, now)
+	if err != nil {
+		return Transaction{}, err
+	}
+	result, err := s.repository.RejectAuthTransaction(ctx, transaction.ID, reason, now.UTC(), event)
+	if err != nil {
+		s.observe("reject", "failure")
+		return Transaction{}, err
+	}
+	s.observe("reject", "success")
 	return result, nil
 }
 
@@ -254,4 +295,60 @@ func canonicalStrings(values []string) []string {
 		output = append(output, value)
 	}
 	return output
+}
+
+func validS256Challenge(value string) bool {
+	if len(value) != 43 {
+		return false
+	}
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(value)
+	return err == nil && len(decoded) == 32
+}
+
+func validOIDCScopes(values []string) bool {
+	if !contains(values, "openid") {
+		return false
+	}
+	for _, value := range values {
+		if value != "openid" && value != "profile" && value != "email" {
+			return false
+		}
+	}
+	return true
+}
+
+func validPrompts(values []string) bool {
+	canonical := canonicalStrings(values)
+	if len(canonical) != len(values) {
+		return false
+	}
+	for index := range canonical {
+		if canonical[index] != values[index] ||
+			(canonical[index] != "consent" && canonical[index] != "create" && canonical[index] != "login" && canonical[index] != "none") {
+			return false
+		}
+	}
+	return (!contains(values, "none") || len(values) == 1) && (!contains(values, "create") || !contains(values, "login"))
+}
+
+func contains(values []string, target string) bool {
+	index := sort.SearchStrings(values, target)
+	return index < len(values) && values[index] == target
+}
+
+func validFailureReason(reason string) bool {
+	switch reason {
+	case "invalid", "client_disabled", "registration_disabled", "canceled", "login_required", "consent_required", "interaction_required", "access_denied", "server_error":
+		return true
+	default:
+		return false
+	}
+}
+
+func cloneUint32(value *uint32) *uint32 {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	return &copyValue
 }

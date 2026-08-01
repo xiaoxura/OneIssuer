@@ -20,30 +20,39 @@ type Result string
 // TargetType identifies the kind of resource affected by an event.
 type TargetType string
 
-// Supported phase-two security event types.
+// Supported fixed security event types through phase three.
 const (
-	AdminBootstrapSucceeded          EventType = "admin_bootstrap_succeeded"
-	AdminBootstrapRejected           EventType = "admin_bootstrap_rejected"
-	UserRegistered                   EventType = "user_registered"
-	UserRegistrationRejected         EventType = "user_registration_rejected"
-	UserCreated                      EventType = "user_created"
-	UserUpdated                      EventType = "user_updated"
-	UserStatusChanged                EventType = "user_status_changed"
-	UserRoleChanged                  EventType = "user_role_changed"
-	LoginSucceeded                   EventType = "login_succeeded"
-	LoginFailed                      EventType = "login_failed"
-	LoginDisabledUser                EventType = "login_disabled_user"
-	SessionCreated                   EventType = "session_created"
-	SessionRevoked                   EventType = "session_revoked"
-	SessionsRevokedAll               EventType = "sessions_revoked_all"
-	ClientCreated                    EventType = "client_created"
-	ClientUpdated                    EventType = "client_updated"
-	ClientDisabled                   EventType = "client_disabled"
-	ClientSecretRotated              EventType = "client_secret_rotated"
-	AuthorizationTransactionCreated  EventType = "authorization_transaction_created"
-	AuthorizationTransactionConsumed EventType = "authorization_transaction_consumed"
-	AuthorizationTransactionExpired  EventType = "authorization_transaction_expired"
-	AuthorizationTransactionRejected EventType = "authorization_transaction_rejected"
+	AdminBootstrapSucceeded            EventType = "admin_bootstrap_succeeded"
+	AdminBootstrapRejected             EventType = "admin_bootstrap_rejected"
+	UserRegistered                     EventType = "user_registered"
+	UserRegistrationRejected           EventType = "user_registration_rejected"
+	UserCreated                        EventType = "user_created"
+	UserUpdated                        EventType = "user_updated"
+	UserStatusChanged                  EventType = "user_status_changed"
+	UserRoleChanged                    EventType = "user_role_changed"
+	LoginSucceeded                     EventType = "login_succeeded"
+	LoginFailed                        EventType = "login_failed"
+	LoginDisabledUser                  EventType = "login_disabled_user"
+	SessionCreated                     EventType = "session_created"
+	SessionRevoked                     EventType = "session_revoked"
+	SessionsRevokedAll                 EventType = "sessions_revoked_all"
+	ClientCreated                      EventType = "client_created"
+	ClientUpdated                      EventType = "client_updated"
+	ClientDisabled                     EventType = "client_disabled"
+	ClientSecretRotated                EventType = "client_secret_rotated"
+	AuthorizationTransactionCreated    EventType = "authorization_transaction_created"
+	AuthorizationTransactionConsumed   EventType = "authorization_transaction_consumed"
+	AuthorizationTransactionExpired    EventType = "authorization_transaction_expired"
+	AuthorizationTransactionRejected   EventType = "authorization_transaction_rejected"
+	AuthorizationGranted               EventType = "authorization_granted"
+	AuthorizationDenied                EventType = "authorization_denied"
+	AuthorizationCodeIssued            EventType = "authorization_code_issued"
+	AuthorizationCodeExchangeSucceeded EventType = "authorization_code_exchange_succeeded"
+	AuthorizationCodeExchangeRejected  EventType = "authorization_code_exchange_rejected"
+	ConsentGrantCreated                EventType = "consent_grant_created"
+	ConsentGrantExpanded               EventType = "consent_grant_expanded"
+	AccessTokenIssued                  EventType = "access_token_issued"
+	SigningKeyLoaded                   EventType = "signing_key_loaded"
 )
 
 // Supported audit result classifications.
@@ -55,10 +64,13 @@ const (
 
 // Supported audit target classifications.
 const (
-	TargetUser            TargetType = "user"
-	TargetClient          TargetType = "client"
-	TargetSession         TargetType = "session"
-	TargetAuthTransaction TargetType = "auth_transaction"
+	TargetUser              TargetType = "user"
+	TargetClient            TargetType = "client"
+	TargetSession           TargetType = "session"
+	TargetAuthTransaction   TargetType = "auth_transaction"
+	TargetConsentGrant      TargetType = "consent_grant"
+	TargetAuthorizationCode TargetType = "authorization_code"
+	TargetAccessToken       TargetType = "access_token"
 )
 
 var (
@@ -74,13 +86,16 @@ var (
 		string(ClientCreated), string(ClientUpdated), string(ClientDisabled), string(ClientSecretRotated),
 		string(AuthorizationTransactionCreated), string(AuthorizationTransactionConsumed),
 		string(AuthorizationTransactionExpired), string(AuthorizationTransactionRejected),
+		string(AuthorizationGranted), string(AuthorizationDenied), string(AuthorizationCodeIssued),
+		string(AuthorizationCodeExchangeSucceeded), string(AuthorizationCodeExchangeRejected),
+		string(ConsentGrantCreated), string(ConsentGrantExpanded), string(AccessTokenIssued), string(SigningKeyLoaded),
 	)
 	validResults       = set(string(ResultSuccess), string(ResultRejected), string(ResultFailure))
-	validTargets       = set(string(TargetUser), string(TargetClient), string(TargetSession), string(TargetAuthTransaction))
+	validTargets       = set(string(TargetUser), string(TargetClient), string(TargetSession), string(TargetAuthTransaction), string(TargetConsentGrant), string(TargetAuthorizationCode), string(TargetAccessToken))
 	validChangedFields = set(
 		"status", "role", "username", "display_name", "email", "name", "description",
 		"logo_uri", "registration_enabled", "redirect_uris", "logout_uris", "scopes",
-		"secret", "revoked", "created",
+		"secret", "revoked", "created", "expanded", "issued", "consumed",
 	)
 )
 

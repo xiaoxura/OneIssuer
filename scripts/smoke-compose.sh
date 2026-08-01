@@ -8,6 +8,10 @@ compose_file=${COMPOSE_FILE:-deploy/docker-compose.yml}
 http_port=${ONEISSUER_SMOKE_HTTP_PORT:-8080}
 base_url=${ONEISSUER_SMOKE_URL:-http://127.0.0.1:$http_port}
 session_cookie_name=${ONEISSUER_SMOKE_COOKIE_NAME:-oneissuer_smoke_session}
+client_a_port=${ONEISSUER_SMOKE_CLIENT_A_PORT:-8081}
+client_b_port=${ONEISSUER_SMOKE_CLIENT_B_PORT:-8082}
+client_a_url=http://localhost:$client_a_port
+client_b_url=http://localhost:$client_b_port
 
 # Export every acceptance-specific override so values from a developer .env do
 # not silently weaken or redirect the test. PostgreSQL stays on the internal
@@ -18,11 +22,25 @@ export ONEISSUER_ENV=development
 export ONEISSUER_REGISTRATION_ENABLED=true
 export ONEISSUER_COOKIE_NAME=$session_cookie_name
 export ONEISSUER_COOKIE_SECURE=false
-export ONEISSUER_VERSION=${ONEISSUER_VERSION:-v0.1.0-dev.2}
+export ONEISSUER_VERSION=${ONEISSUER_VERSION:-v0.1.0-dev.3}
 export POSTGRES_PORT=${ONEISSUER_SMOKE_POSTGRES_PORT:-0}
+export EXAMPLE_CLIENT_A_PORT=$client_a_port
+export EXAMPLE_CLIENT_B_PORT=$client_b_port
+export EXAMPLE_CLIENT_A_REDIRECT_URI=$client_a_url/callback
+export EXAMPLE_CLIENT_B_REDIRECT_URI=$client_b_url/callback
 
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/oneissuer-compose-smoke.XXXXXX")
 chmod 700 "$temporary"
+signing_key=$temporary/signing-key.jwk
+go run ./cmd/oneissuer keys generate --alg RS256 --out "$signing_key" >/dev/null
+# The runtime is deliberately UID/GID 65532 and the loader deliberately rejects
+# any group/world permission. Preserve mode 0600 while transferring ownership;
+# making the bind-mounted private JWK world-readable would turn the smoke test
+# into an unsafe deployment example.
+docker run --rm --user 0:0 --entrypoint /bin/sh \
+  --mount "type=bind,source=$signing_key,target=/run/oneissuer-secret" \
+  alpine:3.23.3 -c 'chown 65532:65532 /run/oneissuer-secret && chmod 0600 /run/oneissuer-secret'
+export ONEISSUER_SIGNING_KEY_HOST_FILE=$signing_key
 sensitive_values=$temporary/sensitive-values
 exposure_surface=$temporary/exposure-surface
 : >"$sensitive_values"
@@ -35,7 +53,7 @@ compose() {
 cleanup() {
   cleanup_status=$?
   trap - EXIT HUP INT TERM
-  compose down -v --remove-orphans >/dev/null 2>&1 || true
+  compose --profile oidc-demo down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$temporary"
   exit "$cleanup_status"
 }
@@ -62,6 +80,16 @@ assert_equal() {
   if [ "$assert_actual" != "$assert_expected" ]; then
     fail "$assert_label was '$assert_actual'; expected '$assert_expected'"
   fi
+}
+
+assert_prefix() {
+  assert_actual=$1
+  assert_expected=$2
+  assert_label=$3
+  case "$assert_actual" in
+    "$assert_expected"*) ;;
+    *) fail "$assert_label was '$assert_actual'; expected prefix '$assert_expected'" ;;
+  esac
 }
 
 assert_file_contains() {
@@ -133,6 +161,32 @@ cookie_value() {
   awk -v wanted="$cookie_name" 'NF >= 7 && $6 == wanted { value = $7 } END { print value }' "$cookie_jar"
 }
 
+query_value() {
+  query_name=$1
+  query_url=$2
+  printf '%s\n' "$query_url" | sed -n 's/.*[?&]'"$query_name"'=\([^&#]*\).*/\1/p' | head -n 1
+}
+
+absolute_url() {
+  absolute_base=$1
+  absolute_location=$2
+  case "$absolute_location" in
+    http://*|https://*) printf '%s\n' "$absolute_location" ;;
+    /*) printf '%s%s\n' "$absolute_base" "$absolute_location" ;;
+    *) fail "received unsafe relative Location '$absolute_location'" ;;
+  esac
+}
+
+write_curl_url_config() {
+  config_url=$1
+  config_file=$2
+  case "$config_url" in
+    *'"'*) fail "callback URL was not safe for curl config" ;;
+  esac
+  printf 'url = "%s"\n' "$config_url" >"$config_file"
+  chmod 600 "$config_file"
+}
+
 record_sensitive() {
   sensitive_value=$1
   sensitive_label=$2
@@ -182,7 +236,9 @@ for family in \
   oneissuer_http_request_duration_seconds \
   oneissuer_http_in_flight_requests \
   oneissuer_database_pool_connections \
-  oneissuer_readiness_status; do
+  oneissuer_readiness_status \
+  oneissuer_oidc_authorization_total \
+  oneissuer_oidc_token_operations_total; do
   assert_file_contains "$metrics_file" "$family" "metrics response"
 done
 
@@ -191,25 +247,36 @@ curl_request -D "$health_headers" -o /dev/null "$base_url/health/live"
 request_id=$(header_value X-Request-ID "$health_headers")
 [ -n "$request_id" ] || fail "health response omitted X-Request-ID"
 
-# Phase two must not counterfeit protocol success before the phase-three OIDC
-# adapter exists. Check every planned Discovery/JWKS/Authorize/Token/UserInfo
-# route (including both UserInfo methods) at the deployed HTTP boundary.
-protocol_body=$temporary/unimplemented-protocol-body
-for protocol_path in \
-  /.well-known/openid-configuration \
-  /oauth2/jwks \
-  /oauth2/authorize \
-  /oauth2/userinfo; do
-  protocol_status=$(curl_request -o "$protocol_body" -w '%{http_code}' "$base_url$protocol_path")
-  assert_status "$protocol_status" 404 "unimplemented GET $protocol_path"
+# Phase-three Discovery and JWKS are live only with the complete Code/Token/
+# UserInfo route set. Deferred phase-four endpoints must remain absent.
+discovery_body=$temporary/discovery-body
+discovery_status=$(curl_request -o "$discovery_body" -w '%{http_code}' "$base_url/.well-known/openid-configuration")
+assert_status "$discovery_status" 200 "OIDC Discovery"
+for marker in '"grant_types_supported":["authorization_code"]' '"code_challenge_methods_supported":["S256"]' '"id_token_signing_alg_values_supported":["RS256"]'; do
+  assert_file_contains "$discovery_body" "$marker" "OIDC Discovery"
 done
-for protocol_path in \
-  /oauth2/token \
-  /oauth2/userinfo \
-  /oauth2/revoke \
-  /oauth2/introspect; do
+for forbidden in refresh_token offline_access revocation_endpoint introspection_endpoint end_session_endpoint registration_endpoint; do
+  assert_file_excludes "$discovery_body" "$forbidden" "OIDC Discovery"
+done
+jwks_body=$temporary/jwks-body
+jwks_status=$(curl_request -o "$jwks_body" -w '%{http_code}' "$base_url/oauth2/jwks")
+assert_status "$jwks_status" 200 "OIDC JWKS"
+assert_file_contains "$jwks_body" '"alg": "RS256"' "OIDC JWKS"
+for private_member in '"d"' '"p"' '"q"' '"dp"' '"dq"' '"qi"'; do
+  assert_file_excludes "$jwks_body" "$private_member" "OIDC JWKS"
+done
+protocol_body=$temporary/protocol-boundary-body
+authorize_status=$(curl_request -o "$protocol_body" -w '%{http_code}' "$base_url/oauth2/authorize")
+assert_status "$authorize_status" 400 "malformed Authorize request"
+token_status=$(curl_request -X POST -o "$protocol_body" -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$token_status" 400 "malformed Token request"
+userinfo_get_status=$(curl_request -o "$protocol_body" -w '%{http_code}' "$base_url/oauth2/userinfo")
+assert_status "$userinfo_get_status" 401 "unauthenticated GET UserInfo"
+userinfo_post_status=$(curl_request -X POST -o "$protocol_body" -w '%{http_code}' "$base_url/oauth2/userinfo")
+assert_status "$userinfo_post_status" 401 "unauthenticated POST UserInfo"
+for protocol_path in /oauth2/revoke /oauth2/introspect /oauth2/logout; do
   protocol_status=$(curl_request -X POST -o "$protocol_body" -w '%{http_code}' "$base_url$protocol_path")
-  assert_status "$protocol_status" 404 "unimplemented POST $protocol_path"
+  assert_status "$protocol_status" 404 "deferred POST $protocol_path"
 done
 
 migrate_id=$(compose ps -aq migrate)
@@ -457,8 +524,8 @@ admin_csrf_header=$temporary/admin-csrf-header
 write_csrf_header "$admin_csrf" "$admin_csrf_header"
 
 public_payload=$temporary/public-client-payload
-cat >"$public_payload" <<'EOF'
-{"client_type":"public","name":"Compose Smoke Public","description":"phase-two acceptance","registration_enabled":true,"redirect_uris":["https://public.example.invalid/callback"],"logout_uris":["https://public.example.invalid/logout"],"scopes":["openid","profile"]}
+cat >"$public_payload" <<EOF
+{"client_type":"public","name":"Compose Smoke Public","description":"phase-three Public RP acceptance","registration_enabled":true,"redirect_uris":["$client_a_url/callback"],"logout_uris":["$client_a_url/logout"],"scopes":["openid","profile","email"]}
 EOF
 public_headers=$temporary/public-client-headers
 public_body=$temporary/public-client-body
@@ -469,7 +536,9 @@ assert_status "$public_status" 201 "create Public Client"
 assert_equal "$(header_value Cache-Control "$public_headers")" no-store "Public Client create cache policy"
 assert_file_excludes "$public_body" '"client_secret":' "Public Client create response"
 public_client_id=$(json_string id "$public_body")
+public_protocol_client_id=$(json_string client_id "$public_body")
 [ -n "$public_client_id" ] || fail "Public Client response omitted id"
+[ -n "$public_protocol_client_id" ] || fail "Public Client response omitted client_id"
 
 public_rotate_body=$temporary/public-rotate-body
 public_rotate_status=$(curl_request -X POST -b "$admin_jar" -c "$admin_jar" -H @"$admin_csrf_header" \
@@ -479,8 +548,8 @@ assert_status "$public_rotate_status" 422 "rotate Public Client Secret"
 assert_file_contains "$public_rotate_body" invalid_input "Public Client rotation error"
 
 confidential_payload=$temporary/confidential-client-payload
-cat >"$confidential_payload" <<'EOF'
-{"client_type":"confidential","name":"Compose Smoke Confidential","description":"phase-two acceptance","registration_enabled":false,"redirect_uris":["https://confidential.example.invalid/callback"],"logout_uris":["https://confidential.example.invalid/logout"],"scopes":["openid","email"]}
+cat >"$confidential_payload" <<EOF
+{"client_type":"confidential","name":"Compose Smoke Confidential","description":"phase-three Confidential RP acceptance","registration_enabled":false,"redirect_uris":["$client_b_url/callback"],"logout_uris":["$client_b_url/logout"],"scopes":["openid","profile","email"]}
 EOF
 confidential_headers=$temporary/confidential-client-headers
 confidential_body=$temporary/confidential-client-body
@@ -490,8 +559,10 @@ confidential_status=$(curl_request -X POST -b "$admin_jar" -c "$admin_jar" -H @"
 assert_status "$confidential_status" 201 "create Confidential Client"
 assert_equal "$(header_value Cache-Control "$confidential_headers")" no-store "Confidential Client create cache policy"
 confidential_client_id=$(json_string id "$confidential_body")
+confidential_protocol_client_id=$(json_string client_id "$confidential_body")
 confidential_secret=$(json_string client_secret "$confidential_body")
 [ -n "$confidential_client_id" ] || fail "Confidential Client response omitted id"
+[ -n "$confidential_protocol_client_id" ] || fail "Confidential Client response omitted client_id"
 record_sensitive "$confidential_secret" "one-time Confidential Client Secret"
 
 rotate_headers=$temporary/confidential-rotate-headers
@@ -512,12 +583,641 @@ assert_status "$client_read_status" 200 "read Confidential Client"
 assert_file_excludes "$client_read_before_restart" '"client_secret":' "Confidential Client read model"
 assert_file_excludes "$client_read_before_restart" '"secret_hash":' "Confidential Client read model"
 
+# Start the same strict server-side example RP twice: A is Public and B is
+# Confidential. The clear B Secret stays in a 0600 bind mount owned by the
+# runtime UID; it never enters Compose environment, argv, logs, or an image.
+client_b_secret_file=$temporary/example-client-b-secret
+printf '%s' "$rotated_client_secret" >"$client_b_secret_file"
+chmod 600 "$client_b_secret_file"
+docker run --rm --user 0:0 --entrypoint /bin/sh \
+  --mount "type=bind,source=$client_b_secret_file,target=/run/oneissuer-secret" \
+  alpine:3.23.3 -c 'chown 65532:65532 /run/oneissuer-secret && chmod 0600 /run/oneissuer-secret'
+export EXAMPLE_CLIENT_A_ID=$public_protocol_client_id
+export EXAMPLE_CLIENT_B_ID=$confidential_protocol_client_id
+export EXAMPLE_CLIENT_B_SECRET_FILE=$client_b_secret_file
+compose --profile oidc-demo up --build -d client-a client-b >/dev/null
+wait_status "$client_a_url/health/ready" 200 90
+wait_status "$client_b_url/health/ready" 200 90
+assert_equal "$(compose --profile oidc-demo exec -T client-a id -u)" 65532 "Client A effective UID"
+assert_equal "$(compose --profile oidc-demo exec -T client-b id -u)" 65532 "Client B effective UID"
+
+# Client A starts with prompt=create in a fresh browser. The RP owns state,
+# nonce, and verifier; OneIssuer restores all protocol context from its opaque
+# server transaction while registration POST carries only account fields plus
+# CSRF/transaction tokens.
+oidc_jar=$temporary/oidc-browser-jar
+: >"$oidc_jar"
+chmod 600 "$oidc_jar"
+oidc_username="oidcuser${nonce}"
+oidc_email="${oidc_username}@example.invalid"
+oidc_password="OIDCUser-${nonce}-StrongPassword"
+record_sensitive "$oidc_password" "OIDC demonstration user password"
+
+a_begin_headers=$temporary/client-a-begin-headers
+a_begin_body=$temporary/client-a-begin-body
+a_begin_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$a_begin_headers" -o "$a_begin_body" \
+  -w '%{http_code}' "$client_a_url/login?prompt=create")
+assert_status "$a_begin_status" 302 "Client A begin prompt=create"
+a_authorize=$(header_value Location "$a_begin_headers")
+assert_prefix "$a_authorize" "$base_url/oauth2/authorize?" "Client A authorization Location"
+a_state=$(query_value state "$a_authorize")
+a_nonce=$(query_value nonce "$a_authorize")
+record_sensitive "$a_state" "Client A state"
+record_sensitive "$a_nonce" "Client A nonce"
+client_a_cookie=$(cookie_value oneissuer_example_a "$oidc_jar")
+record_sensitive "$client_a_cookie" "Client A browser Session"
+
+a_authorize_headers=$temporary/client-a-authorize-headers
+a_authorize_body=$temporary/client-a-authorize-body
+a_authorize_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$a_authorize_headers" -o "$a_authorize_body" \
+  -w '%{http_code}' "$a_authorize")
+assert_status "$a_authorize_status" 303 "OneIssuer prompt=create decision"
+a_register_location=$(header_value Location "$a_authorize_headers")
+assert_prefix "$a_register_location" "/register?transaction=" "prompt=create registration continuation"
+
+a_register_page=$temporary/client-a-register-page
+a_register_headers=$temporary/client-a-register-headers
+a_register_url=$(absolute_url "$base_url" "$a_register_location")
+a_register_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$a_register_headers" -o "$a_register_page" \
+  -w '%{http_code}' "$a_register_url")
+assert_status "$a_register_status" 200 "OIDC hosted registration"
+a_register_csrf=$(hidden_value csrf_token "$a_register_page")
+a_transaction=$(hidden_value transaction "$a_register_page")
+record_sensitive "$a_register_csrf" "OIDC registration CSRF"
+record_sensitive "$a_transaction" "OIDC authorization transaction"
+a_register_form=$temporary/client-a-register-form
+printf 'csrf_token=%s&transaction=%s&username=%s&display_name=OIDC%%20Smoke%%20User&email=%s&password=%s' \
+  "$a_register_csrf" "$a_transaction" "$oidc_username" "$oidc_email" "$oidc_password" >"$a_register_form"
+chmod 600 "$a_register_form"
+a_register_post_headers=$temporary/client-a-register-post-headers
+a_register_post_body=$temporary/client-a-register-post-body
+a_register_post_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$a_register_post_headers" -o "$a_register_post_body" \
+  -w '%{http_code}' -H "Origin: $base_url" -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$a_register_form" "$base_url/register")
+assert_status "$a_register_post_status" 303 "OIDC prompt=create registration POST"
+a_continue_location=$(header_value Location "$a_register_post_headers")
+assert_prefix "$a_continue_location" "/oauth2/authorize/continue?transaction=" "post-registration authorization continuation"
+oidc_session_token=$(cookie_value "$session_cookie_name" "$oidc_jar")
+oidc_csrf_cookie=$(cookie_value "${session_cookie_name}_csrf" "$oidc_jar")
+record_sensitive "$oidc_session_token" "OIDC OneIssuer Session"
+record_sensitive "$oidc_csrf_cookie" "OIDC OneIssuer CSRF cookie"
+
+a_continue_headers=$temporary/client-a-continue-headers
+a_continue_body=$temporary/client-a-continue-body
+a_continue_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$a_continue_headers" -o "$a_continue_body" \
+  -w '%{http_code}' "$(absolute_url "$base_url" "$a_continue_location")")
+assert_status "$a_continue_status" 303 "Client A post-registration continuation"
+a_consent_location=$(header_value Location "$a_continue_headers")
+assert_prefix "$a_consent_location" "/consent?transaction=" "Client A first Consent Location"
+
+a_consent_page=$temporary/client-a-consent-page
+a_consent_headers=$temporary/client-a-consent-headers
+a_consent_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$a_consent_headers" -o "$a_consent_page" \
+  -w '%{http_code}' "$(absolute_url "$base_url" "$a_consent_location")")
+assert_status "$a_consent_status" 200 "Client A Consent page"
+assert_file_contains "$a_consent_page" 'Compose Smoke Public' "Client A Consent page"
+a_consent_csrf=$(hidden_value csrf_token "$a_consent_page")
+a_consent_transaction=$(hidden_value transaction "$a_consent_page")
+record_sensitive "$a_consent_csrf" "Client A Consent CSRF"
+record_sensitive "$a_consent_transaction" "Client A Consent transaction"
+a_consent_form=$temporary/client-a-consent-form
+printf 'csrf_token=%s&transaction=%s&decision=approve' "$a_consent_csrf" "$a_consent_transaction" >"$a_consent_form"
+chmod 600 "$a_consent_form"
+a_consent_post_headers=$temporary/client-a-consent-post-headers
+a_consent_post_body=$temporary/client-a-consent-post-body
+a_consent_post_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$a_consent_post_headers" -o "$a_consent_post_body" \
+  -w '%{http_code}' -H "Origin: $base_url" -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$a_consent_form" "$base_url/consent")
+assert_status "$a_consent_post_status" 302 "Client A Consent approval"
+a_callback_url=$(header_value Location "$a_consent_post_headers")
+assert_prefix "$a_callback_url" "$client_a_url/callback?code=" "Client A callback Location"
+a_code=$(query_value code "$a_callback_url")
+record_sensitive "$a_code" "Client A Authorization Code"
+a_callback_config=$temporary/client-a-callback-curl
+write_curl_url_config "$a_callback_url" "$a_callback_config"
+a_callback_headers=$temporary/client-a-callback-headers
+a_callback_body=$temporary/client-a-callback-body
+a_callback_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$a_callback_headers" -o "$a_callback_body" \
+  -w '%{http_code}' --config "$a_callback_config")
+assert_status "$a_callback_status" 303 "Client A strict callback"
+assert_equal "$(header_value Location "$a_callback_headers")" / "Client A callback completion"
+a_home=$temporary/client-a-home
+a_home_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -o "$a_home" -w '%{http_code}' "$client_a_url/")
+assert_status "$a_home_status" 200 "Client A signed-in home"
+assert_file_contains "$a_home" 'Signed in as <strong>OIDC Smoke User</strong>' "Client A verified identity"
+assert_file_excludes "$a_home" 'access_token' "Client A page"
+assert_file_excludes "$a_home" 'id_token' "Client A page"
+
+# A consumed Code remains unusable outside the RP after its successful callback.
+a_replay_form=$temporary/client-a-replay-form
+printf 'grant_type=authorization_code&code=%s&redirect_uri=http%%3A%%2F%%2Flocalhost%%3A%s%%2Fcallback&client_id=%s&code_verifier=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' \
+  "$a_code" "$client_a_port" "$public_protocol_client_id" >"$a_replay_form"
+chmod 600 "$a_replay_form"
+a_replay_body=$temporary/client-a-replay-body
+a_replay_status=$(curl_request -X POST -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @"$a_replay_form" \
+  -o "$a_replay_body" -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$a_replay_status" 400 "Client A consumed Code replay"
+assert_file_contains "$a_replay_body" '"error":"invalid_grant"' "Client A replay response"
+assert_file_excludes "$a_replay_body" "$a_code" "Client A replay response"
+
+# Client B uses the same OneIssuer browser Session but receives a separate
+# Consent page and validates a distinct audience with client_secret_basic.
+b_begin_headers=$temporary/client-b-begin-headers
+b_begin_body=$temporary/client-b-begin-body
+b_begin_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$b_begin_headers" -o "$b_begin_body" \
+  -w '%{http_code}' "$client_b_url/login")
+assert_status "$b_begin_status" 302 "Client B begin"
+b_authorize=$(header_value Location "$b_begin_headers")
+assert_prefix "$b_authorize" "$base_url/oauth2/authorize?" "Client B authorization Location"
+b_state=$(query_value state "$b_authorize")
+b_nonce=$(query_value nonce "$b_authorize")
+record_sensitive "$b_state" "Client B state"
+record_sensitive "$b_nonce" "Client B nonce"
+client_b_cookie=$(cookie_value oneissuer_example_b "$oidc_jar")
+record_sensitive "$client_b_cookie" "Client B browser Session"
+b_authorize_headers=$temporary/client-b-authorize-headers
+b_authorize_body=$temporary/client-b-authorize-body
+b_authorize_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$b_authorize_headers" -o "$b_authorize_body" \
+  -w '%{http_code}' "$b_authorize")
+assert_status "$b_authorize_status" 303 "Client B SSO authorization"
+b_consent_location=$(header_value Location "$b_authorize_headers")
+assert_prefix "$b_consent_location" "/consent?transaction=" "Client B independent Consent Location"
+assert_file_excludes "$b_authorize_headers" '/login?transaction=' "Client B SSO authorization"
+b_consent_page=$temporary/client-b-consent-page
+b_consent_headers=$temporary/client-b-consent-headers
+b_consent_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$b_consent_headers" -o "$b_consent_page" \
+  -w '%{http_code}' "$(absolute_url "$base_url" "$b_consent_location")")
+assert_status "$b_consent_status" 200 "Client B Consent page"
+assert_file_contains "$b_consent_page" 'Compose Smoke Confidential' "Client B Consent page"
+b_consent_csrf=$(hidden_value csrf_token "$b_consent_page")
+b_consent_transaction=$(hidden_value transaction "$b_consent_page")
+record_sensitive "$b_consent_csrf" "Client B Consent CSRF"
+record_sensitive "$b_consent_transaction" "Client B Consent transaction"
+b_consent_form=$temporary/client-b-consent-form
+printf 'csrf_token=%s&transaction=%s&decision=approve' "$b_consent_csrf" "$b_consent_transaction" >"$b_consent_form"
+chmod 600 "$b_consent_form"
+b_consent_post_headers=$temporary/client-b-consent-post-headers
+b_consent_post_body=$temporary/client-b-consent-post-body
+b_consent_post_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$b_consent_post_headers" -o "$b_consent_post_body" \
+  -w '%{http_code}' -H "Origin: $base_url" -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$b_consent_form" "$base_url/consent")
+assert_status "$b_consent_post_status" 302 "Client B Consent approval"
+b_callback_url=$(header_value Location "$b_consent_post_headers")
+assert_prefix "$b_callback_url" "$client_b_url/callback?code=" "Client B callback Location"
+b_code=$(query_value code "$b_callback_url")
+record_sensitive "$b_code" "Client B Authorization Code"
+b_callback_config=$temporary/client-b-callback-curl
+write_curl_url_config "$b_callback_url" "$b_callback_config"
+b_callback_headers=$temporary/client-b-callback-headers
+b_callback_body=$temporary/client-b-callback-body
+b_callback_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$b_callback_headers" -o "$b_callback_body" \
+  -w '%{http_code}' --config "$b_callback_config")
+assert_status "$b_callback_status" 303 "Client B strict callback"
+b_home=$temporary/client-b-home
+b_home_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -o "$b_home" -w '%{http_code}' "$client_b_url/")
+assert_status "$b_home_status" 200 "Client B signed-in home"
+assert_file_contains "$b_home" 'Signed in as <strong>OIDC Smoke User</strong>' "Client B verified identity"
+assert_file_excludes "$b_home" 'access_token' "Client B page"
+assert_file_excludes "$b_home" 'id_token' "Client B page"
+
+# Exercise the protocol endpoints with a known RFC 7636 S256 vector. Clear
+# Code/verifier/JWT values are kept in 0600 files or shell memory and are added
+# to the exact-value privacy scan; none is placed in a curl command argument.
+pkce_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+pkce_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+wrong_verifier=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+record_sensitive "$pkce_verifier" "direct Token PKCE verifier"
+record_sensitive "$pkce_challenge" "direct Authorize PKCE challenge"
+direct_state="direct-state-${nonce}"
+direct_nonce="direct-nonce-${nonce}"
+record_sensitive "$direct_state" "direct Public state"
+record_sensitive "$direct_nonce" "direct Public nonce"
+public_redirect_encoded=http%3A%2F%2Flocalhost%3A${client_a_port}%2Fcallback
+confidential_redirect_encoded=http%3A%2F%2Flocalhost%3A${client_b_port}%2Fcallback
+direct_public_authorize="$base_url/oauth2/authorize?client_id=$public_protocol_client_id&redirect_uri=$public_redirect_encoded&response_type=code&response_mode=query&scope=openid%20profile%20email&state=$direct_state&nonce=$direct_nonce&code_challenge=$pkce_challenge&code_challenge_method=S256"
+direct_public_headers=$temporary/direct-public-authorize-headers
+direct_public_body=$temporary/direct-public-authorize-body
+direct_public_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$direct_public_headers" -o "$direct_public_body" \
+  -w '%{http_code}' "$direct_public_authorize")
+assert_status "$direct_public_status" 302 "Public Grant reuse authorization"
+direct_public_callback=$(header_value Location "$direct_public_headers")
+assert_prefix "$direct_public_callback" "$client_a_url/callback?code=" "Public direct callback"
+direct_public_code=$(query_value code "$direct_public_callback")
+record_sensitive "$direct_public_code" "direct Public Authorization Code"
+
+direct_public_wrong_form=$temporary/direct-public-wrong-verifier-form
+printf 'grant_type=authorization_code&code=%s&redirect_uri=%s&client_id=%s&code_verifier=%s' \
+  "$direct_public_code" "$public_redirect_encoded" "$public_protocol_client_id" "$wrong_verifier" >"$direct_public_wrong_form"
+chmod 600 "$direct_public_wrong_form"
+direct_public_wrong_body=$temporary/direct-public-wrong-verifier-body
+direct_public_wrong_status=$(curl_request -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$direct_public_wrong_form" -o "$direct_public_wrong_body" -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$direct_public_wrong_status" 400 "Public wrong PKCE verifier"
+assert_file_contains "$direct_public_wrong_body" '"error":"invalid_grant"' "wrong-verifier response"
+assert_file_excludes "$direct_public_wrong_body" "$direct_public_code" "wrong-verifier response"
+
+direct_public_form=$temporary/direct-public-token-form
+printf 'grant_type=authorization_code&code=%s&redirect_uri=%s&client_id=%s&code_verifier=%s' \
+  "$direct_public_code" "$public_redirect_encoded" "$public_protocol_client_id" "$pkce_verifier" >"$direct_public_form"
+chmod 600 "$direct_public_form"
+direct_public_token_headers=$temporary/direct-public-token-headers
+direct_public_token_body=$temporary/direct-public-token-body
+direct_public_token_status=$(curl_request -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$direct_public_form" -D "$direct_public_token_headers" -o "$direct_public_token_body" \
+  -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$direct_public_token_status" 200 "Public Code exchange after wrong verifier"
+assert_equal "$(header_value Cache-Control "$direct_public_token_headers")" no-store "Public Token cache policy"
+assert_file_contains "$direct_public_token_body" '"token_type":"Bearer"' "Public Token response"
+assert_file_excludes "$direct_public_token_body" 'refresh_token' "Public Token response"
+public_access_token=$(json_string access_token "$direct_public_token_body")
+public_id_token=$(json_string id_token "$direct_public_token_body")
+record_sensitive "$public_access_token" "Public Access Token"
+record_sensitive "$public_id_token" "Public ID Token"
+public_bearer_header=$temporary/public-bearer-header
+printf 'Authorization: Bearer %s\n' "$public_access_token" >"$public_bearer_header"
+chmod 600 "$public_bearer_header"
+public_userinfo_headers=$temporary/public-userinfo-headers
+public_userinfo_body=$temporary/public-userinfo-body
+public_userinfo_status=$(curl_request -H @"$public_bearer_header" -D "$public_userinfo_headers" -o "$public_userinfo_body" \
+  -w '%{http_code}' "$base_url/oauth2/userinfo")
+assert_status "$public_userinfo_status" 200 "Public Access Token UserInfo"
+assert_file_contains "$public_userinfo_body" '"name":"OIDC Smoke User"' "Public UserInfo profile"
+assert_file_contains "$public_userinfo_body" '"email_verified":false' "Public UserInfo email verification"
+
+direct_public_replay_body=$temporary/direct-public-replay-body
+direct_public_replay_status=$(curl_request -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$direct_public_form" -o "$direct_public_replay_body" -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$direct_public_replay_status" 400 "Public direct Code replay"
+assert_file_contains "$direct_public_replay_body" '"error":"invalid_grant"' "Public direct replay response"
+
+# Deferred phase-four surfaces fail explicitly and Discovery remains honest.
+refresh_form=$temporary/refresh-grant-form
+printf 'grant_type=refresh_token&code=%s&redirect_uri=%s&client_id=%s&code_verifier=%s' \
+  "$direct_public_code" "$public_redirect_encoded" "$public_protocol_client_id" "$pkce_verifier" >"$refresh_form"
+chmod 600 "$refresh_form"
+refresh_body=$temporary/refresh-grant-body
+refresh_status=$(curl_request -X POST -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @"$refresh_form" \
+  -o "$refresh_body" -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$refresh_status" 400 "deferred Refresh grant"
+assert_file_contains "$refresh_body" '"error":"unsupported_grant_type"' "Refresh grant response"
+offline_state="offline-state-${nonce}"
+record_sensitive "$offline_state" "offline_access rejected state"
+offline_headers=$temporary/offline-authorize-headers
+offline_body=$temporary/offline-authorize-body
+offline_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$offline_headers" -o "$offline_body" -w '%{http_code}' \
+  "$base_url/oauth2/authorize?client_id=$public_protocol_client_id&redirect_uri=$public_redirect_encoded&response_type=code&scope=openid%20offline_access&state=$offline_state&code_challenge=$pkce_challenge&code_challenge_method=S256")
+assert_status "$offline_status" 302 "offline_access rejection"
+offline_location=$(header_value Location "$offline_headers")
+assert_prefix "$offline_location" "$client_a_url/callback?error=invalid_scope" "offline_access error redirect"
+assert_file_contains "$offline_headers" "state=$offline_state" "offline_access state round trip"
+
+none_state="none-state-${nonce}"
+record_sensitive "$none_state" "prompt=none state"
+none_jar=$temporary/prompt-none-cookie-jar
+: >"$none_jar"
+chmod 600 "$none_jar"
+none_headers=$temporary/prompt-none-headers
+none_body=$temporary/prompt-none-body
+none_status=$(curl_request -b "$none_jar" -c "$none_jar" -D "$none_headers" -o "$none_body" -w '%{http_code}' \
+  "$base_url/oauth2/authorize?client_id=$public_protocol_client_id&redirect_uri=$public_redirect_encoded&response_type=code&scope=openid&state=$none_state&prompt=none&code_challenge=$pkce_challenge&code_challenge_method=S256")
+assert_status "$none_status" 302 "prompt=none without Session"
+none_location=$(header_value Location "$none_headers")
+assert_prefix "$none_location" "$client_a_url/callback?error=login_required" "prompt=none login_required redirect"
+assert_file_contains "$none_headers" "state=$none_state" "prompt=none state round trip"
+
+bad_redirect_headers=$temporary/bad-redirect-headers
+bad_redirect_body=$temporary/bad-redirect-body
+bad_redirect_status=$(curl_request -D "$bad_redirect_headers" -o "$bad_redirect_body" -w '%{http_code}' \
+  "$base_url/oauth2/authorize?client_id=$public_protocol_client_id&redirect_uri=http%3A%2F%2Flocalhost%3A65530%2Fcallback&response_type=code&scope=openid&state=must-not-leave&code_challenge=$pkce_challenge&code_challenge_method=S256")
+assert_status "$bad_redirect_status" 400 "unregistered Redirect URI"
+assert_equal "$(header_value Location "$bad_redirect_headers")" "" "unregistered Redirect URI local failure"
+assert_file_excludes "$bad_redirect_body" 'localhost:65530' "unregistered Redirect URI body"
+
+# Confidential authentication is strictly Basic. A wrong Secret returns one
+# generic 401 without consuming the Code; the correct header can then exchange
+# that same S256-bound Code exactly once.
+confidential_state="confidential-state-${nonce}"
+confidential_nonce="confidential-nonce-${nonce}"
+record_sensitive "$confidential_state" "direct Confidential state"
+record_sensitive "$confidential_nonce" "direct Confidential nonce"
+direct_confidential_headers=$temporary/direct-confidential-authorize-headers
+direct_confidential_body=$temporary/direct-confidential-authorize-body
+direct_confidential_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$direct_confidential_headers" \
+  -o "$direct_confidential_body" -w '%{http_code}' \
+  "$base_url/oauth2/authorize?client_id=$confidential_protocol_client_id&redirect_uri=$confidential_redirect_encoded&response_type=code&scope=openid%20profile%20email&state=$confidential_state&nonce=$confidential_nonce&code_challenge=$pkce_challenge&code_challenge_method=S256")
+assert_status "$direct_confidential_status" 302 "Confidential Grant reuse authorization"
+direct_confidential_callback=$(header_value Location "$direct_confidential_headers")
+direct_confidential_code=$(query_value code "$direct_confidential_callback")
+record_sensitive "$direct_confidential_code" "direct Confidential Authorization Code"
+direct_confidential_form=$temporary/direct-confidential-token-form
+printf 'grant_type=authorization_code&code=%s&redirect_uri=%s&code_verifier=%s' \
+  "$direct_confidential_code" "$confidential_redirect_encoded" "$pkce_verifier" >"$direct_confidential_form"
+chmod 600 "$direct_confidential_form"
+wrong_basic=$(printf '%s:%s' "$confidential_protocol_client_id" invalid-client-secret | base64 | tr -d '\n')
+correct_basic=$(printf '%s:%s' "$confidential_protocol_client_id" "$rotated_client_secret" | base64 | tr -d '\n')
+record_sensitive "$correct_basic" "Confidential Basic credential"
+wrong_basic_header=$temporary/wrong-basic-header
+correct_basic_header=$temporary/correct-basic-header
+printf 'Authorization: Basic %s\n' "$wrong_basic" >"$wrong_basic_header"
+printf 'Authorization: Basic %s\n' "$correct_basic" >"$correct_basic_header"
+chmod 600 "$wrong_basic_header" "$correct_basic_header"
+wrong_secret_headers=$temporary/wrong-secret-headers
+wrong_secret_body=$temporary/wrong-secret-body
+wrong_secret_status=$(curl_request -X POST -H @"$wrong_basic_header" -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$direct_confidential_form" -D "$wrong_secret_headers" -o "$wrong_secret_body" \
+  -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$wrong_secret_status" 401 "Confidential wrong Secret"
+assert_equal "$(header_value WWW-Authenticate "$wrong_secret_headers")" Basic "Confidential invalid_client challenge"
+assert_file_contains "$wrong_secret_body" '"error":"invalid_client"' "Confidential wrong-Secret response"
+assert_file_excludes "$wrong_secret_body" "$direct_confidential_code" "Confidential wrong-Secret response"
+
+confidential_token_headers=$temporary/confidential-token-headers
+confidential_token_body=$temporary/confidential-token-body
+confidential_token_status=$(curl_request -X POST -H @"$correct_basic_header" -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$direct_confidential_form" -D "$confidential_token_headers" -o "$confidential_token_body" \
+  -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$confidential_token_status" 200 "Confidential Code exchange after wrong Secret"
+assert_file_excludes "$confidential_token_body" 'refresh_token' "Confidential Token response"
+confidential_access_token=$(json_string access_token "$confidential_token_body")
+confidential_id_token=$(json_string id_token "$confidential_token_body")
+record_sensitive "$confidential_access_token" "Confidential Access Token"
+record_sensitive "$confidential_id_token" "Confidential ID Token"
+confidential_bearer_header=$temporary/confidential-bearer-header
+printf 'Authorization: Bearer %s\n' "$confidential_access_token" >"$confidential_bearer_header"
+chmod 600 "$confidential_bearer_header"
+confidential_userinfo_body=$temporary/confidential-userinfo-body
+confidential_userinfo_status=$(curl_request -H @"$confidential_bearer_header" -o "$confidential_userinfo_body" \
+  -w '%{http_code}' "$base_url/oauth2/userinfo")
+assert_status "$confidential_userinfo_status" 200 "Confidential Access Token UserInfo"
+confidential_replay_body=$temporary/confidential-replay-body
+confidential_replay_status=$(curl_request -X POST -H @"$correct_basic_header" -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$direct_confidential_form" -o "$confidential_replay_body" -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$confidential_replay_status" 400 "Confidential Code replay"
+assert_file_contains "$confidential_replay_body" '"error":"invalid_grant"' "Confidential replay response"
+
+# A fresh Public Code is raced through two independent HTTP requests. Exactly
+# one response commits JWT metadata; the loser is a generic invalid_grant.
+concurrent_state="concurrent-state-${nonce}"
+record_sensitive "$concurrent_state" "concurrent exchange state"
+concurrent_authorize_headers=$temporary/concurrent-authorize-headers
+concurrent_authorize_body=$temporary/concurrent-authorize-body
+concurrent_authorize_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$concurrent_authorize_headers" \
+  -o "$concurrent_authorize_body" -w '%{http_code}' \
+  "$base_url/oauth2/authorize?client_id=$public_protocol_client_id&redirect_uri=$public_redirect_encoded&response_type=code&scope=openid%20profile%20email&state=$concurrent_state&code_challenge=$pkce_challenge&code_challenge_method=S256")
+assert_status "$concurrent_authorize_status" 302 "concurrent exchange authorization"
+concurrent_callback=$(header_value Location "$concurrent_authorize_headers")
+concurrent_code=$(query_value code "$concurrent_callback")
+record_sensitive "$concurrent_code" "concurrent Authorization Code"
+concurrent_form=$temporary/concurrent-token-form
+printf 'grant_type=authorization_code&code=%s&redirect_uri=%s&client_id=%s&code_verifier=%s' \
+  "$concurrent_code" "$public_redirect_encoded" "$public_protocol_client_id" "$pkce_verifier" >"$concurrent_form"
+chmod 600 "$concurrent_form"
+concurrent_body_one=$temporary/concurrent-token-body-one
+concurrent_body_two=$temporary/concurrent-token-body-two
+concurrent_status_one=$temporary/concurrent-token-status-one
+concurrent_status_two=$temporary/concurrent-token-status-two
+(curl_request -X POST -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @"$concurrent_form" \
+  -o "$concurrent_body_one" -w '%{http_code}' "$base_url/oauth2/token" >"$concurrent_status_one") &
+concurrent_pid_one=$!
+(curl_request -X POST -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @"$concurrent_form" \
+  -o "$concurrent_body_two" -w '%{http_code}' "$base_url/oauth2/token" >"$concurrent_status_two") &
+concurrent_pid_two=$!
+wait "$concurrent_pid_one"
+wait "$concurrent_pid_two"
+concurrent_one=$(cat "$concurrent_status_one")
+concurrent_two=$(cat "$concurrent_status_two")
+if [ "$concurrent_one" = 200 ] && [ "$concurrent_two" = 400 ]; then
+  concurrent_success_body=$concurrent_body_one
+  concurrent_failure_body=$concurrent_body_two
+elif [ "$concurrent_one" = 400 ] && [ "$concurrent_two" = 200 ]; then
+  concurrent_success_body=$concurrent_body_two
+  concurrent_failure_body=$concurrent_body_one
+else
+  fail "concurrent Code exchange statuses were $concurrent_one/$concurrent_two; expected one 200 and one 400"
+fi
+assert_file_contains "$concurrent_failure_body" '"error":"invalid_grant"' "concurrent exchange loser"
+concurrent_access_token=$(json_string access_token "$concurrent_success_body")
+concurrent_id_token=$(json_string id_token "$concurrent_success_body")
+record_sensitive "$concurrent_access_token" "concurrent Access Token"
+record_sensitive "$concurrent_id_token" "concurrent ID Token"
+
+# The example RP rejects a callback whose state does not match its server-side
+# pending attempt. Feed the callback URL through a protected curl config so the
+# unconsumed Code never appears in process arguments.
+state_check_headers=$temporary/state-check-begin-headers
+state_check_body=$temporary/state-check-begin-body
+state_check_begin_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$state_check_headers" -o "$state_check_body" \
+  -w '%{http_code}' "$client_a_url/login")
+assert_status "$state_check_begin_status" 302 "Client A state-check begin"
+state_check_authorize=$(header_value Location "$state_check_headers")
+state_check_original=$(query_value state "$state_check_authorize")
+record_sensitive "$state_check_original" "Client A state-check original state"
+state_check_authorize_headers=$temporary/state-check-authorize-headers
+state_check_authorize_body=$temporary/state-check-authorize-body
+state_check_authorize_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$state_check_authorize_headers" \
+  -o "$state_check_authorize_body" -w '%{http_code}' "$state_check_authorize")
+assert_status "$state_check_authorize_status" 302 "Client A state-check authorization"
+state_check_callback=$(header_value Location "$state_check_authorize_headers")
+state_check_code=$(query_value code "$state_check_callback")
+record_sensitive "$state_check_code" "state-check Authorization Code"
+tampered_state="tampered-state-${nonce}"
+record_sensitive "$tampered_state" "Client A tampered callback state"
+state_check_tampered=$(printf '%s\n' "$state_check_callback" | sed 's/\([?&]state=\)[^&]*/\1'"$tampered_state"'/')
+state_check_config=$temporary/state-check-callback-curl
+write_curl_url_config "$state_check_tampered" "$state_check_config"
+state_check_callback_body=$temporary/state-check-callback-body
+state_check_callback_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -o "$state_check_callback_body" \
+  -w '%{http_code}' --config "$state_check_config")
+assert_status "$state_check_callback_status" 400 "Client A mismatched state callback"
+assert_file_excludes "$state_check_callback_body" "$state_check_code" "Client A mismatched-state error"
+
+# Current Client and User status is authoritative for both Code exchange and
+# UserInfo. Administrative disablement fails closed; re-enabling does not consume
+# a Code that was rejected while authority was disabled.
+client_disable_payload=$temporary/client-disable-payload
+client_enable_payload=$temporary/client-enable-payload
+printf '%s' '{"status":"disabled"}' >"$client_disable_payload"
+printf '%s' '{"status":"active"}' >"$client_enable_payload"
+client_disable_body=$temporary/client-disable-body
+client_disable_status=$(curl_request -X PATCH -b "$admin_jar" -c "$admin_jar" -H @"$admin_csrf_header" \
+  -H 'Content-Type: application/json' --data-binary @"$client_disable_payload" -o "$client_disable_body" \
+  -w '%{http_code}' "$base_url/api/admin/v1/clients/$confidential_client_id")
+assert_status "$client_disable_status" 200 "disable Confidential Client"
+disabled_client_userinfo_headers=$temporary/disabled-client-userinfo-headers
+disabled_client_userinfo_body=$temporary/disabled-client-userinfo-body
+disabled_client_userinfo_status=$(curl_request -H @"$confidential_bearer_header" -D "$disabled_client_userinfo_headers" \
+  -o "$disabled_client_userinfo_body" -w '%{http_code}' "$base_url/oauth2/userinfo")
+assert_status "$disabled_client_userinfo_status" 401 "disabled Client UserInfo"
+assert_equal "$(header_value WWW-Authenticate "$disabled_client_userinfo_headers")" Bearer "disabled Client Bearer challenge"
+disabled_client_authorize_headers=$temporary/disabled-client-authorize-headers
+disabled_client_authorize_body=$temporary/disabled-client-authorize-body
+disabled_client_authorize_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$disabled_client_authorize_headers" \
+  -o "$disabled_client_authorize_body" -w '%{http_code}' \
+  "$base_url/oauth2/authorize?client_id=$confidential_protocol_client_id&redirect_uri=$confidential_redirect_encoded&response_type=code&scope=openid&state=disabled-client-state&code_challenge=$pkce_challenge&code_challenge_method=S256")
+assert_status "$disabled_client_authorize_status" 400 "disabled Client authorization"
+assert_equal "$(header_value Location "$disabled_client_authorize_headers")" "" "disabled Client local error"
+client_enable_body=$temporary/client-enable-body
+client_enable_status=$(curl_request -X PATCH -b "$admin_jar" -c "$admin_jar" -H @"$admin_csrf_header" \
+  -H 'Content-Type: application/json' --data-binary @"$client_enable_payload" -o "$client_enable_body" \
+  -w '%{http_code}' "$base_url/api/admin/v1/clients/$confidential_client_id")
+assert_status "$client_enable_status" 200 "re-enable Confidential Client"
+reenabled_client_userinfo_body=$temporary/reenabled-client-userinfo-body
+reenabled_client_userinfo_status=$(curl_request -H @"$confidential_bearer_header" -o "$reenabled_client_userinfo_body" \
+  -w '%{http_code}' "$base_url/oauth2/userinfo")
+assert_status "$reenabled_client_userinfo_status" 200 "re-enabled Client UserInfo"
+
+oidc_me_headers=$temporary/oidc-user-me-headers
+oidc_me_body=$temporary/oidc-user-me-body
+oidc_me_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$oidc_me_headers" -o "$oidc_me_body" \
+  -w '%{http_code}' "$base_url/api/v1/me")
+assert_status "$oidc_me_status" 200 "OIDC user current identity"
+oidc_user_id=$(json_string id "$oidc_me_body")
+[ -n "$oidc_user_id" ] || fail "OIDC current-user response omitted id"
+
+disabled_user_state="disabled-user-state-${nonce}"
+record_sensitive "$disabled_user_state" "disabled-user authorization state"
+disabled_user_authorize_headers=$temporary/disabled-user-authorize-headers
+disabled_user_authorize_body=$temporary/disabled-user-authorize-body
+disabled_user_authorize_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$disabled_user_authorize_headers" \
+  -o "$disabled_user_authorize_body" -w '%{http_code}' \
+  "$base_url/oauth2/authorize?client_id=$public_protocol_client_id&redirect_uri=$public_redirect_encoded&response_type=code&scope=openid%20profile%20email&state=$disabled_user_state&code_challenge=$pkce_challenge&code_challenge_method=S256")
+assert_status "$disabled_user_authorize_status" 302 "pre-disable User authorization"
+disabled_user_code=$(query_value code "$(header_value Location "$disabled_user_authorize_headers")")
+record_sensitive "$disabled_user_code" "pre-disable User Authorization Code"
+disabled_user_form=$temporary/disabled-user-token-form
+printf 'grant_type=authorization_code&code=%s&redirect_uri=%s&client_id=%s&code_verifier=%s' \
+  "$disabled_user_code" "$public_redirect_encoded" "$public_protocol_client_id" "$pkce_verifier" >"$disabled_user_form"
+chmod 600 "$disabled_user_form"
+
+user_disable_payload=$temporary/user-disable-payload
+user_enable_payload=$temporary/user-enable-payload
+printf '%s' '{"status":"disabled"}' >"$user_disable_payload"
+printf '%s' '{"status":"active"}' >"$user_enable_payload"
+user_disable_body=$temporary/user-disable-body
+user_disable_status=$(curl_request -X PATCH -b "$admin_jar" -c "$admin_jar" -H @"$admin_csrf_header" \
+  -H 'Content-Type: application/json' --data-binary @"$user_disable_payload" -o "$user_disable_body" \
+  -w '%{http_code}' "$base_url/api/admin/v1/users/$oidc_user_id")
+assert_status "$user_disable_status" 200 "disable OIDC User"
+disabled_user_userinfo_headers=$temporary/disabled-user-userinfo-headers
+disabled_user_userinfo_body=$temporary/disabled-user-userinfo-body
+disabled_user_userinfo_status=$(curl_request -H @"$public_bearer_header" -D "$disabled_user_userinfo_headers" \
+  -o "$disabled_user_userinfo_body" -w '%{http_code}' "$base_url/oauth2/userinfo")
+assert_status "$disabled_user_userinfo_status" 401 "disabled User UserInfo"
+disabled_user_token_body=$temporary/disabled-user-token-body
+disabled_user_token_status=$(curl_request -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$disabled_user_form" -o "$disabled_user_token_body" -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$disabled_user_token_status" 400 "disabled User Code exchange"
+assert_file_contains "$disabled_user_token_body" '"error":"invalid_grant"' "disabled User exchange response"
+
+user_enable_body=$temporary/user-enable-body
+user_enable_status=$(curl_request -X PATCH -b "$admin_jar" -c "$admin_jar" -H @"$admin_csrf_header" \
+  -H 'Content-Type: application/json' --data-binary @"$user_enable_payload" -o "$user_enable_body" \
+  -w '%{http_code}' "$base_url/api/admin/v1/users/$oidc_user_id")
+assert_status "$user_enable_status" 200 "re-enable OIDC User"
+reenabled_user_userinfo_body=$temporary/reenabled-user-userinfo-body
+reenabled_user_userinfo_status=$(curl_request -H @"$public_bearer_header" -o "$reenabled_user_userinfo_body" \
+  -w '%{http_code}' "$base_url/oauth2/userinfo")
+assert_status "$reenabled_user_userinfo_status" 200 "re-enabled User UserInfo"
+reenabled_user_token_body=$temporary/reenabled-user-token-body
+reenabled_user_token_status=$(curl_request -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$disabled_user_form" -o "$reenabled_user_token_body" -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$reenabled_user_token_status" 200 "re-enabled User Code exchange"
+reenabled_user_access_token=$(json_string access_token "$reenabled_user_token_body")
+reenabled_user_id_token=$(json_string id_token "$reenabled_user_token_body")
+record_sensitive "$reenabled_user_access_token" "re-enabled User Access Token"
+record_sensitive "$reenabled_user_id_token" "re-enabled User ID Token"
+reenabled_user_bearer_header=$temporary/reenabled-user-bearer-header
+printf 'Authorization: Bearer %s\n' "$reenabled_user_access_token" >"$reenabled_user_bearer_header"
+chmod 600 "$reenabled_user_bearer_header"
+
+# Disabling the User revoked its browser Session. Sign in again so post-restart
+# Grant reuse proves persisted Consent independently of stale browser authority.
+oidc_relogin_headers=$temporary/oidc-relogin-get-headers
+oidc_relogin_page=$temporary/oidc-relogin-page
+begin_auth /login "$oidc_jar" "$oidc_relogin_headers" "$oidc_relogin_page"
+oidc_relogin_csrf=$auth_csrf
+oidc_relogin_transaction=$auth_transaction
+oidc_relogin_form=$temporary/oidc-relogin-form
+printf 'csrf_token=%s&transaction=%s&identifier=%s&password=%s' \
+  "$oidc_relogin_csrf" "$oidc_relogin_transaction" "$oidc_username" "$oidc_password" >"$oidc_relogin_form"
+chmod 600 "$oidc_relogin_form"
+oidc_relogin_post_headers=$temporary/oidc-relogin-post-headers
+oidc_relogin_post_body=$temporary/oidc-relogin-post-body
+oidc_relogin_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$oidc_relogin_post_headers" \
+  -o "$oidc_relogin_post_body" -w '%{http_code}' -H "Origin: $base_url" \
+  -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @"$oidc_relogin_form" "$base_url/login")
+assert_status "$oidc_relogin_status" 303 "OIDC User re-login after enable"
+assert_equal "$(header_value Location "$oidc_relogin_post_headers")" /auth/complete "OIDC User re-login completion"
+oidc_relogin_session=$(cookie_value "$session_cookie_name" "$oidc_jar")
+record_sensitive "$oidc_relogin_session" "OIDC re-login Session"
+
+pre_restart_jwks_headers=$temporary/pre-restart-jwks-headers
+pre_restart_jwks_body=$temporary/pre-restart-jwks-body
+pre_restart_jwks_status=$(curl_request -D "$pre_restart_jwks_headers" -o "$pre_restart_jwks_body" \
+  -w '%{http_code}' "$base_url/oauth2/jwks")
+assert_status "$pre_restart_jwks_status" 200 "pre-restart JWKS"
+pre_restart_jwks_etag=$(header_value ETag "$pre_restart_jwks_headers")
+[ -n "$pre_restart_jwks_etag" ] || fail "pre-restart JWKS omitted ETag"
+protocol_metrics=$temporary/protocol-metrics
+curl_request --fail "$base_url/metrics" >"$protocol_metrics"
+for marker in \
+  'oneissuer_oidc_authorization_total{operation="issue",result="success"}' \
+  'oneissuer_oidc_token_operations_total{operation="exchange",result="success"}' \
+  'oneissuer_oidc_token_operations_total{operation="userinfo",result="success"}'; do
+  assert_file_contains "$protocol_metrics" "$marker" "phase-three protocol metrics"
+done
+
 # Restart only the application process. PostgreSQL and its volume remain in
 # place. User/admin authority, Client records, audit history, and revoked Session
 # state must all be resolved from persisted database state afterwards.
 compose restart oneissuer >/dev/null
 wait_status "$base_url/health/live" 200
 wait_status "$base_url/health/ready" 200 90
+
+post_restart_jwks_headers=$temporary/post-restart-jwks-headers
+post_restart_jwks_body=$temporary/post-restart-jwks-body
+post_restart_jwks_status=$(curl_request -D "$post_restart_jwks_headers" -o "$post_restart_jwks_body" \
+  -w '%{http_code}' "$base_url/oauth2/jwks")
+assert_status "$post_restart_jwks_status" 200 "post-restart JWKS"
+assert_equal "$(header_value ETag "$post_restart_jwks_headers")" "$pre_restart_jwks_etag" "stable signing Key/JWKS across restart"
+if ! cmp -s "$pre_restart_jwks_body" "$post_restart_jwks_body"; then
+  fail "public JWKS changed across an application restart"
+fi
+
+post_restart_userinfo_body=$temporary/post-restart-userinfo-body
+post_restart_userinfo_status=$(curl_request -H @"$reenabled_user_bearer_header" -o "$post_restart_userinfo_body" \
+  -w '%{http_code}' "$base_url/oauth2/userinfo")
+assert_status "$post_restart_userinfo_status" 200 "Access metadata after application restart"
+post_restart_replay_body=$temporary/post-restart-replay-body
+post_restart_replay_status=$(curl_request -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$disabled_user_form" -o "$post_restart_replay_body" -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$post_restart_replay_status" 400 "consumed Code after application restart"
+assert_file_contains "$post_restart_replay_body" '"error":"invalid_grant"' "post-restart Code replay"
+
+post_restart_state="post-restart-state-${nonce}"
+record_sensitive "$post_restart_state" "post-restart Grant-reuse state"
+post_restart_authorize_headers=$temporary/post-restart-authorize-headers
+post_restart_authorize_body=$temporary/post-restart-authorize-body
+post_restart_authorize_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$post_restart_authorize_headers" \
+  -o "$post_restart_authorize_body" -w '%{http_code}' \
+  "$base_url/oauth2/authorize?client_id=$public_protocol_client_id&redirect_uri=$public_redirect_encoded&response_type=code&scope=openid%20profile%20email&state=$post_restart_state&code_challenge=$pkce_challenge&code_challenge_method=S256")
+assert_status "$post_restart_authorize_status" 302 "post-restart persisted Grant reuse"
+post_restart_callback=$(header_value Location "$post_restart_authorize_headers")
+assert_prefix "$post_restart_callback" "$client_a_url/callback?code=" "post-restart Grant callback"
+post_restart_code=$(query_value code "$post_restart_callback")
+record_sensitive "$post_restart_code" "post-restart Authorization Code"
+post_restart_form=$temporary/post-restart-token-form
+printf 'grant_type=authorization_code&code=%s&redirect_uri=%s&client_id=%s&code_verifier=%s' \
+  "$post_restart_code" "$public_redirect_encoded" "$public_protocol_client_id" "$pkce_verifier" >"$post_restart_form"
+chmod 600 "$post_restart_form"
+post_restart_token_body=$temporary/post-restart-token-body
+post_restart_token_status=$(curl_request -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$post_restart_form" -o "$post_restart_token_body" -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$post_restart_token_status" 200 "post-restart Code exchange"
+post_restart_access_token=$(json_string access_token "$post_restart_token_body")
+post_restart_id_token=$(json_string id_token "$post_restart_token_body")
+record_sensitive "$post_restart_access_token" "post-restart Access Token"
+record_sensitive "$post_restart_id_token" "post-restart ID Token"
 
 persisted_user_headers=$temporary/persisted-user-headers
 persisted_user_body=$temporary/persisted-user-body
@@ -572,7 +1272,14 @@ for event_type in \
   login_succeeded \
   session_revoked \
   client_created \
-  client_secret_rotated; do
+  client_secret_rotated \
+  authorization_granted \
+  authorization_code_issued \
+  authorization_code_exchange_succeeded \
+  authorization_code_exchange_rejected \
+  consent_grant_created \
+  access_token_issued \
+  signing_key_loaded; do
   assert_file_contains "$audit_after_restart" "$event_type" "persisted audit list"
 done
 
@@ -624,8 +1331,8 @@ assert_equal "$(docker inspect "$oneissuer_id" --format '{{.State.ExitCode}}')" 
 # all subsequent read responses.
 application_logs=$temporary/application-logs
 compose_logs=$temporary/compose-logs
-compose logs --no-color oneissuer >"$application_logs"
-compose logs --no-color >"$compose_logs"
+compose --profile oidc-demo logs --no-color oneissuer >"$application_logs"
+compose --profile oidc-demo logs --no-color >"$compose_logs"
 assert_file_contains "$application_logs" '"timestamp"' "application logs"
 assert_file_contains "$application_logs" '"request_id"' "application logs"
 assert_file_contains "$application_logs" '"duration_ms"' "application logs"
@@ -644,6 +1351,30 @@ cat \
   "$persisted_admin_body" \
   "$public_read_after_restart" \
   "$confidential_read_after_restart" \
+  "$a_home" \
+  "$b_home" \
+  "$a_replay_body" \
+  "$direct_public_wrong_body" \
+  "$direct_public_replay_body" \
+  "$refresh_body" \
+  "$bad_redirect_body" \
+  "$wrong_secret_body" \
+  "$confidential_replay_body" \
+  "$concurrent_failure_body" \
+  "$state_check_callback_body" \
+  "$disabled_client_userinfo_body" \
+  "$disabled_client_authorize_body" \
+  "$disabled_user_userinfo_body" \
+  "$disabled_user_token_body" \
+  "$public_userinfo_body" \
+  "$confidential_userinfo_body" \
+  "$reenabled_client_userinfo_body" \
+  "$reenabled_user_userinfo_body" \
+  "$post_restart_userinfo_body" \
+  "$post_restart_replay_body" \
+  "$protocol_metrics" \
+  "$pre_restart_jwks_body" \
+  "$post_restart_jwks_body" \
   "$audit_after_restart" \
   "$final_audit" \
   "$recovered_admin_body" \
@@ -670,4 +1401,4 @@ if grep -Eq '"(password|password_hash|token_hash|csrf_hash|secret_hash)"[[:space
   fail "logs, audit, or a credential-free response exposed a forbidden sensitive field"
 fi
 
-printf '%s\n' 'compose smoke: PASS (empty volume, repeated migration, Bootstrap, hosted auth, Session/CSRF, Client/audit persistence, absent OIDC routes, privacy, outage recovery, and graceful shutdown)'
+printf '%s\n' 'compose smoke: PASS (empty volume, migration/Bootstrap regression, Public+Confidential S256, prompt=create, Consent/SSO, strict RP callbacks, Token/UserInfo, negative/concurrent/restart authority, privacy, outage recovery, and graceful shutdown)'

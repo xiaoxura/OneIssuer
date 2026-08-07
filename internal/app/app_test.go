@@ -170,6 +170,29 @@ func TestSuperviseHTTPForcesCloseAfterTimeout(t *testing.T) {
 	}
 }
 
+func TestCleanupOperationsReceiveIndependentBoundedContexts(t *testing.T) {
+	t.Parallel()
+
+	parent := context.Background()
+	firstStarted := time.Now()
+	runCleanupOperation(parent, 10*time.Millisecond, "sessions", nil, nil, "unused", func(ctx context.Context) (int64, error) {
+		<-ctx.Done()
+		return 3, ctx.Err()
+	})
+	if elapsed := time.Since(firstStarted); elapsed < 5*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("first cleanup timeout elapsed in %s", elapsed)
+	}
+
+	secondRanWithLiveContext := false
+	runCleanupOperation(parent, time.Second, "auth_transactions", nil, nil, "unused", func(ctx context.Context) (int64, error) {
+		secondRanWithLiveContext = ctx.Err() == nil
+		return 1, nil
+	})
+	if !secondRanWithLiveContext {
+		t.Fatal("a later cleanup operation inherited the previous operation's canceled context")
+	}
+}
+
 func waitFor(t *testing.T, timeout time.Duration, condition func() bool, message string) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

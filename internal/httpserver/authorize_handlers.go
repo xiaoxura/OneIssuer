@@ -115,7 +115,8 @@ func (a *applicationHandler) advanceAuthorization(writer http.ResponseWriter, re
 
 func (a *applicationHandler) issueAuthorizationCode(writer http.ResponseWriter, request *http.Request, transactionToken string, transaction authflow.Transaction, principal session.Principal, interactive bool) {
 	issued, err := a.authorization.Issue(
-		request.Context(), transaction, principal.User.ID, principal.AuthenticatedAt,
+		request.Context(), transaction, principal.User.ID, principal.SessionID, principal.SessionBindingID,
+		principal.AuthenticatedAt,
 		interactive, RequestID(request.Context()), a.now().UTC(),
 	)
 	if err != nil {

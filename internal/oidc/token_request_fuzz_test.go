@@ -12,6 +12,11 @@ func FuzzTokenRequestAndBasicParsing(f *testing.F) {
 	resolver := tokenResolverFixture()
 	f.Add(validTokenForm(resolver.public.ClientID).Encode(), "")
 	f.Add(validTokenForm(resolver.confidential.ClientID).Encode(), basicHeader(resolver.confidential.ClientID, resolver.secret))
+	publicRefresh := validRefreshForm(resolver.public.ClientID)
+	f.Add(publicRefresh.Encode(), "")
+	confidentialRefresh := validRefreshForm(resolver.confidential.ClientID)
+	confidentialRefresh.Del("client_id")
+	f.Add(confidentialRefresh.Encode(), basicHeader(resolver.confidential.ClientID, resolver.secret))
 	f.Add("grant_type=refresh_token&code=canary", "Bearer downgrade")
 	f.Add("code=%GG", "Basic !!!")
 
@@ -29,9 +34,20 @@ func FuzzTokenRequestAndBasicParsing(f *testing.F) {
 		}
 		verified, parseErr := ParseTokenRequest(context.Background(), form, header, resolver)
 		if parseErr == nil {
-			if len(verified.CodeHash) != 32 || verified.Client.ID.String() == "00000000-0000-0000-0000-000000000000" ||
-				verified.RedirectURI == "" || verified.CodeVerifier == "" || strings.Contains(string(verified.CodeHash), form.Get("code")) {
-				t.Fatalf("successful token parse violated boundary: %+v", verified)
+			if verified.Client.ID.String() == "00000000-0000-0000-0000-000000000000" {
+				t.Fatalf("successful token parse returned an empty client for grant type %q", verified.GrantType)
+			}
+			switch verified.GrantType {
+			case "authorization_code":
+				if len(verified.CodeHash) != 32 || verified.RedirectURI == "" || verified.CodeVerifier == "" || len(verified.RefreshTokenHash) != 0 {
+					t.Fatalf("successful authorization-code parse violated boundary: code_hash=%d refresh_hash=%d redirect_set=%t verifier_len=%d", len(verified.CodeHash), len(verified.RefreshTokenHash), verified.RedirectURI != "", len(verified.CodeVerifier))
+				}
+			case "refresh_token":
+				if len(verified.RefreshTokenHash) != 32 || len(verified.CodeHash) != 0 || verified.RedirectURI != "" || verified.CodeVerifier != "" || form.Get("code") != "" {
+					t.Fatalf("successful refresh parse violated boundary: refresh_hash=%d code_hash=%d redirect_set=%t verifier_len=%d", len(verified.RefreshTokenHash), len(verified.CodeHash), verified.RedirectURI != "", len(verified.CodeVerifier))
+				}
+			default:
+				t.Fatalf("successful token parse returned unsupported grant type %q", verified.GrantType)
 			}
 		}
 

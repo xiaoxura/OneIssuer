@@ -1,0 +1,22 @@
+{
+  "record_version": 1,
+  "executed_at": "2026-08-03T00:00:00+08:00",
+  "target_version": "v0.1.0-dev.4",
+  "target_issuer_class": "temporary local HTTPS reverse proxy; no production credentials",
+  "suite": {
+    "release": "release-v5.2.1",
+    "source_commit": "working-tree-phase4",
+    "plan": "oidcc-test-plan"
+  },
+  "configuration_templates": [
+    "conformance/phase-4/public-config.template.json",
+    "conformance/phase-4/confidential-config.template.json"
+  ],
+  "results": [
+    {"test_module": "oidcc-refresh-token-rotation", "variants": {"client_auth_type": "none"}, "result": "NOT_RUN", "reason": "Run the pinned external suite after the Phase-four browser/Compose evidence is frozen."},
+    {"test_module": "oidcc-refresh-token-rotation", "variants": {"client_auth_type": "client_secret_basic"}, "result": "NOT_RUN", "reason": "Run the pinned external suite after the Phase-four browser/Compose evidence is frozen."},
+    {"test_module": "oidcc-rp-initiated-logout", "variants": {"client_auth_type": "none"}, "result": "NOT_RUN", "reason": "Run the pinned external suite after the Phase-four browser/Compose evidence is frozen."}
+  ],
+  "assessment": "Phase-four applicable modules are recorded as pending and are not represented as certification evidence.",
+  "certification_claim": false
+}

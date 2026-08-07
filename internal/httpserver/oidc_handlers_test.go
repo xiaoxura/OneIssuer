@@ -119,10 +119,11 @@ func TestDiscoveryIsEnabledOnlyForCompleteRealRouteSet(t *testing.T) {
 	}
 	if metadata.Issuer != "https://issuer.example" || metadata.AuthorizationEndpoint != "https://issuer.example"+oidc.AuthorizePath ||
 		metadata.TokenEndpoint != "https://issuer.example"+oidc.TokenPath || metadata.UserInfoEndpoint != "https://issuer.example"+oidc.UserInfoPath ||
+		metadata.RevocationEndpoint != "https://issuer.example"+oidc.RevocationPath || metadata.IntrospectionEndpoint != "https://issuer.example"+oidc.IntrospectionPath ||
 		metadata.JWKSURI != "https://issuer.example"+oidc.JWKSPath || strings.Contains(response.Body.String(), "attacker.invalid") {
 		t.Fatalf("metadata was not derived solely from configured issuer: %+v", metadata)
 	}
-	for _, forbidden := range []string{"refresh_token", "offline_access", "revocation_endpoint", "introspection_endpoint", "end_session_endpoint", "registration_endpoint"} {
+	for _, forbidden := range []string{"end_session_endpoint", "registration_endpoint"} {
 		if strings.Contains(response.Body.String(), forbidden) {
 			t.Fatalf("Discovery advertised unavailable capability %q: %s", forbidden, response.Body)
 		}
@@ -134,6 +135,8 @@ func TestDiscoveryIsEnabledOnlyForCompleteRealRouteSet(t *testing.T) {
 		{http.MethodPost, oidc.AuthorizePath},
 		{http.MethodGet, oidc.TokenPath},
 		{http.MethodGet, oidc.UserInfoPath},
+		{http.MethodGet, oidc.RevocationPath},
+		{http.MethodGet, oidc.IntrospectionPath},
 		{http.MethodGet, oidc.JWKSPath},
 	} {
 		request := httptest.NewRequest(route.method, route.path, nil)

@@ -1,13 +1,15 @@
 # OneIssuer OIDC interoperability example
 
 This directory contains a deliberately small server-side Relying Party used by
-the phase-three tests. It demonstrates OneIssuer's static Authorization Code +
-S256 profile for both Public and Confidential Clients.
+the Phase-four smoke suite. It demonstrates OneIssuer's static Authorization
+Code + S256 profile, offline Consent, and rotating Refresh Token handling for
+both Public and Confidential Clients.
 
 > [!CAUTION]
 > This is an interoperability example, **not a production SDK or application
 > template**. Its Sessions and JIT identities are in memory, local Compose uses
-> HTTP, and it has no durable account/session/logout lifecycle. Do not deploy it
+> HTTP, and it has no durable account/session database. Its logout flow is an
+> in-memory interoperability demonstration. Do not deploy it
 > publicly or copy its development settings into a production RP.
 
 ## What it verifies
@@ -21,9 +23,24 @@ S256 profile for both Public and Confidential Clients.
 - uses Public `none` or Confidential `client_secret_basic` as configured;
 - fetches a public RSA JWKS and allows only RS256;
 - verifies ID Token signature, `typ`, `kid`, Issuer, Audience, `azp`, expiry,
-  issuance time, authentication time, nonce, and Scope/claim minimization;
+  issuance time, authentication time, nonce, and claim minimization against the
+  Token endpoint's canonical **granted** Scope rather than the requested Scope;
 - calls only the discovered UserInfo endpoint and compares `sub` to the ID Token;
 - keys its mock JIT identity by the verified `(iss, sub)` pair;
+- caps the in-memory RP Session map at 1024 entries, sweeps expired entries, fails
+  closed at capacity, and uses compare-and-swap-style pending-attempt completion
+  so stale/concurrent callbacks cannot resurrect or overwrite a newer attempt;
+- stores the Refresh Token only in the bounded server-side Session, replaces it
+  atomically after every successful refresh, rejects concurrent generations
+  before contacting the Provider, and sends `invalid_grant` through a fresh
+  authorization request without retrying an old generation;
+- best-effort revokes newly issued Provider authority when local Session commit
+  fails; the user must still start a fresh authorization request;
+- requires same-origin, Session-bound CSRF-protected POSTs for refresh and
+  logout mutations;
+- submits RP-Initiated Logout as a form POST with the initial ID Token Hint and a
+  fresh server-side state, then destroys the local Session only after the exact
+  registered callback state returns;
 - does not render or log Codes, Secrets, verifiers, or Tokens;
 - sets bounded HTTP clients/servers, no-store/CSP headers, and HttpOnly RP cookies.
 
@@ -35,7 +52,7 @@ become a protocol-secret oracle.
 Run the repository's complete disposable A/B scenario:
 
 ```bash
-make phase-3-smoke
+make phase-4-smoke
 ```
 
 The script creates and cleans an empty database, private key, administrator,
@@ -63,6 +80,7 @@ The process reads environment variables directly and prints no rejected value:
 | `EXAMPLE_ISSUER` | required | exact canonical OneIssuer origin |
 | `EXAMPLE_CLIENT_ID` | required | statically registered Client ID |
 | `EXAMPLE_REDIRECT_URI` | required | exact registered callback URL |
+| `EXAMPLE_POST_LOGOUT_REDIRECT_URI` | Redirect URI origin + `/logged-out` | exact registered same-origin post-logout callback; must use `/logged-out` |
 | `EXAMPLE_HTTP_ADDR` | `:8080` | example listen address |
 | `EXAMPLE_NAME` | `OneIssuer OIDC Example` | escaped display label |
 | `EXAMPLE_SCOPES` | `openid profile email` | canonical supported Scope subset; must contain `openid` |
@@ -92,14 +110,19 @@ After OneIssuer is running and a matching static Client has been created:
 export EXAMPLE_ISSUER=http://localhost:8080
 export EXAMPLE_CLIENT_ID=<runtime-client-id>
 export EXAMPLE_REDIRECT_URI=http://127.0.0.1:8081/callback
+export EXAMPLE_POST_LOGOUT_REDIRECT_URI=http://127.0.0.1:8081/logged-out
 export EXAMPLE_HTTP_ADDR=:8081
 export EXAMPLE_COOKIE_SECURE=false
 go run ./examples/oidc-client
 ```
 
-For a Confidential Client, set `EXAMPLE_CLIENT_SECRET_FILE` to a protected
-runtime file rather than placing the clear value in the shell command. Open the
-example home page and choose sign-in or account creation.
+Register both callback URLs with the Client. When
+`EXAMPLE_POST_LOGOUT_REDIRECT_URI` is omitted, the example derives
+`/logged-out` from the scheme and authority of `EXAMPLE_REDIRECT_URI`; an
+explicit value must use that same origin and exact path. For a Confidential
+Client, set `EXAMPLE_CLIENT_SECRET_FILE` to a protected runtime file rather than
+placing the clear value in the shell command. Open the example home page and
+choose sign-in or account creation.
 
 Run package tests with:
 
@@ -112,10 +135,13 @@ go test -race ./examples/oidc-client
 
 - RP Sessions and linked identities disappear on restart and are not shared
   across replicas;
-- no RP logout, Session revocation, CSRF token for application mutations, user
-  database, authorization policy, refresh lifecycle, or account management;
-- no persistent encrypted Token store; Tokens are used transiently during the
-  callback and discarded;
+- the fixed 1024-Session capacity intentionally returns a generic failure rather
+  than evicting a live Session; this is a test safety bound, not production
+  admission control;
+- no durable RP account/session database; the example's bounded in-memory
+  Session map is intentionally disposable and is not a production store;
+- no browser-held Refresh Token, local-storage authority, or automatic retry of
+  a consumed generation;
 - no distributed state/replay cache, HA routing, rate limit, telemetry backend,
   or operational administration;
 - local HTTP and non-Secure cookies are accepted only for loopback development;

@@ -10,6 +10,8 @@ func FuzzParseAuthorizationRequest(f *testing.F) {
 	f.Add(values.Encode())
 	f.Add("%ZZ")
 	f.Add("client_id=x&client_id=y")
+	f.Add("%00canary=value")
+	f.Add(values.Encode() + "&state=opaque%00state")
 	f.Fuzz(func(t *testing.T, raw string) {
 		if len(raw) > 16<<10 {
 			t.Skip()

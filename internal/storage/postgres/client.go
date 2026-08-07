@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,7 +15,7 @@ import (
 
 // CreateClient atomically inserts client metadata, an optional secret digest, and audit.
 func (s *Store) CreateClient(ctx context.Context, value clientdomain.Client, secret *clientdomain.SecretRecord, event audit.Event) error {
-	return s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
+	return s.inTxWithAudit(ctx, pgx.TxOptions{}, []audit.Event{event}, func(queries *sqlcgen.Queries) error {
 		if _, err := queries.CreateOIDCClient(ctx, createClientParams(value)); err != nil {
 			return mapClientWriteError("create client", err)
 		}
@@ -42,7 +43,7 @@ func (s *Store) GetClient(ctx context.Context, id uuid.UUID) (clientdomain.Clien
 		}
 		result = value
 		return nil
-	})
+	}, func() { result = clientdomain.Client{} })
 	return result, err
 }
 
@@ -63,7 +64,7 @@ func (s *Store) GetClientByPublicID(ctx context.Context, publicID string) (clien
 		}
 		result = value
 		return nil
-	})
+	}, func() { result = clientdomain.Client{} })
 	return result, err
 }
 
@@ -86,22 +87,27 @@ func (s *Store) ListClients(ctx context.Context, cursor pagination.Cursor, limit
 			result = append(result, value)
 		}
 		return nil
-	})
+	}, func() { result = nil })
 	return result, err
 }
 
 // UpdateClient atomically applies an optimistic metadata update and audit event.
 func (s *Store) UpdateClient(ctx context.Context, value clientdomain.Client, event audit.Event) error {
-	return s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
-		if _, err := queries.LockOIDCClientByID(ctx, value.ID); isNoRows(err) {
+	return s.inTxWithAudit(ctx, pgx.TxOptions{}, []audit.Event{event}, func(queries *sqlcgen.Queries) error {
+		_, err := queries.LockOIDCClientByID(ctx, value.ID)
+		if isNoRows(err) {
 			return clientdomain.ErrNotFound
 		} else if err != nil {
 			return wrapError("lock client", ErrorKindQuery, err)
 		}
-		_, err := queries.UpdateOIDCClient(ctx, sqlcgen.UpdateOIDCClientParams{
+		currentScopes, err := queries.ListOIDCClientScopes(ctx, value.ID)
+		if err != nil {
+			return wrapError("read client scopes before update", ErrorKindQuery, err)
+		}
+		_, err = queries.UpdateOIDCClient(ctx, sqlcgen.UpdateOIDCClientParams{
 			Name: value.Name, Description: value.Description, LogoUri: pointerString(value.LogoURI),
 			Status: string(value.Status), RegistrationEnabled: value.RegistrationEnabled,
-			UpdatedAt: timestamp(value.UpdatedAt), ID: value.ID, ExpectedUpdatedAt: timestamp(value.Version),
+			UpdatedAt: timestamp(value.UpdatedAt), ID: value.ID, ExpectedVersion: value.Version,
 		})
 		if isNoRows(err) {
 			return clientdomain.ErrConflict
@@ -112,13 +118,55 @@ func (s *Store) UpdateClient(ctx context.Context, value clientdomain.Client, eve
 		if err := replaceClientChildren(ctx, queries, value, true); err != nil {
 			return err
 		}
+		clientDisabled := value.Status == clientdomain.StatusDisabled
+		offlineScopeRemoved := slices.Contains(currentScopes, "offline_access") && !slices.Contains(value.Scopes, "offline_access")
+		if clientDisabled || offlineScopeRemoved {
+			revokeReason := "offline_scope_removed"
+			if clientDisabled {
+				revokeReason = "client_disabled"
+			}
+			if _, err := queries.LockUnrevokedRefreshTokenFamiliesByClient(ctx, value.ID); err != nil {
+				return wrapError("lock client refresh families", ErrorKindQuery, err)
+			}
+			if clientDisabled {
+				if _, err := queries.LockLiveAccessTokensByClient(ctx, sqlcgen.LockLiveAccessTokensByClientParams{
+					ClientID: value.ID, Now: timestamp(value.UpdatedAt),
+				}); err != nil {
+					return wrapError("lock client access metadata", ErrorKindQuery, err)
+				}
+			} else {
+				if _, err := queries.LockLiveRefreshAccessTokensByClient(ctx, sqlcgen.LockLiveRefreshAccessTokensByClientParams{
+					ClientID: value.ID, Now: timestamp(value.UpdatedAt),
+				}); err != nil {
+					return wrapError("lock client refresh-bound access metadata", ErrorKindQuery, err)
+				}
+			}
+			if _, err := queries.RevokeRefreshTokenFamiliesByClient(ctx, sqlcgen.RevokeRefreshTokenFamiliesByClientParams{
+				RevokedAt: timestamp(value.UpdatedAt), RevokeReason: pointerString(revokeReason), ClientID: value.ID,
+			}); err != nil {
+				return wrapError("revoke client refresh families", ErrorKindQuery, err)
+			}
+			if clientDisabled {
+				if _, err := queries.RevokeLiveAccessTokensByClient(ctx, sqlcgen.RevokeLiveAccessTokensByClientParams{
+					RevokedAt: timestamp(value.UpdatedAt), RevokeReason: pointerString(revokeReason), ClientID: value.ID,
+				}); err != nil {
+					return wrapError("revoke client access metadata", ErrorKindQuery, err)
+				}
+			} else {
+				if _, err := queries.RevokeLiveRefreshAccessTokensByClient(ctx, sqlcgen.RevokeLiveRefreshAccessTokensByClientParams{
+					RevokedAt: timestamp(value.UpdatedAt), RevokeReason: pointerString(revokeReason), ClientID: value.ID,
+				}); err != nil {
+					return wrapError("revoke client refresh-bound access metadata", ErrorKindQuery, err)
+				}
+			}
+		}
 		return insertAudit(ctx, queries, event)
 	})
 }
 
 // RotateClientSecret atomically revokes old digests, inserts a replacement, and audits.
 func (s *Store) RotateClientSecret(ctx context.Context, id uuid.UUID, secret clientdomain.SecretRecord, now time.Time, event audit.Event) error {
-	return s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
+	return s.inTxWithAudit(ctx, pgx.TxOptions{}, []audit.Event{event}, func(queries *sqlcgen.Queries) error {
 		row, err := queries.LockOIDCClientByID(ctx, id)
 		if isNoRows(err) {
 			return clientdomain.ErrNotFound
@@ -238,7 +286,7 @@ func mapClient(row sqlcgen.OidcClient) clientdomain.Client {
 		TokenEndpointAuthMethod: clientdomain.AuthMethod(row.TokenEndpointAuthMethod), Name: row.Name,
 		Description: row.Description, LogoURI: valueString(row.LogoUri), Status: clientdomain.Status(row.Status),
 		RegistrationEnabled: row.RegistrationEnabled, RedirectURIs: []string{}, LogoutURIs: []string{}, Scopes: []string{},
-		CreatedAt: requiredTime(row.CreatedAt), UpdatedAt: updated, Version: updated,
+		CreatedAt: requiredTime(row.CreatedAt), UpdatedAt: updated, Version: row.Version,
 	}
 }
 

@@ -1,0 +1,6 @@
+{{- /* Fixed local-only terminal/error page. */ -}}
+<!doctype html>
+<html lang="{{.Lang}}">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{.Title}}</title></head>
+<body><main><h1>{{.Title}}</h1><p data-logout-result="{{.ResultCode}}">{{.Message}}</p></main></body>
+</html>

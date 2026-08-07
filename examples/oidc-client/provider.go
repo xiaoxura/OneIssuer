@@ -20,12 +20,23 @@ import (
 	jose "github.com/go-jose/go-jose/v4"
 )
 
-const maxProviderResponseBytes = 64 << 10
+const (
+	maxProviderResponseBytes           = 64 << 10
+	maxProviderRevocationBodyBytes     = 8 << 10
+	maxProviderRevocationResponseBytes = 8 << 10
+	maxProviderRevocationTokenBytes    = 16 << 10
+	providerRevocationTimeout          = 2 * time.Second
+)
+
+var errProviderInvalidGrant = errors.New("provider rejected the refresh grant")
 
 type providerMetadata struct {
 	Issuer                            string   `json:"issuer"`
 	AuthorizationEndpoint             string   `json:"authorization_endpoint"`
 	TokenEndpoint                     string   `json:"token_endpoint"`
+	RevocationEndpoint                string   `json:"revocation_endpoint"`
+	IntrospectionEndpoint             string   `json:"introspection_endpoint"`
+	EndSessionEndpoint                string   `json:"end_session_endpoint"`
 	UserInfoEndpoint                  string   `json:"userinfo_endpoint"`
 	JWKSURI                           string   `json:"jwks_uri"`
 	ResponseTypesSupported            []string `json:"response_types_supported"`
@@ -34,6 +45,8 @@ type providerMetadata struct {
 	SubjectTypesSupported             []string `json:"subject_types_supported"`
 	IDTokenSigningAlgorithmsSupported []string `json:"id_token_signing_alg_values_supported"`
 	TokenEndpointAuthMethodsSupported []string `json:"token_endpoint_auth_methods_supported"`
+	RevocationAuthMethodsSupported    []string `json:"revocation_endpoint_auth_methods_supported"`
+	IntrospectionAuthMethodsSupported []string `json:"introspection_endpoint_auth_methods_supported"`
 	ScopesSupported                   []string `json:"scopes_supported"`
 	ClaimsSupported                   []string `json:"claims_supported"`
 	CodeChallengeMethodsSupported     []string `json:"code_challenge_methods_supported"`
@@ -41,11 +54,19 @@ type providerMetadata struct {
 }
 
 type tokenResponse struct {
-	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"`
-	ExpiresIn   int64  `json:"expires_in"`
-	IDToken     string `json:"id_token"`
-	Scope       string `json:"scope"`
+	AccessToken   string   `json:"access_token"`
+	TokenType     string   `json:"token_type"`
+	ExpiresIn     int64    `json:"expires_in"`
+	IDToken       string   `json:"id_token"`
+	RefreshToken  string   `json:"refresh_token"`
+	Scope         string   `json:"scope"`
+	GrantedScopes []string `json:"-"`
+}
+
+type providerOAuthErrorResponse struct {
+	Error            string `json:"error"`
+	ErrorDescription string `json:"error_description,omitempty"`
+	ErrorURI         string `json:"error_uri,omitempty"`
 }
 
 type idTokenClaims struct {
@@ -86,11 +107,13 @@ func discoverProvider(ctx context.Context, client *http.Client, cfg exampleConfi
 func validateProviderMetadata(cfg exampleConfig, metadata providerMetadata) error {
 	issuer := cfg.Issuer.String()
 	if metadata.Issuer != issuer || metadata.AuthorizationEndpoint != issuer+"/oauth2/authorize" ||
-		metadata.TokenEndpoint != issuer+"/oauth2/token" || metadata.UserInfoEndpoint != issuer+"/oauth2/userinfo" || metadata.JWKSURI != issuer+"/oauth2/jwks" ||
+		metadata.TokenEndpoint != issuer+"/oauth2/token" || metadata.RevocationEndpoint != issuer+"/oauth2/revoke" || metadata.IntrospectionEndpoint != issuer+"/oauth2/introspect" || metadata.EndSessionEndpoint != issuer+"/oauth2/logout" || metadata.UserInfoEndpoint != issuer+"/oauth2/userinfo" || metadata.JWKSURI != issuer+"/oauth2/jwks" ||
 		!slices.Equal(metadata.ResponseTypesSupported, []string{"code"}) || !slices.Equal(metadata.ResponseModesSupported, []string{"query"}) ||
-		!slices.Equal(metadata.GrantTypesSupported, []string{"authorization_code"}) || !slices.Equal(metadata.SubjectTypesSupported, []string{"public"}) ||
+		!slices.Equal(metadata.GrantTypesSupported, []string{"authorization_code", "refresh_token"}) || !slices.Equal(metadata.SubjectTypesSupported, []string{"public"}) ||
 		!slices.Equal(metadata.IDTokenSigningAlgorithmsSupported, []string{"RS256"}) ||
 		!slices.Contains(metadata.TokenEndpointAuthMethodsSupported, expectedAuthMethod(cfg)) ||
+		!slices.Contains(metadata.RevocationAuthMethodsSupported, expectedAuthMethod(cfg)) ||
+		!slices.Contains(metadata.IntrospectionAuthMethodsSupported, "client_secret_basic") ||
 		!slices.Equal(metadata.ClaimsSupported, []string{
 			"sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "azp",
 			"name", "preferred_username", "email", "email_verified",
@@ -113,12 +136,7 @@ func exchangeAuthorizationCode(ctx context.Context, client *http.Client, cfg exa
 	}
 	headers := make(http.Header)
 	headers.Set("Content-Type", "application/x-www-form-urlencoded")
-	if cfg.ClientSecret == "" {
-		form.Set("client_id", cfg.ClientID)
-	} else {
-		credentials := url.QueryEscape(cfg.ClientID) + ":" + url.QueryEscape(cfg.ClientSecret)
-		headers.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(credentials)))
-	}
+	setProviderClientAuthentication(form, headers, cfg)
 	var response tokenResponse
 	if err := providerJSON(ctx, client, cfg, http.MethodPost, metadata.TokenEndpoint, strings.NewReader(form.Encode()), headers, &response); err != nil {
 		return tokenResponse{}, errors.New("authorization code exchange failed")
@@ -126,19 +144,137 @@ func exchangeAuthorizationCode(ctx context.Context, client *http.Client, cfg exa
 	if response.AccessToken == "" || response.IDToken == "" || response.TokenType != "Bearer" || response.ExpiresIn <= 0 || response.ExpiresIn > 1800 {
 		return tokenResponse{}, errors.New("token response does not match the example security profile")
 	}
-	scopes, err := canonicalExampleScopes(strings.Split(response.Scope, " "))
-	if err != nil || strings.Join(scopes, " ") != response.Scope {
+	scopes, ok := grantedScopeSubset(response.Scope, cfg.Scopes)
+	if !ok {
 		return tokenResponse{}, errors.New("token response scope is invalid")
 	}
-	for _, scope := range scopes {
-		if !slices.Contains(cfg.Scopes, scope) {
-			return tokenResponse{}, errors.New("token response expanded the requested scope")
-		}
+	if slices.Contains(scopes, "offline_access") != (response.RefreshToken != "") {
+		return tokenResponse{}, errors.New("token response refresh capability does not match granted scope")
 	}
+	response.GrantedScopes = append([]string(nil), scopes...)
 	return response, nil
 }
 
-func verifyIDToken(ctx context.Context, client *http.Client, cfg exampleConfig, metadata providerMetadata, compact, nonce string, now time.Time) (idTokenClaims, error) {
+func exchangeRefreshToken(ctx context.Context, client *http.Client, cfg exampleConfig, metadata providerMetadata, refresh string, authorityScopes []string) (tokenResponse, error) {
+	if refresh == "" || len(refresh) > 256 {
+		return tokenResponse{}, errors.New("refresh token is unavailable")
+	}
+	form := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refresh}}
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/x-www-form-urlencoded")
+	setProviderClientAuthentication(form, headers, cfg)
+	var response tokenResponse
+	if err := providerJSON(ctx, client, cfg, http.MethodPost, metadata.TokenEndpoint, strings.NewReader(form.Encode()), headers, &response); err != nil {
+		if errors.Is(err, errProviderInvalidGrant) {
+			return tokenResponse{}, errProviderInvalidGrant
+		}
+		return tokenResponse{}, errors.New("refresh exchange failed")
+	}
+	if response.AccessToken == "" || response.IDToken != "" || response.TokenType != "Bearer" || response.ExpiresIn <= 0 || response.ExpiresIn > 1800 {
+		return tokenResponse{}, errors.New("refresh response does not match the example security profile")
+	}
+	scopes, ok := grantedScopeSubset(response.Scope, cfg.Scopes)
+	if !ok || !scopeSubset(scopes, authorityScopes) {
+		return tokenResponse{}, errors.New("refresh response scope is invalid")
+	}
+	if slices.Contains(scopes, "offline_access") != (response.RefreshToken != "") {
+		return tokenResponse{}, errors.New("refresh response capability does not match granted scope")
+	}
+	response.GrantedScopes = append([]string(nil), scopes...)
+	return response, nil
+}
+
+// revokeProviderTokens is a synchronous, narrowly bounded RFC 7009 cleanup
+// path for Provider authority that could not be committed locally. A Refresh
+// Token is preferred because OneIssuer revokes its family and linked Access
+// Tokens; otherwise the returned Access Token is revoked directly.
+func revokeProviderTokens(ctx context.Context, client *http.Client, cfg exampleConfig, metadata providerMetadata, tokens tokenResponse) error {
+	if ctx == nil || client == nil {
+		return errors.New("provider revocation dependencies are incomplete")
+	}
+	token, hint := tokens.RefreshToken, "refresh_token"
+	if token == "" {
+		token, hint = tokens.AccessToken, "access_token"
+	}
+	if token == "" || len(token) > maxProviderRevocationTokenBytes || strings.TrimSpace(token) != token {
+		return errors.New("provider revocation token is unavailable")
+	}
+	form := url.Values{"token": {token}, "token_type_hint": {hint}}
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/x-www-form-urlencoded")
+	setProviderClientAuthentication(form, headers, cfg)
+	encoded := form.Encode()
+	if len(encoded) == 0 || len(encoded) > maxProviderRevocationBodyBytes {
+		return errors.New("provider revocation request is too large")
+	}
+	target, err := cfg.backchannelURL(metadata.RevocationEndpoint)
+	if err != nil {
+		return errors.New("provider revocation endpoint is invalid")
+	}
+	revocationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), providerRevocationTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(revocationCtx, http.MethodPost, target, strings.NewReader(encoded))
+	if err != nil {
+		return errors.New("provider revocation request could not be created")
+	}
+	request.Header = headers
+	request.Header.Set("Accept", "application/json")
+	timeout := providerRevocationTimeout
+	if client.Timeout > 0 && client.Timeout < timeout {
+		timeout = client.Timeout
+	}
+	revocationClient := &http.Client{
+		Transport: client.Transport,
+		Timeout:   timeout,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	response, err := revocationClient.Do(request)
+	if err != nil {
+		return errors.New("provider revocation request failed")
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.ContentLength > maxProviderRevocationResponseBytes {
+		return errors.New("provider revocation response is too large")
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxProviderRevocationResponseBytes+1))
+	if err != nil || len(body) > maxProviderRevocationResponseBytes {
+		return errors.New("provider revocation response is invalid")
+	}
+	if response.StatusCode != http.StatusOK {
+		return errors.New("provider revocation was not accepted")
+	}
+	return nil
+}
+
+func setProviderClientAuthentication(form url.Values, headers http.Header, cfg exampleConfig) {
+	if cfg.ClientSecret == "" {
+		form.Set("client_id", cfg.ClientID)
+	} else {
+		credentials := url.QueryEscape(cfg.ClientID) + ":" + url.QueryEscape(cfg.ClientSecret)
+		headers.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(credentials)))
+	}
+}
+
+func grantedScopeSubset(raw string, allowed []string) ([]string, bool) {
+	scopes, err := canonicalExampleScopes(strings.Split(raw, " "))
+	if err != nil || strings.Join(scopes, " ") != raw || !scopeSubset(scopes, allowed) {
+		return nil, false
+	}
+	return scopes, true
+}
+
+func scopeSubset(values, allowed []string) bool {
+	for _, value := range values {
+		if !slices.Contains(allowed, value) {
+			return false
+		}
+	}
+	return true
+}
+
+func verifyIDToken(ctx context.Context, client *http.Client, cfg exampleConfig, metadata providerMetadata, compact, nonce string, grantedScopes []string, now time.Time) (idTokenClaims, error) {
 	if compact == "" || len(compact) > 16<<10 || strings.Count(compact, ".") != 2 || strings.TrimSpace(compact) != compact {
 		return idTokenClaims{}, errors.New("ID Token is malformed")
 	}
@@ -185,14 +321,14 @@ func verifyIDToken(ctx context.Context, client *http.Client, cfg exampleConfig, 
 		subtle.ConstantTimeCompare([]byte(claims.Nonce), []byte(nonce)) != 1 {
 		return idTokenClaims{}, errors.New("ID Token claims do not match the authorization request")
 	}
-	if (!slices.Contains(cfg.Scopes, "profile") && (claims.Name != nil || claims.PreferredUsername != nil)) ||
-		(!slices.Contains(cfg.Scopes, "email") && (claims.Email != nil || claims.EmailVerified != nil)) {
+	if (!slices.Contains(grantedScopes, "profile") && (claims.Name != nil || claims.PreferredUsername != nil)) ||
+		(!slices.Contains(grantedScopes, "email") && (claims.Email != nil || claims.EmailVerified != nil)) {
 		return idTokenClaims{}, errors.New("ID Token contains claims outside the granted scope")
 	}
 	return claims, nil
 }
 
-func fetchUserInfo(ctx context.Context, client *http.Client, cfg exampleConfig, metadata providerMetadata, accessToken, subject string) (userInfoResponse, error) {
+func fetchUserInfo(ctx context.Context, client *http.Client, cfg exampleConfig, metadata providerMetadata, accessToken, subject string, grantedScopes []string) (userInfoResponse, error) {
 	headers := make(http.Header)
 	headers.Set("Authorization", "Bearer "+accessToken)
 	var response userInfoResponse
@@ -202,8 +338,8 @@ func fetchUserInfo(ctx context.Context, client *http.Client, cfg exampleConfig, 
 	if response.Subject == "" || subtle.ConstantTimeCompare([]byte(response.Subject), []byte(subject)) != 1 {
 		return userInfoResponse{}, errors.New("UserInfo subject does not match ID Token")
 	}
-	if (!slices.Contains(cfg.Scopes, "profile") && (response.Name != nil || response.PreferredUsername != nil)) ||
-		(!slices.Contains(cfg.Scopes, "email") && (response.Email != nil || response.EmailVerified != nil)) {
+	if (!slices.Contains(grantedScopes, "profile") && (response.Name != nil || response.PreferredUsername != nil)) ||
+		(!slices.Contains(grantedScopes, "email") && (response.Email != nil || response.EmailVerified != nil)) {
 		return userInfoResponse{}, errors.New("UserInfo contains claims outside the granted scope")
 	}
 	return response, nil
@@ -247,14 +383,17 @@ func providerJSON(ctx context.Context, client *http.Client, cfg exampleConfig, m
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode < 200 || response.StatusCode > 299 {
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxProviderResponseBytes))
+		encoded, readErr := io.ReadAll(io.LimitReader(response.Body, maxProviderResponseBytes+1))
+		if response.StatusCode == http.StatusBadRequest && readErr == nil && len(encoded) > 0 && len(encoded) <= maxProviderResponseBytes &&
+			providerJSONContentType(response.Header) {
+			var protocolError providerOAuthErrorResponse
+			if decodeErr := decodeStrictJSON(bytes.NewReader(encoded), &protocolError); decodeErr == nil && protocolError.Error == "invalid_grant" {
+				return errProviderInvalidGrant
+			}
+		}
 		return fmt.Errorf("provider returned HTTP status class %dxx", response.StatusCode/100)
 	}
-	if len(response.Header.Values("Content-Type")) != 1 {
-		return errors.New("provider response content type is invalid")
-	}
-	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
-	if err != nil || !strings.EqualFold(mediaType, "application/json") {
+	if !providerJSONContentType(response.Header) {
 		return errors.New("provider response content type is invalid")
 	}
 	limited := io.LimitReader(response.Body, maxProviderResponseBytes+1)
@@ -266,6 +405,14 @@ func providerJSON(ctx context.Context, client *http.Client, cfg exampleConfig, m
 		return errors.New("provider response JSON is invalid")
 	}
 	return nil
+}
+
+func providerJSONContentType(header http.Header) bool {
+	if len(header.Values("Content-Type")) != 1 {
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(header.Get("Content-Type"))
+	return err == nil && strings.EqualFold(mediaType, "application/json")
 }
 
 func decodeStrictJSON(reader io.Reader, destination any) error {

@@ -1667,6 +1667,7 @@ html[lang="zh-CN"] .auth-visual__content h1 {
 
 .admin-content {
   width: 100%;
+  min-width: 0;
   min-height: calc(100dvh - 68px);
   margin: 0 auto;
   padding: 32px clamp(22px, 2.6vw, 42px) 52px;
@@ -1685,6 +1686,10 @@ html[lang="zh-CN"] .auth-visual__content h1 {
   margin-bottom: 25px;
 }
 
+.page-header > div:first-child {
+  min-width: 0;
+}
+
 .page-header h1 {
   margin-top: 6px;
   color: var(--ink-950);
@@ -1698,16 +1703,19 @@ html[lang="zh-CN"] .auth-visual__content h1 {
   margin-top: 8px;
   color: var(--ink-500);
   font-size: 13px;
+  overflow-wrap: anywhere;
 }
 
 .page-header__actions {
   display: flex;
+  max-width: 100%;
   flex: 0 0 auto;
   align-items: center;
   gap: 8px;
 }
 
 .panel {
+  min-width: 0;
   background: var(--paper);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
@@ -1720,6 +1728,10 @@ html[lang="zh-CN"] .auth-visual__content h1 {
   justify-content: space-between;
   gap: 18px;
   padding: 20px 21px 14px;
+}
+
+.panel__header > div {
+  min-width: 0;
 }
 
 .panel__header h2 {
@@ -1767,6 +1779,11 @@ html[lang="zh-CN"] .auth-visual__content h1 {
   font-weight: 620;
 }
 
+.metric-card__topline > span:first-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .metric-card__icon {
   display: inline-flex;
   width: 32px;
@@ -1790,6 +1807,7 @@ html[lang="zh-CN"] .auth-visual__content h1 {
 
 .metric-card__foot {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 7px;
   color: var(--ink-400);
@@ -1809,6 +1827,9 @@ html[lang="zh-CN"] .auth-visual__content h1 {
 }
 
 .table-scroll {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   overflow-x: auto;
 }
 
@@ -1975,6 +1996,7 @@ html[lang="zh-CN"] .auth-visual__content h1 {
 
 .directory-toolbar {
   display: flex;
+  min-width: 0;
   min-height: 62px;
   align-items: center;
   gap: 12px;
@@ -1988,6 +2010,8 @@ html[lang="zh-CN"] .auth-visual__content h1 {
 .filter-tabs,
 .segmented-control {
   display: flex;
+  min-width: 0;
+  max-width: 100%;
   align-items: center;
   gap: 3px;
   padding: 3px;
@@ -1999,6 +2023,7 @@ html[lang="zh-CN"] .auth-visual__content h1 {
 .filter-tabs button,
 .segmented-control button {
   display: inline-flex;
+  flex: 0 0 auto;
   height: 28px;
   align-items: center;
   gap: 5px;
@@ -2274,6 +2299,11 @@ html[lang="zh-CN"] .auth-visual__content h1 {
   cursor: pointer;
 }
 
+.users-table tbody tr:focus-visible {
+  outline: 3px solid rgba(24, 24, 27, 0.14);
+  outline-offset: -3px;
+}
+
 .checkbox-cell {
   width: 42px;
   text-align: center !important;
@@ -2336,6 +2366,11 @@ html[lang="zh-CN"] .auth-visual__content h1 {
   border-bottom: 1px solid var(--border);
   font-size: 12px;
   font-weight: 680;
+}
+
+.detail-drawer__topbar h2 {
+  margin: 0;
+  font: inherit;
 }
 
 .detail-drawer__profile {
@@ -5303,7 +5338,7 @@ html[lang="zh-CN"] .auth-visual__content h1 {
 }
 
 @media (max-width: 780px) {
-  .admin-topbar { padding: 0 16px; }
+  .admin-topbar { min-width: 0; padding: 0 16px; }
   .admin-content { padding: 24px 16px 42px; }
   .global-search { display: none; }
   .admin-account__copy,
@@ -5317,8 +5352,8 @@ html[lang="zh-CN"] .auth-visual__content h1 {
   .segmented-control { width: max-content; }
   .directory-toolbar { align-items: stretch; flex-wrap: wrap; }
   .directory-toolbar .table-search { width: 100%; max-width: none; }
-  .filter-tabs { order: 2; overflow-x: auto; }
-  .toolbar-filter { order: 2; }
+  .filter-tabs { flex: 1 1 0; order: 2; overflow-x: auto; }
+  .toolbar-filter { flex: 0 0 auto; order: 2; margin-left: 0; }
   .create-application-layout { grid-template-columns: 1fr; }
   .create-application-aside { position: static; }
   .application-type-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -5366,6 +5401,9 @@ html[lang="zh-CN"] .auth-visual__content h1 {
 @media (max-width: 560px) {
   .auth-workspace__mobile-header { padding: 18px; }
   .admin-topbar__context > span { display: none; }
+  .admin-topbar__context { flex: 1 1 auto; overflow: hidden; }
+  .admin-topbar__context strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .admin-topbar__actions { flex: 0 0 auto; }
   .topbar-icon--help { display: none; }
   .admin-topbar .language-switcher > svg { display: none; }
   .admin-topbar .language-switcher { padding-left: 4px; }
@@ -5380,7 +5418,8 @@ html[lang="zh-CN"] .auth-visual__content h1 {
   .form-grid--two { grid-template-columns: 1fr; }
   .metrics-grid { grid-template-columns: 1fr; }
   .metric-card { padding: 15px 16px; }
-  .chart-summary { align-items: flex-start; flex-direction: column; gap: 4px; }
+  .panel__header { flex-wrap: wrap; }
+  .chart-summary { width: 100%; flex-wrap: wrap; align-items: flex-start; flex-direction: column; gap: 4px; }
   /* SVG text scales with the chart viewBox; compensate so day labels stay readable on phones. */
   .chart-day { font-size: 22px; }
   .signin-chart svg { height: 195px; }

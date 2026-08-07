@@ -8,13 +8,13 @@
 | [`phase-2-development-plan.md`](./phase-2-development-plan.md) | Implemented and verified | 第二阶段身份、凭证、Session、Client、管理员与审计计划 |
 | [`phase-2-threat-model.md`](./phase-2-threat-model.md) | Implemented | 第二阶段资产、信任边界、威胁、控制和残余风险 |
 | [`adr/0001-phase-two-identity-and-client-security.md`](./adr/0001-phase-two-identity-and-client-security.md) | Accepted | 身份规范化、密码、Session、Client、审计与协议边界决策 |
-| [`development.md`](./development.md) | Implemented | 阶段三本地开发、完整门禁、Conformance 与供应链流程 |
+| [`development.md`](./development.md) | Implemented | 阶段四本地开发、完整门禁、Conformance 与供应链流程 |
 | [`configuration.md`](./configuration.md) | Implemented | 环境变量、Canonical Issuer、签名 Key、TTL、安全校验与代理信任 |
-| [`migrations.md`](./migrations.md) | Implemented | 版本 1–10 显式 Goose 迁移、升级、清理与 sqlc 规则 |
-| [`troubleshooting.md`](./troubleshooting.md) | Implemented | Key、Discovery/JWKS、Authorize/Token/UserInfo、数据库与容器排障 |
-| [`operations.md`](./operations.md) | Implemented | 发布、Bootstrap、备份/恢复、at-most-once、清理和事故处置 |
+| [`migrations.md`](./migrations.md) | Implemented | 版本 1–15 显式 Goose 迁移、升级、生命周期清理与 sqlc 规则 |
+| [`troubleshooting.md`](./troubleshooting.md) | Implemented | Key、Discovery/JWKS、Authorize/Token/Lifecycle、数据库与容器排障 |
+| [`operations.md`](./operations.md) | Implemented | 发布、Bootstrap、备份/恢复、Token 生命周期、清理和事故处置 |
 | [`key-rotation-runbook.md`](./key-rotation-runbook.md) | Implemented | RS256 Key 生成、预发布、重启式 overlap、移除与紧急撤销 |
-| [`oidc-client-integration.md`](./oidc-client-integration.md) | Implemented | Public/Confidential RP 的 S256、Token 校验、UserInfo 与错误处理 |
+| [`oidc-client-integration.md`](./oidc-client-integration.md) | Implemented | Public/Confidential RP 的 S256、offline/Refresh、生命周期、Logout 与错误处理 |
 | [`phase-1-release-notes.md`](./phase-1-release-notes.md) | Verified | 第一阶段交付与验收证据记录 |
 | [`phase-2-release-notes.md`](./phase-2-release-notes.md) | Verified | 第二阶段迁移、能力、安全边界与执行证据 |
 | [`phase-3-handoff.md`](./phase-3-handoff.md) | Accepted freeze | 第三阶段协议适配必须复用的领域接口和禁用捷径 |
@@ -24,6 +24,11 @@
 | [`adr/0002-phase-three-oidc-security-profile.md`](./adr/0002-phase-three-oidc-security-profile.md) | Accepted | 第三阶段协议剖面、依赖、密钥、Token、原子性与延期能力决策 |
 | [`phase-3-conformance.md`](./phase-3-conformance.md) | Applicable subset passed | 固定 Suite/镜像、适用模块、结果证据、限制与非认证声明 |
 | [`phase-3-release-notes.md`](./phase-3-release-notes.md) | Verified | 阶段三能力、迁移、安全边界、升级与最终验收记录 |
+| [`phase-4-development-plan.md`](./phase-4-development-plan.md) | Approved; implementation complete, release gates pending | 第四阶段 offline access、Refresh 生命周期、撤销、状态查询与安全退出计划 |
+| [`phase-4-threat-model.md`](./phase-4-threat-model.md) | Accepted | Refresh reuse、Token oracle、级联撤销、Logout CSRF/Redirect 与保留风险 |
+| [`adr/0003-phase-four-token-lifecycle.md`](./adr/0003-phase-four-token-lifecycle.md) | Accepted | 第四阶段 rotation/reuse、Revoke、受限 Introspection 与 RP Logout 决策 |
+| [`phase-4-dependency-concurrency-spike.md`](./phase-4-dependency-concurrency-spike.md) | Accepted | Fosite 边界、Schema/锁序、Session lineage、Hint/Key、浏览器与 Conformance Spike |
+| [`phase-4-release-notes.md`](./phase-4-release-notes.md) | Pending final gates | 第四阶段交付能力、迁移/回滚边界、证据状态与残余限制 |
 
 ## 推荐阅读顺序
 
@@ -34,8 +39,12 @@
 5. 阅读已接受的第三阶段交接文档，确认协议层不可绕过的领域契约；
 6. 阅读第三阶段 ADR、威胁模型和依赖 Spike，确认协议与依赖边界；
 7. 阅读 OIDC Client 接入指南、Key Runbook 与 Conformance 限制；
-8. 查阅第三阶段开发计划和 Release Notes 的最终门禁与验收记录。
+8. 查阅第三阶段开发计划和 Release Notes 的最终门禁与验收记录；
+9. 阅读已接受的第四阶段 ADR、Threat Model、P4-00 Spike 与 Development Plan，再按冻结依赖实施。
 
 第一阶段是工程基础，第二阶段实现身份与 Client 基础；第三阶段已实现并验证 Discovery、JWKS、
-Authorize、Token、UserInfo 及强制 S256 Code Flow。它仍不包含 Refresh、Revoke、
-Introspection 或 RP Logout，也不代表生产就绪或 OpenID Foundation 认证。
+Authorize、Token、UserInfo 及强制 S256 Code Flow，作为历史兼容基线保留。
+
+第四阶段已通过设计门禁并实现：范围是 `offline_access`、强制 Refresh rotation/reuse
+detection、RFC 7009 Revocation、受限 RFC 7662 Introspection、RP-Initiated Logout 和
+当前用户 Grant 撤销。完整真实 PostgreSQL/Compose/browser 验收仍是发布前门禁。

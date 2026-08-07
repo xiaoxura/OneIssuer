@@ -91,7 +91,8 @@ OneIssuer verifier.
 | Issuer/endpoint mix-up | Canonical configured origin; exact `iss`; all URLs derived from it; Host/forwarded data ignored; fixed UserInfo audience | config tests, metadata/token cross-test, proxy spoof tests |
 | Discovery overclaim | typed capability model; route enabled only after endpoints exist; no deferred endpoints/grants/scopes | metadata snapshot plus live-route matrix |
 | Open redirect | resolve Active Client; exact registered Redirect URI before redirect; local errors before trust; URL builder for query merge | negative HTTP matrix including query/CRLF/fragment encodings |
-| Duplicate/ambiguous parameters | 8 KiB request-target bound; percent/UTF-8 validation; exactly one security parameter before Fosite | table tests and parser fuzz corpus |
+| Duplicate/ambiguous parameters | 8 KiB request-target bound; percent/UTF-8/NUL rejection for keys and values; exactly one security parameter before Fosite | table tests and parser fuzz corpus |
+| Authentication resource exhaustion | bounded per-IP/global browser token buckets before DB/Argon2; 4096-entry cap/idle sweep; five atomic submissions per form; 1 GiB aggregate Argon2 configuration ceiling | limiter/refill/cap tests, reservation concurrency test, config boundary matrix |
 | Authorization login CSRF | RP State round trip; server opaque transaction; SameSite Session; no arbitrary return target | wrong/missing State rejected by example RP; browser flow tests |
 | Consent CSRF/confusion | authenticated server Session, same-origin + CSRF, server-restored Client/Scope only, no browser resubmission | cross-session/user, altered field, double-submit tests |
 | Account substitution | Session resolved from DB; `prompt=login` rotates Session; authenticated `prompt=create` cannot silently switch identity | prompt state-machine integration tests |
@@ -113,11 +114,14 @@ OneIssuer verifier.
 | UserInfo token confusion | Bearer Header only; RS256/typ/iss/fixed aud/time/jti/client/scope; metadata and current status checks | query/body/wrong audience/status/scope negative tests |
 | Disabled authority | current User/Client status checked before Code, exchange, and each UserInfo call | disable-before-each-step integration tests |
 | Database/signing partial failure | explicit transactions; local bounded signer; audit in success transaction; HTTP written only after commit | injected signing/audit/commit failures and state inspection |
-| Metadata/cache leakage | Discovery/JWKS contain only public values; stable ETag; no private fields; browser protocol pages no-store/no-referrer | header/body snapshots |
+| Stale User/Client writer | monotonic positive bigint version; compare-and-increment update independent of timestamp resolution | same-timestamp sequential and stale-writer PostgreSQL tests |
+| Cleanup lock/storage amplification | 250-row `SKIP LOCKED` batches, independent five-second operation contexts, FK-aware ordering, committed partial-progress metrics | first/later-batch fault injection and fresh-context unit test |
+| Metadata/cache leakage | Discovery/JWKS contain only public values; stable ETag; no private fields; browser protocol pages no-store with same-origin-only referrers | header/body snapshots |
 | Log/audit/metric exfiltration | denylisted/redacted headers and token shapes; fixed audit enums/no values; low-cardinality label enums | synthetic canary across logs, DB audit, metrics, errors |
 | Storage DoS through audit | malformed traffic counted with bounded metrics/logs; only meaningful transitions/replay classifications reach append-only audit | high-volume rejected request test and audit count bound |
-| Migration tampering | immutable `00001`–`00005`; new checksum entries; explicit migrate; constraints and upgrade tests | checksum, empty/repeat/upgrade/Down-Up gates |
-| Dependency compromise | pinned versions, checksums, Apache licenses, govulncheck, update automation, SBOM | CI vulnerability/license/SBOM record |
+| PostgreSQL TLS downgrade | production requires one explicit `sslmode=verify-full` for serve, Bootstrap, and migration scopes | all-scope configuration mode/duplicate matrix |
+| Migration tampering | immutable released SQL through `00011` (especially frozen `00001`–`00005`); checksum entries; explicit migrate; constraints and upgrade tests | checksum, empty/repeat/upgrade/Down-Up gates |
+| Dependency/base compromise | pinned module versions/checksums and container frontend/builder/runtime/PostgreSQL digests; no mutable build-time OS upgrade; govulncheck/SBOM/scan | CI vulnerability/license/build/SBOM record |
 
 ## Protocol error redirect state machine
 
@@ -158,8 +162,9 @@ from generic audit metadata and management read models.
   is bounded by its default 10-minute lifetime. Phase four adds lifecycle endpoints.
 - JWT offline verification cannot observe current User/Client disable; phase-three
   Tokens are intentionally audience-bound to online OneIssuer UserInfo.
-- No distributed/adaptive limiter, IP reputation, bot control, or Client lockout
-  exists. Request/concurrency bounds and edge enforcement are required.
+- Bounded per-process authentication buckets and per-form attempts now exist, but
+  there is still no distributed/adaptive limiter, IP reputation, bot control, or
+  Client lockout. Edge enforcement remains required.
 - RSA signing occurs inside a bounded database transaction. Remote KMS latency and
   retry semantics are not supported by this design.
 - Restart-based key rotation is operationally error-prone if cache overlap is not

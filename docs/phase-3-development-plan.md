@@ -394,7 +394,7 @@ Authorize 参数剖面：
 跳回只往已验证 URI 追加标准参数；如果已登记 URI 自带 query，必须通过 URL 构造器合并，
 不能字符串拼接。State 只在协议跳回中逐字节往返，不进入日志、Audit、Metrics 或本地错误
 Body。所有浏览器协议页面和重定向响应设置 `Cache-Control: no-store`、
-`Referrer-Policy: no-referrer` 和现有严格安全头。
+`Referrer-Policy: same-origin`（跨 RP 边界不发送 Referer）和现有严格安全头。
 
 ## 10. Session、`prompt`、`max_age` 与注册恢复
 
@@ -1046,5 +1046,6 @@ curl --fail --silent --show-error \
 10. Public/Confidential 示例 Client 的互操作证据。
 
 第四阶段在这些边界上增加 Refresh Token rotation/reuse detection、Revoke、Introspection、
-RP-Initiated Logout、Grant 撤销管理、更完整限流/故障安全和必要的自动 Key 生命周期。它不得
-通过改变第三阶段 Code、Subject、Issuer、Redirect URI 或 Secret 语义来“简化”新增流程。
+RP-Initiated Logout、Grant 撤销管理、更完整限流/故障安全，以及 Logout Hint 所需的有界
+verification-key overlap 策略；自动/热 Key 生命周期仍不属于第四阶段。它不得通过改变第三阶段
+Code、Subject、Issuer、Redirect URI 或 Secret 语义来“简化”新增流程。

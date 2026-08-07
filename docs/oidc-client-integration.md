@@ -1,8 +1,9 @@
 # OIDC Client integration guide
 
-This guide describes the implemented OneIssuer `v0.1.0-dev.3` wire profile for a
-server-side Relying Party (RP). The provider is single-Issuer and supports only
-Authorization Code Flow with mandatory S256 PKCE.
+This guide describes the implemented OneIssuer `v0.1.0-dev.4` wire profile for a
+server-side Relying Party (RP). The provider is single-Issuer and supports
+Authorization Code Flow with mandatory S256 PKCE plus rotating Refresh Tokens,
+restricted lifecycle endpoints, and RP-Initiated Logout.
 
 The executable under `examples/oidc-client/` demonstrates the checks described
 here, but it is an interoperability example, **not a production SDK**.
@@ -28,24 +29,25 @@ endpoint URL alone. Cache Discovery/JWKS according to their headers, use HTTPS i
 production, and reject metadata that moves an endpoint outside the trusted
 Issuer origin.
 
-The phase-three capability set is:
+The phase-four capability set is:
 
 | Capability | Value |
 | --- | --- |
 | response type | `code` |
 | response mode | `query` |
 | grant type | `authorization_code` |
+| refresh grant | `refresh_token`, single-use rotating family |
 | subject type | `public` |
 | ID Token signing | `RS256` |
 | Client authentication | `none`, `client_secret_basic` |
 | PKCE | `S256` only, required for every Client |
-| scopes | `openid`, `profile`, `email` |
+| scopes | `openid`, `profile`, `email`, `offline_access` |
 | prompt values | `none`, `login`, `consent`, `create` |
 
-Discovery does not advertise Refresh Tokens, `offline_access`, Revocation,
-Introspection, RP Logout, Dynamic Registration, `client_secret_post`, Request
-Objects, PAR, JARM, DPoP, or mTLS. Do not probe for or depend on placeholder
-behavior.
+Discovery advertises Revocation and an Introspection endpoint restricted to an
+owning Confidential Client, plus the RP-Initiated Logout endpoint. Dynamic
+Registration, `client_secret_post`, Request Objects, PAR, JARM, DPoP, and mTLS
+remain outside this profile.
 
 ## 2. Provision a static Client
 
@@ -216,7 +218,7 @@ production RP must:
 13. accept profile/email claims only as attributes covered by granted Scope, not
     as account-link authority.
 
-OneIssuer's phase-three ID Token uses a single string Audience. Claims are:
+OneIssuer's phase-four ID Token uses a single string Audience. Claims are:
 
 | Claim | Rule |
 | --- | --- |
@@ -251,9 +253,12 @@ support OneIssuer's own validation but do **not** authorize another resource API
 to accept it. UserInfo additionally requires committed unexpired metadata and
 current Active User, Active Client, and covering Consent/Client Scope.
 
-A `401 invalid_token` is terminal for that call. Start a new authorization if the
-RP needs a current login; there is no Refresh, Introspection, or Revocation
-fallback.
+A `401 invalid_token` is terminal for that call. A Client holding
+`offline_access` may perform one bounded Refresh exchange and must atomically
+replace the old generation. `invalid_grant` is terminal for that family; clear
+the local copy and start a new authorization. Introspection is available only
+to the owning Confidential Client, and Revocation uses uniform success semantics
+for unknown or already-inactive values.
 
 ## 8. Session, logout, and lifecycle expectations
 
@@ -262,16 +267,19 @@ callback validation. Keep Tokens server-side and render only minimal identity
 attributes. Use Secure, HttpOnly, SameSite cookies, CSRF protection, short local
 Sessions, and explicit local logout.
 
-OneIssuer phase three does not implement RP-Initiated Logout or front/back-
-channel logout. Local RP logout does not revoke the OneIssuer browser Session,
-and OneIssuer logout does not notify RPs. Design UI text accordingly; do not
-register a logout URI and claim federated logout works.
+Use the discovered `end_session_endpoint` with a server-side, bounded ID Token
+Hint and a fresh state. The example submits a form POST, keeps the RP Session
+until the exact returned state is verified, then clears the local cookie and
+redirects to a clean URL. The hosted provider confirmation is transaction-bound
+and revokes the matching Session binding, Refresh families, and live Access
+metadata atomically. Front-/back-channel logout is outside this profile.
 
 Disabling a User/Client causes Code exchange and UserInfo to fail closed. Re-
 enabling cannot restore an expired or consumed Code; only an unconsumed,
-unexpired Code with all current bindings can proceed. A still-unexpired Access
-Token can become usable again after re-enable if all current metadata/Grant/Scope
-checks pass, because phase three has no permanent per-Token revocation record.
+unexpired Code with all current bindings can proceed. UserInfo and Introspection
+observe User/Client/Grant/Session/Refresh revocation immediately; external
+resource servers validating JWTs directly still need their own bounded cache and
+revocation policy.
 
 ## 9. Error and privacy handling
 
@@ -294,10 +302,11 @@ The repository example runs as Public Client A and Confidential Client B in the
 `oidc-demo` Compose profile. The full disposable scenario is:
 
 ```bash
-make phase-3-smoke
+make phase-4-smoke
 ```
 
 It is the recommended interoperability reference because it verifies state,
 nonce, S256, signed ID Token claims, UserInfo Subject, separate Client Audience/
-Consent, Session reuse, and Secret handling. Copy concepts and tests—not the
+Consent, offline Consent, Refresh rotation/replay, lifecycle endpoints, logout,
+Session reuse, and Secret handling. Copy concepts and tests—not the
 in-memory Session store or development HTTP settings—into a production RP.

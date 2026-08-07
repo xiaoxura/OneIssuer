@@ -74,6 +74,23 @@ func TestParseAuthorizationRequestValidProfile(t *testing.T) {
 	}
 }
 
+func TestParseAuthorizationRequestRejectsNULInNamesAndValues(t *testing.T) {
+	t.Parallel()
+
+	resolver, values := validAuthorizeFixture()
+	for _, raw := range []string{
+		values.Encode() + "&%00canary=value",
+		strings.Replace(values.Encode(), "opaque-state", "opaque%00state", 1),
+		strings.Replace(values.Encode(), resolver.client.ClientID, resolver.client.ClientID+"%00", 1),
+	} {
+		_, err := ParseAuthorizationRequest(context.Background(), raw, resolver)
+		var protocolError *AuthorizationError
+		if !errors.As(err, &protocolError) || protocolError.Code != ErrorInvalidRequest {
+			t.Fatalf("NUL-bearing query error = %#v", err)
+		}
+	}
+}
+
 func TestParseAuthorizationRequestAcceptsOnlyFrozenPromptCombinations(t *testing.T) {
 	t.Parallel()
 

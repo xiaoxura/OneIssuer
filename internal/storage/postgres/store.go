@@ -12,8 +12,16 @@ import (
 
 // Store wraps the pool and generated sqlc system queries.
 type Store struct {
-	pool    *pgxpool.Pool
-	queries *sqlcgen.Queries
+	pool          *pgxpool.Pool
+	queries       *sqlcgen.Queries
+	auditObserver AuditObserver
+}
+
+// AuditObserver receives only fixed event/result labels after a database write
+// or transaction has committed successfully.
+type AuditObserver interface {
+	AuditEvent(event, result string)
+	AuditWriteFailure(event string)
 }
 
 // Open creates a bounded pool and verifies a real connection before returning.
@@ -34,6 +42,14 @@ func Open(ctx context.Context, databaseURL string, maxConns int32) (*Store, erro
 	}
 
 	return &Store{pool: pool, queries: sqlcgen.New(pool)}, nil
+}
+
+// SetAuditObserver installs the process-wide audit metric observer. It must be
+// called during startup before the Store is shared with request goroutines.
+func (s *Store) SetAuditObserver(observer AuditObserver) {
+	if s != nil {
+		s.auditObserver = observer
+	}
 }
 
 // Ping executes the sqlc-generated SELECT 1 query used by readiness checks.

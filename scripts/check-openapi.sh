@@ -5,8 +5,8 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 spec="$root/api/openapi.yaml"
 redocly_version=${REDOCLY_VERSION:-2.43.2}
 
-if [ "$(grep -c '^  version: 0\.1\.0-dev\.3$' "$spec")" -ne 1 ]; then
-  echo "OpenAPI info.version must be exactly 0.1.0-dev.3" >&2
+if [ "$(grep -c '^  version: 0\.1\.0-dev\.4$' "$spec")" -ne 1 ]; then
+  echo "OpenAPI info.version must be exactly 0.1.0-dev.4" >&2
   exit 1
 fi
 
@@ -17,6 +17,8 @@ for path in \
   /api/v1/me/sessions \
   '/api/v1/me/sessions/{id}/revoke' \
   /api/v1/me/sessions/revoke-others \
+  /api/v1/me/grants \
+  /api/v1/me/grants/revoke \
   /api/admin/v1/me \
   /api/admin/v1/users \
   '/api/admin/v1/users/{id}' \

@@ -12,27 +12,60 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const consumeRefreshToken = `-- name: ConsumeRefreshToken :one
+UPDATE refresh_tokens
+SET consumed_at = $1
+WHERE id = $2 AND consumed_at IS NULL
+RETURNING id, family_id, token_hash, generation, issued_at, expires_at, consumed_at
+`
+
+type ConsumeRefreshTokenParams struct {
+	ConsumedAt pgtype.Timestamptz `db:"consumed_at"`
+	ID         uuid.UUID          `db:"id"`
+}
+
+func (q *Queries) ConsumeRefreshToken(ctx context.Context, arg ConsumeRefreshTokenParams) (RefreshToken, error) {
+	row := q.db.QueryRow(ctx, consumeRefreshToken, arg.ConsumedAt, arg.ID)
+	var i RefreshToken
+	err := row.Scan(
+		&i.ID,
+		&i.FamilyID,
+		&i.TokenHash,
+		&i.Generation,
+		&i.IssuedAt,
+		&i.ExpiresAt,
+		&i.ConsumedAt,
+	)
+	return i, err
+}
+
 const createAccessToken = `-- name: CreateAccessToken :exec
 INSERT INTO access_tokens (
     id, jti_hash, authorization_code_id, consent_grant_id,
-    user_id, client_id, scopes, issued_at, expires_at
+    user_id, client_id, scopes, issued_at, expires_at,
+    issuance_source, refresh_family_id, origin_session_id, session_binding_id
 ) VALUES (
     $1, $2, $3,
     $4, $5, $6,
-    $7, $8, $9
+    $7, $8, $9,
+    'authorization_code', $10,
+    $11, $12
 )
 `
 
 type CreateAccessTokenParams struct {
 	ID                  uuid.UUID          `db:"id"`
 	JtiHash             []byte             `db:"jti_hash"`
-	AuthorizationCodeID uuid.UUID          `db:"authorization_code_id"`
+	AuthorizationCodeID *uuid.UUID         `db:"authorization_code_id"`
 	ConsentGrantID      uuid.UUID          `db:"consent_grant_id"`
 	UserID              uuid.UUID          `db:"user_id"`
 	ClientID            uuid.UUID          `db:"client_id"`
 	Scopes              []string           `db:"scopes"`
 	IssuedAt            pgtype.Timestamptz `db:"issued_at"`
 	ExpiresAt           pgtype.Timestamptz `db:"expires_at"`
+	RefreshFamilyID     *uuid.UUID         `db:"refresh_family_id"`
+	OriginSessionID     *uuid.UUID         `db:"origin_session_id"`
+	SessionBindingID    *uuid.UUID         `db:"session_binding_id"`
 }
 
 func (q *Queries) CreateAccessToken(ctx context.Context, arg CreateAccessTokenParams) error {
@@ -46,16 +79,259 @@ func (q *Queries) CreateAccessToken(ctx context.Context, arg CreateAccessTokenPa
 		arg.Scopes,
 		arg.IssuedAt,
 		arg.ExpiresAt,
+		arg.RefreshFamilyID,
+		arg.OriginSessionID,
+		arg.SessionBindingID,
 	)
 	return err
 }
 
-const deleteRetiredAccessTokens = `-- name: DeleteRetiredAccessTokens :execrows
-DELETE FROM access_tokens WHERE expires_at <= $1
+const createRefreshAccessToken = `-- name: CreateRefreshAccessToken :exec
+INSERT INTO access_tokens (
+    id, jti_hash, authorization_code_id, consent_grant_id,
+    user_id, client_id, scopes, issued_at, expires_at,
+    issuance_source, source_refresh_token_id, refresh_family_id,
+    origin_session_id, session_binding_id
+) VALUES (
+    $1, $2, NULL, $3,
+    $4, $5, $6,
+    $7, $8, 'refresh_token',
+    $9, $10,
+    $11, $12
+)
 `
 
-func (q *Queries) DeleteRetiredAccessTokens(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteRetiredAccessTokens, cutoff)
+type CreateRefreshAccessTokenParams struct {
+	ID                   uuid.UUID          `db:"id"`
+	JtiHash              []byte             `db:"jti_hash"`
+	ConsentGrantID       uuid.UUID          `db:"consent_grant_id"`
+	UserID               uuid.UUID          `db:"user_id"`
+	ClientID             uuid.UUID          `db:"client_id"`
+	Scopes               []string           `db:"scopes"`
+	IssuedAt             pgtype.Timestamptz `db:"issued_at"`
+	ExpiresAt            pgtype.Timestamptz `db:"expires_at"`
+	SourceRefreshTokenID *uuid.UUID         `db:"source_refresh_token_id"`
+	RefreshFamilyID      *uuid.UUID         `db:"refresh_family_id"`
+	OriginSessionID      *uuid.UUID         `db:"origin_session_id"`
+	SessionBindingID     *uuid.UUID         `db:"session_binding_id"`
+}
+
+func (q *Queries) CreateRefreshAccessToken(ctx context.Context, arg CreateRefreshAccessTokenParams) error {
+	_, err := q.db.Exec(ctx, createRefreshAccessToken,
+		arg.ID,
+		arg.JtiHash,
+		arg.ConsentGrantID,
+		arg.UserID,
+		arg.ClientID,
+		arg.Scopes,
+		arg.IssuedAt,
+		arg.ExpiresAt,
+		arg.SourceRefreshTokenID,
+		arg.RefreshFamilyID,
+		arg.OriginSessionID,
+		arg.SessionBindingID,
+	)
+	return err
+}
+
+const createRefreshToken = `-- name: CreateRefreshToken :one
+INSERT INTO refresh_tokens (
+    id, family_id, token_hash, generation, issued_at, expires_at
+) VALUES (
+    $1, $2, $3,
+    $4, $5, $6
+)
+RETURNING id, family_id, token_hash, generation, issued_at, expires_at, consumed_at
+`
+
+type CreateRefreshTokenParams struct {
+	ID         uuid.UUID          `db:"id"`
+	FamilyID   uuid.UUID          `db:"family_id"`
+	TokenHash  []byte             `db:"token_hash"`
+	Generation int64              `db:"generation"`
+	IssuedAt   pgtype.Timestamptz `db:"issued_at"`
+	ExpiresAt  pgtype.Timestamptz `db:"expires_at"`
+}
+
+func (q *Queries) CreateRefreshToken(ctx context.Context, arg CreateRefreshTokenParams) (RefreshToken, error) {
+	row := q.db.QueryRow(ctx, createRefreshToken,
+		arg.ID,
+		arg.FamilyID,
+		arg.TokenHash,
+		arg.Generation,
+		arg.IssuedAt,
+		arg.ExpiresAt,
+	)
+	var i RefreshToken
+	err := row.Scan(
+		&i.ID,
+		&i.FamilyID,
+		&i.TokenHash,
+		&i.Generation,
+		&i.IssuedAt,
+		&i.ExpiresAt,
+		&i.ConsumedAt,
+	)
+	return i, err
+}
+
+const createRefreshTokenFamily = `-- name: CreateRefreshTokenFamily :one
+INSERT INTO refresh_token_families (
+    id, origin_authorization_code_id, consent_grant_id, user_id, client_id,
+    origin_session_id, session_binding_id, scopes, created_at, absolute_expires_at
+) VALUES (
+    $1, $2, $3,
+    $4, $5, $6,
+    $7, $8, $9,
+    $10
+)
+RETURNING id, origin_authorization_code_id, consent_grant_id, user_id, client_id, origin_session_id, session_binding_id, scopes, created_at, absolute_expires_at, revoked_at, revoke_reason
+`
+
+type CreateRefreshTokenFamilyParams struct {
+	ID                        uuid.UUID          `db:"id"`
+	OriginAuthorizationCodeID *uuid.UUID         `db:"origin_authorization_code_id"`
+	ConsentGrantID            uuid.UUID          `db:"consent_grant_id"`
+	UserID                    uuid.UUID          `db:"user_id"`
+	ClientID                  uuid.UUID          `db:"client_id"`
+	OriginSessionID           *uuid.UUID         `db:"origin_session_id"`
+	SessionBindingID          uuid.UUID          `db:"session_binding_id"`
+	Scopes                    []string           `db:"scopes"`
+	CreatedAt                 pgtype.Timestamptz `db:"created_at"`
+	AbsoluteExpiresAt         pgtype.Timestamptz `db:"absolute_expires_at"`
+}
+
+func (q *Queries) CreateRefreshTokenFamily(ctx context.Context, arg CreateRefreshTokenFamilyParams) (RefreshTokenFamily, error) {
+	row := q.db.QueryRow(ctx, createRefreshTokenFamily,
+		arg.ID,
+		arg.OriginAuthorizationCodeID,
+		arg.ConsentGrantID,
+		arg.UserID,
+		arg.ClientID,
+		arg.OriginSessionID,
+		arg.SessionBindingID,
+		arg.Scopes,
+		arg.CreatedAt,
+		arg.AbsoluteExpiresAt,
+	)
+	var i RefreshTokenFamily
+	err := row.Scan(
+		&i.ID,
+		&i.OriginAuthorizationCodeID,
+		&i.ConsentGrantID,
+		&i.UserID,
+		&i.ClientID,
+		&i.OriginSessionID,
+		&i.SessionBindingID,
+		&i.Scopes,
+		&i.CreatedAt,
+		&i.AbsoluteExpiresAt,
+		&i.RevokedAt,
+		&i.RevokeReason,
+	)
+	return i, err
+}
+
+const deleteRetiredAccessTokens = `-- name: DeleteRetiredAccessTokens :execrows
+WITH candidates AS (
+    SELECT tokens.id
+    FROM access_tokens AS tokens
+    WHERE tokens.expires_at <= $1
+    ORDER BY tokens.expires_at, tokens.id
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+)
+DELETE FROM access_tokens AS tokens
+USING candidates
+WHERE tokens.id = candidates.id
+`
+
+type DeleteRetiredAccessTokensParams struct {
+	Cutoff     pgtype.Timestamptz `db:"cutoff"`
+	BatchLimit int32              `db:"batch_limit"`
+}
+
+func (q *Queries) DeleteRetiredAccessTokens(ctx context.Context, arg DeleteRetiredAccessTokensParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteRetiredAccessTokens, arg.Cutoff, arg.BatchLimit)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteRetiredRefreshTokenFamilies = `-- name: DeleteRetiredRefreshTokenFamilies :execrows
+WITH candidates AS (
+    SELECT families.id
+    FROM refresh_token_families AS families
+    WHERE GREATEST(
+        families.absolute_expires_at,
+        COALESCE(families.revoked_at, families.absolute_expires_at)
+    ) <= $1
+      AND NOT EXISTS (
+          SELECT 1 FROM refresh_tokens AS tokens
+          WHERE tokens.family_id = families.id
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM access_tokens AS accesses
+          WHERE accesses.refresh_family_id = families.id
+      )
+    ORDER BY GREATEST(
+        families.absolute_expires_at,
+        COALESCE(families.revoked_at, families.absolute_expires_at)
+    ), families.id
+    LIMIT $2
+    FOR UPDATE OF families SKIP LOCKED
+)
+DELETE FROM refresh_token_families AS families
+USING candidates
+WHERE families.id = candidates.id
+`
+
+type DeleteRetiredRefreshTokenFamiliesParams struct {
+	Cutoff     pgtype.Timestamptz `db:"cutoff"`
+	BatchLimit int32              `db:"batch_limit"`
+}
+
+func (q *Queries) DeleteRetiredRefreshTokenFamilies(ctx context.Context, arg DeleteRetiredRefreshTokenFamiliesParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteRetiredRefreshTokenFamilies, arg.Cutoff, arg.BatchLimit)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteRetiredRefreshTokens = `-- name: DeleteRetiredRefreshTokens :execrows
+WITH candidates AS (
+    SELECT tokens.id
+    FROM refresh_tokens AS tokens
+    JOIN refresh_token_families AS families ON families.id = tokens.family_id
+    WHERE GREATEST(
+        families.absolute_expires_at,
+        COALESCE(families.revoked_at, families.absolute_expires_at)
+    ) <= $1
+      AND NOT EXISTS (
+          SELECT 1 FROM access_tokens AS accesses
+          WHERE accesses.source_refresh_token_id = tokens.id
+      )
+    ORDER BY GREATEST(
+        families.absolute_expires_at,
+        COALESCE(families.revoked_at, families.absolute_expires_at)
+    ), tokens.id
+    LIMIT $2
+    FOR UPDATE OF tokens SKIP LOCKED
+)
+DELETE FROM refresh_tokens AS tokens
+USING candidates
+WHERE tokens.id = candidates.id
+`
+
+type DeleteRetiredRefreshTokensParams struct {
+	Cutoff     pgtype.Timestamptz `db:"cutoff"`
+	BatchLimit int32              `db:"batch_limit"`
+}
+
+func (q *Queries) DeleteRetiredRefreshTokens(ctx context.Context, arg DeleteRetiredRefreshTokensParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteRetiredRefreshTokens, arg.Cutoff, arg.BatchLimit)
 	if err != nil {
 		return 0, err
 	}
@@ -63,7 +339,7 @@ func (q *Queries) DeleteRetiredAccessTokens(ctx context.Context, cutoff pgtype.T
 }
 
 const getAccessTokenByJTIHash = `-- name: GetAccessTokenByJTIHash :one
-SELECT id, jti_hash, authorization_code_id, consent_grant_id, user_id, client_id, scopes, issued_at, expires_at FROM access_tokens WHERE jti_hash = $1
+SELECT id, jti_hash, authorization_code_id, consent_grant_id, user_id, client_id, scopes, issued_at, expires_at, issuance_source, source_refresh_token_id, refresh_family_id, origin_session_id, session_binding_id, revoked_at, revoke_reason FROM access_tokens WHERE jti_hash = $1
 `
 
 func (q *Queries) GetAccessTokenByJTIHash(ctx context.Context, jtiHash []byte) (AccessToken, error) {
@@ -79,6 +355,56 @@ func (q *Queries) GetAccessTokenByJTIHash(ctx context.Context, jtiHash []byte) (
 		&i.Scopes,
 		&i.IssuedAt,
 		&i.ExpiresAt,
+		&i.IssuanceSource,
+		&i.SourceRefreshTokenID,
+		&i.RefreshFamilyID,
+		&i.OriginSessionID,
+		&i.SessionBindingID,
+		&i.RevokedAt,
+		&i.RevokeReason,
+	)
+	return i, err
+}
+
+const getRefreshTokenByHash = `-- name: GetRefreshTokenByHash :one
+SELECT id, family_id, token_hash, generation, issued_at, expires_at, consumed_at FROM refresh_tokens WHERE token_hash = $1
+`
+
+func (q *Queries) GetRefreshTokenByHash(ctx context.Context, tokenHash []byte) (RefreshToken, error) {
+	row := q.db.QueryRow(ctx, getRefreshTokenByHash, tokenHash)
+	var i RefreshToken
+	err := row.Scan(
+		&i.ID,
+		&i.FamilyID,
+		&i.TokenHash,
+		&i.Generation,
+		&i.IssuedAt,
+		&i.ExpiresAt,
+		&i.ConsumedAt,
+	)
+	return i, err
+}
+
+const getRefreshTokenFamilyByID = `-- name: GetRefreshTokenFamilyByID :one
+SELECT id, origin_authorization_code_id, consent_grant_id, user_id, client_id, origin_session_id, session_binding_id, scopes, created_at, absolute_expires_at, revoked_at, revoke_reason FROM refresh_token_families WHERE id = $1
+`
+
+func (q *Queries) GetRefreshTokenFamilyByID(ctx context.Context, id uuid.UUID) (RefreshTokenFamily, error) {
+	row := q.db.QueryRow(ctx, getRefreshTokenFamilyByID, id)
+	var i RefreshTokenFamily
+	err := row.Scan(
+		&i.ID,
+		&i.OriginAuthorizationCodeID,
+		&i.ConsentGrantID,
+		&i.UserID,
+		&i.ClientID,
+		&i.OriginSessionID,
+		&i.SessionBindingID,
+		&i.Scopes,
+		&i.CreatedAt,
+		&i.AbsoluteExpiresAt,
+		&i.RevokedAt,
+		&i.RevokeReason,
 	)
 	return i, err
 }
@@ -98,4 +424,557 @@ func (q *Queries) HasAuthorizationCodeExchangeRejection(ctx context.Context, aut
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
+}
+
+const lockAccessTokenByID = `-- name: LockAccessTokenByID :one
+SELECT id, jti_hash, authorization_code_id, consent_grant_id, user_id, client_id, scopes, issued_at, expires_at, issuance_source, source_refresh_token_id, refresh_family_id, origin_session_id, session_binding_id, revoked_at, revoke_reason FROM access_tokens WHERE id = $1 FOR UPDATE
+`
+
+func (q *Queries) LockAccessTokenByID(ctx context.Context, id uuid.UUID) (AccessToken, error) {
+	row := q.db.QueryRow(ctx, lockAccessTokenByID, id)
+	var i AccessToken
+	err := row.Scan(
+		&i.ID,
+		&i.JtiHash,
+		&i.AuthorizationCodeID,
+		&i.ConsentGrantID,
+		&i.UserID,
+		&i.ClientID,
+		&i.Scopes,
+		&i.IssuedAt,
+		&i.ExpiresAt,
+		&i.IssuanceSource,
+		&i.SourceRefreshTokenID,
+		&i.RefreshFamilyID,
+		&i.OriginSessionID,
+		&i.SessionBindingID,
+		&i.RevokedAt,
+		&i.RevokeReason,
+	)
+	return i, err
+}
+
+const lockLiveAccessTokensByClient = `-- name: LockLiveAccessTokensByClient :many
+SELECT id
+FROM access_tokens
+WHERE client_id = $1
+  AND revoked_at IS NULL
+  AND expires_at > $2
+ORDER BY id
+FOR UPDATE
+`
+
+type LockLiveAccessTokensByClientParams struct {
+	ClientID uuid.UUID          `db:"client_id"`
+	Now      pgtype.Timestamptz `db:"now"`
+}
+
+func (q *Queries) LockLiveAccessTokensByClient(ctx context.Context, arg LockLiveAccessTokensByClientParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockLiveAccessTokensByClient, arg.ClientID, arg.Now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockLiveAccessTokensByGrant = `-- name: LockLiveAccessTokensByGrant :many
+SELECT id
+FROM access_tokens
+WHERE consent_grant_id = $1
+  AND revoked_at IS NULL
+  AND expires_at > $2
+ORDER BY id
+FOR UPDATE
+`
+
+type LockLiveAccessTokensByGrantParams struct {
+	ConsentGrantID uuid.UUID          `db:"consent_grant_id"`
+	Now            pgtype.Timestamptz `db:"now"`
+}
+
+func (q *Queries) LockLiveAccessTokensByGrant(ctx context.Context, arg LockLiveAccessTokensByGrantParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockLiveAccessTokensByGrant, arg.ConsentGrantID, arg.Now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockLiveAccessTokensByUser = `-- name: LockLiveAccessTokensByUser :many
+SELECT id
+FROM access_tokens
+WHERE user_id = $1
+  AND revoked_at IS NULL
+  AND expires_at > $2
+ORDER BY id
+FOR UPDATE
+`
+
+type LockLiveAccessTokensByUserParams struct {
+	UserID uuid.UUID          `db:"user_id"`
+	Now    pgtype.Timestamptz `db:"now"`
+}
+
+func (q *Queries) LockLiveAccessTokensByUser(ctx context.Context, arg LockLiveAccessTokensByUserParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockLiveAccessTokensByUser, arg.UserID, arg.Now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockLiveRefreshAccessTokensByClient = `-- name: LockLiveRefreshAccessTokensByClient :many
+SELECT id
+FROM access_tokens
+WHERE client_id = $1
+  AND refresh_family_id IS NOT NULL
+  AND revoked_at IS NULL
+  AND expires_at > $2
+ORDER BY id
+FOR UPDATE
+`
+
+type LockLiveRefreshAccessTokensByClientParams struct {
+	ClientID uuid.UUID          `db:"client_id"`
+	Now      pgtype.Timestamptz `db:"now"`
+}
+
+func (q *Queries) LockLiveRefreshAccessTokensByClient(ctx context.Context, arg LockLiveRefreshAccessTokensByClientParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockLiveRefreshAccessTokensByClient, arg.ClientID, arg.Now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockRefreshTokenByID = `-- name: LockRefreshTokenByID :one
+SELECT id, family_id, token_hash, generation, issued_at, expires_at, consumed_at FROM refresh_tokens WHERE id = $1 FOR UPDATE
+`
+
+func (q *Queries) LockRefreshTokenByID(ctx context.Context, id uuid.UUID) (RefreshToken, error) {
+	row := q.db.QueryRow(ctx, lockRefreshTokenByID, id)
+	var i RefreshToken
+	err := row.Scan(
+		&i.ID,
+		&i.FamilyID,
+		&i.TokenHash,
+		&i.Generation,
+		&i.IssuedAt,
+		&i.ExpiresAt,
+		&i.ConsumedAt,
+	)
+	return i, err
+}
+
+const lockRefreshTokenFamilyByID = `-- name: LockRefreshTokenFamilyByID :one
+SELECT id, origin_authorization_code_id, consent_grant_id, user_id, client_id, origin_session_id, session_binding_id, scopes, created_at, absolute_expires_at, revoked_at, revoke_reason FROM refresh_token_families WHERE id = $1 FOR UPDATE
+`
+
+func (q *Queries) LockRefreshTokenFamilyByID(ctx context.Context, id uuid.UUID) (RefreshTokenFamily, error) {
+	row := q.db.QueryRow(ctx, lockRefreshTokenFamilyByID, id)
+	var i RefreshTokenFamily
+	err := row.Scan(
+		&i.ID,
+		&i.OriginAuthorizationCodeID,
+		&i.ConsentGrantID,
+		&i.UserID,
+		&i.ClientID,
+		&i.OriginSessionID,
+		&i.SessionBindingID,
+		&i.Scopes,
+		&i.CreatedAt,
+		&i.AbsoluteExpiresAt,
+		&i.RevokedAt,
+		&i.RevokeReason,
+	)
+	return i, err
+}
+
+const lockUnrevokedRefreshTokenFamiliesByClient = `-- name: LockUnrevokedRefreshTokenFamiliesByClient :many
+SELECT id
+FROM refresh_token_families
+WHERE client_id = $1
+  AND revoked_at IS NULL
+ORDER BY id
+FOR UPDATE
+`
+
+func (q *Queries) LockUnrevokedRefreshTokenFamiliesByClient(ctx context.Context, clientID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockUnrevokedRefreshTokenFamiliesByClient, clientID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockUnrevokedRefreshTokenFamiliesByGrant = `-- name: LockUnrevokedRefreshTokenFamiliesByGrant :many
+SELECT id
+FROM refresh_token_families
+WHERE consent_grant_id = $1
+  AND revoked_at IS NULL
+ORDER BY id
+FOR UPDATE
+`
+
+func (q *Queries) LockUnrevokedRefreshTokenFamiliesByGrant(ctx context.Context, consentGrantID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockUnrevokedRefreshTokenFamiliesByGrant, consentGrantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockUnrevokedRefreshTokenFamiliesByUser = `-- name: LockUnrevokedRefreshTokenFamiliesByUser :many
+SELECT id
+FROM refresh_token_families
+WHERE user_id = $1
+  AND revoked_at IS NULL
+ORDER BY id
+FOR UPDATE
+`
+
+func (q *Queries) LockUnrevokedRefreshTokenFamiliesByUser(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockUnrevokedRefreshTokenFamiliesByUser, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const revokeAccessToken = `-- name: RevokeAccessToken :one
+UPDATE access_tokens
+SET revoked_at = $1, revoke_reason = $2
+WHERE id = $3 AND revoked_at IS NULL
+RETURNING id, jti_hash, authorization_code_id, consent_grant_id, user_id, client_id, scopes, issued_at, expires_at, issuance_source, source_refresh_token_id, refresh_family_id, origin_session_id, session_binding_id, revoked_at, revoke_reason
+`
+
+type RevokeAccessTokenParams struct {
+	RevokedAt    pgtype.Timestamptz `db:"revoked_at"`
+	RevokeReason *string            `db:"revoke_reason"`
+	ID           uuid.UUID          `db:"id"`
+}
+
+func (q *Queries) RevokeAccessToken(ctx context.Context, arg RevokeAccessTokenParams) (AccessToken, error) {
+	row := q.db.QueryRow(ctx, revokeAccessToken, arg.RevokedAt, arg.RevokeReason, arg.ID)
+	var i AccessToken
+	err := row.Scan(
+		&i.ID,
+		&i.JtiHash,
+		&i.AuthorizationCodeID,
+		&i.ConsentGrantID,
+		&i.UserID,
+		&i.ClientID,
+		&i.Scopes,
+		&i.IssuedAt,
+		&i.ExpiresAt,
+		&i.IssuanceSource,
+		&i.SourceRefreshTokenID,
+		&i.RefreshFamilyID,
+		&i.OriginSessionID,
+		&i.SessionBindingID,
+		&i.RevokedAt,
+		&i.RevokeReason,
+	)
+	return i, err
+}
+
+const revokeLiveAccessTokensByClient = `-- name: RevokeLiveAccessTokensByClient :execrows
+UPDATE access_tokens
+SET revoked_at = $1, revoke_reason = $2
+WHERE client_id = $3
+  AND revoked_at IS NULL
+  AND expires_at > $1
+`
+
+type RevokeLiveAccessTokensByClientParams struct {
+	RevokedAt    pgtype.Timestamptz `db:"revoked_at"`
+	RevokeReason *string            `db:"revoke_reason"`
+	ClientID     uuid.UUID          `db:"client_id"`
+}
+
+func (q *Queries) RevokeLiveAccessTokensByClient(ctx context.Context, arg RevokeLiveAccessTokensByClientParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeLiveAccessTokensByClient, arg.RevokedAt, arg.RevokeReason, arg.ClientID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const revokeLiveAccessTokensByFamily = `-- name: RevokeLiveAccessTokensByFamily :execrows
+UPDATE access_tokens
+SET revoked_at = $1, revoke_reason = 'family_revoked'
+WHERE refresh_family_id = $2
+  AND revoked_at IS NULL
+  AND expires_at > $1
+`
+
+type RevokeLiveAccessTokensByFamilyParams struct {
+	RevokedAt       pgtype.Timestamptz `db:"revoked_at"`
+	RefreshFamilyID *uuid.UUID         `db:"refresh_family_id"`
+}
+
+func (q *Queries) RevokeLiveAccessTokensByFamily(ctx context.Context, arg RevokeLiveAccessTokensByFamilyParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeLiveAccessTokensByFamily, arg.RevokedAt, arg.RefreshFamilyID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const revokeLiveAccessTokensByGrant = `-- name: RevokeLiveAccessTokensByGrant :execrows
+UPDATE access_tokens
+SET revoked_at = $1, revoke_reason = 'grant_revoked'
+WHERE consent_grant_id = $2
+  AND revoked_at IS NULL
+  AND expires_at > $1
+`
+
+type RevokeLiveAccessTokensByGrantParams struct {
+	RevokedAt      pgtype.Timestamptz `db:"revoked_at"`
+	ConsentGrantID uuid.UUID          `db:"consent_grant_id"`
+}
+
+func (q *Queries) RevokeLiveAccessTokensByGrant(ctx context.Context, arg RevokeLiveAccessTokensByGrantParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeLiveAccessTokensByGrant, arg.RevokedAt, arg.ConsentGrantID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const revokeLiveAccessTokensByUser = `-- name: RevokeLiveAccessTokensByUser :execrows
+UPDATE access_tokens
+SET revoked_at = $1, revoke_reason = $2
+WHERE user_id = $3
+  AND revoked_at IS NULL
+  AND expires_at > $1
+`
+
+type RevokeLiveAccessTokensByUserParams struct {
+	RevokedAt    pgtype.Timestamptz `db:"revoked_at"`
+	RevokeReason *string            `db:"revoke_reason"`
+	UserID       uuid.UUID          `db:"user_id"`
+}
+
+func (q *Queries) RevokeLiveAccessTokensByUser(ctx context.Context, arg RevokeLiveAccessTokensByUserParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeLiveAccessTokensByUser, arg.RevokedAt, arg.RevokeReason, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const revokeLiveRefreshAccessTokensByClient = `-- name: RevokeLiveRefreshAccessTokensByClient :execrows
+UPDATE access_tokens
+SET revoked_at = $1, revoke_reason = $2
+WHERE client_id = $3
+  AND refresh_family_id IS NOT NULL
+  AND revoked_at IS NULL
+  AND expires_at > $1
+`
+
+type RevokeLiveRefreshAccessTokensByClientParams struct {
+	RevokedAt    pgtype.Timestamptz `db:"revoked_at"`
+	RevokeReason *string            `db:"revoke_reason"`
+	ClientID     uuid.UUID          `db:"client_id"`
+}
+
+func (q *Queries) RevokeLiveRefreshAccessTokensByClient(ctx context.Context, arg RevokeLiveRefreshAccessTokensByClientParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeLiveRefreshAccessTokensByClient, arg.RevokedAt, arg.RevokeReason, arg.ClientID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const revokeRefreshTokenFamiliesByClient = `-- name: RevokeRefreshTokenFamiliesByClient :execrows
+UPDATE refresh_token_families
+SET revoked_at = $1, revoke_reason = $2
+WHERE client_id = $3
+  AND revoked_at IS NULL
+`
+
+type RevokeRefreshTokenFamiliesByClientParams struct {
+	RevokedAt    pgtype.Timestamptz `db:"revoked_at"`
+	RevokeReason *string            `db:"revoke_reason"`
+	ClientID     uuid.UUID          `db:"client_id"`
+}
+
+func (q *Queries) RevokeRefreshTokenFamiliesByClient(ctx context.Context, arg RevokeRefreshTokenFamiliesByClientParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeRefreshTokenFamiliesByClient, arg.RevokedAt, arg.RevokeReason, arg.ClientID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const revokeRefreshTokenFamiliesByGrant = `-- name: RevokeRefreshTokenFamiliesByGrant :many
+UPDATE refresh_token_families
+SET revoked_at = $1, revoke_reason = 'grant_revoked'
+WHERE consent_grant_id = $2
+  AND revoked_at IS NULL
+RETURNING id
+`
+
+type RevokeRefreshTokenFamiliesByGrantParams struct {
+	RevokedAt      pgtype.Timestamptz `db:"revoked_at"`
+	ConsentGrantID uuid.UUID          `db:"consent_grant_id"`
+}
+
+func (q *Queries) RevokeRefreshTokenFamiliesByGrant(ctx context.Context, arg RevokeRefreshTokenFamiliesByGrantParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, revokeRefreshTokenFamiliesByGrant, arg.RevokedAt, arg.ConsentGrantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const revokeRefreshTokenFamiliesByUser = `-- name: RevokeRefreshTokenFamiliesByUser :execrows
+UPDATE refresh_token_families
+SET revoked_at = $1, revoke_reason = $2
+WHERE user_id = $3
+  AND revoked_at IS NULL
+`
+
+type RevokeRefreshTokenFamiliesByUserParams struct {
+	RevokedAt    pgtype.Timestamptz `db:"revoked_at"`
+	RevokeReason *string            `db:"revoke_reason"`
+	UserID       uuid.UUID          `db:"user_id"`
+}
+
+func (q *Queries) RevokeRefreshTokenFamiliesByUser(ctx context.Context, arg RevokeRefreshTokenFamiliesByUserParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeRefreshTokenFamiliesByUser, arg.RevokedAt, arg.RevokeReason, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const revokeRefreshTokenFamily = `-- name: RevokeRefreshTokenFamily :one
+UPDATE refresh_token_families
+SET revoked_at = $1, revoke_reason = $2
+WHERE id = $3 AND revoked_at IS NULL
+RETURNING id, origin_authorization_code_id, consent_grant_id, user_id, client_id, origin_session_id, session_binding_id, scopes, created_at, absolute_expires_at, revoked_at, revoke_reason
+`
+
+type RevokeRefreshTokenFamilyParams struct {
+	RevokedAt    pgtype.Timestamptz `db:"revoked_at"`
+	RevokeReason *string            `db:"revoke_reason"`
+	ID           uuid.UUID          `db:"id"`
+}
+
+func (q *Queries) RevokeRefreshTokenFamily(ctx context.Context, arg RevokeRefreshTokenFamilyParams) (RefreshTokenFamily, error) {
+	row := q.db.QueryRow(ctx, revokeRefreshTokenFamily, arg.RevokedAt, arg.RevokeReason, arg.ID)
+	var i RefreshTokenFamily
+	err := row.Scan(
+		&i.ID,
+		&i.OriginAuthorizationCodeID,
+		&i.ConsentGrantID,
+		&i.UserID,
+		&i.ClientID,
+		&i.OriginSessionID,
+		&i.SessionBindingID,
+		&i.Scopes,
+		&i.CreatedAt,
+		&i.AbsoluteExpiresAt,
+		&i.RevokedAt,
+		&i.RevokeReason,
+	)
+	return i, err
 }

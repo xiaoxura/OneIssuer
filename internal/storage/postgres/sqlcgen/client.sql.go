@@ -23,7 +23,7 @@ INSERT INTO oidc_clients (
     $7, $8, $9,
     $10, $11
 )
-RETURNING id, client_id, client_type, token_endpoint_auth_method, name, description, logo_uri, status, registration_enabled, created_at, updated_at
+RETURNING id, client_id, client_type, token_endpoint_auth_method, name, description, logo_uri, status, registration_enabled, created_at, updated_at, version
 `
 
 type CreateOIDCClientParams struct {
@@ -67,6 +67,7 @@ func (q *Queries) CreateOIDCClient(ctx context.Context, arg CreateOIDCClientPara
 		&i.RegistrationEnabled,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Version,
 	)
 	return i, err
 }
@@ -172,7 +173,7 @@ func (q *Queries) DeleteOIDCClientScopes(ctx context.Context, clientID uuid.UUID
 }
 
 const getOIDCClientByClientID = `-- name: GetOIDCClientByClientID :one
-SELECT id, client_id, client_type, token_endpoint_auth_method, name, description, logo_uri, status, registration_enabled, created_at, updated_at FROM oidc_clients WHERE client_id = $1
+SELECT id, client_id, client_type, token_endpoint_auth_method, name, description, logo_uri, status, registration_enabled, created_at, updated_at, version FROM oidc_clients WHERE client_id = $1
 `
 
 func (q *Queries) GetOIDCClientByClientID(ctx context.Context, clientID string) (OidcClient, error) {
@@ -190,12 +191,13 @@ func (q *Queries) GetOIDCClientByClientID(ctx context.Context, clientID string) 
 		&i.RegistrationEnabled,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Version,
 	)
 	return i, err
 }
 
 const getOIDCClientByID = `-- name: GetOIDCClientByID :one
-SELECT id, client_id, client_type, token_endpoint_auth_method, name, description, logo_uri, status, registration_enabled, created_at, updated_at FROM oidc_clients WHERE id = $1
+SELECT id, client_id, client_type, token_endpoint_auth_method, name, description, logo_uri, status, registration_enabled, created_at, updated_at, version FROM oidc_clients WHERE id = $1
 `
 
 func (q *Queries) GetOIDCClientByID(ctx context.Context, id uuid.UUID) (OidcClient, error) {
@@ -213,6 +215,7 @@ func (q *Queries) GetOIDCClientByID(ctx context.Context, id uuid.UUID) (OidcClie
 		&i.RegistrationEnabled,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Version,
 	)
 	return i, err
 }
@@ -323,7 +326,7 @@ func (q *Queries) ListOIDCClientScopes(ctx context.Context, clientID uuid.UUID) 
 }
 
 const listOIDCClients = `-- name: ListOIDCClients :many
-SELECT id, client_id, client_type, token_endpoint_auth_method, name, description, logo_uri, status, registration_enabled, created_at, updated_at
+SELECT id, client_id, client_type, token_endpoint_auth_method, name, description, logo_uri, status, registration_enabled, created_at, updated_at, version
 FROM oidc_clients
 WHERE (
         $1::timestamptz IS NULL
@@ -360,6 +363,7 @@ func (q *Queries) ListOIDCClients(ctx context.Context, arg ListOIDCClientsParams
 			&i.RegistrationEnabled,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.Version,
 		); err != nil {
 			return nil, err
 		}
@@ -371,8 +375,32 @@ func (q *Queries) ListOIDCClients(ctx context.Context, arg ListOIDCClientsParams
 	return items, nil
 }
 
+const lockOIDCClientByClientID = `-- name: LockOIDCClientByClientID :one
+SELECT id, client_id, client_type, token_endpoint_auth_method, name, description, logo_uri, status, registration_enabled, created_at, updated_at, version FROM oidc_clients WHERE client_id = $1 FOR UPDATE
+`
+
+func (q *Queries) LockOIDCClientByClientID(ctx context.Context, clientID string) (OidcClient, error) {
+	row := q.db.QueryRow(ctx, lockOIDCClientByClientID, clientID)
+	var i OidcClient
+	err := row.Scan(
+		&i.ID,
+		&i.ClientID,
+		&i.ClientType,
+		&i.TokenEndpointAuthMethod,
+		&i.Name,
+		&i.Description,
+		&i.LogoUri,
+		&i.Status,
+		&i.RegistrationEnabled,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Version,
+	)
+	return i, err
+}
+
 const lockOIDCClientByID = `-- name: LockOIDCClientByID :one
-SELECT id, client_id, client_type, token_endpoint_auth_method, name, description, logo_uri, status, registration_enabled, created_at, updated_at FROM oidc_clients WHERE id = $1 FOR UPDATE
+SELECT id, client_id, client_type, token_endpoint_auth_method, name, description, logo_uri, status, registration_enabled, created_at, updated_at, version FROM oidc_clients WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockOIDCClientByID(ctx context.Context, id uuid.UUID) (OidcClient, error) {
@@ -390,6 +418,7 @@ func (q *Queries) LockOIDCClientByID(ctx context.Context, id uuid.UUID) (OidcCli
 		&i.RegistrationEnabled,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Version,
 	)
 	return i, err
 }
@@ -433,9 +462,10 @@ UPDATE oidc_clients SET
     logo_uri = $3,
     status = $4,
     registration_enabled = $5,
-    updated_at = $6
-WHERE id = $7 AND updated_at = $8
-RETURNING id, client_id, client_type, token_endpoint_auth_method, name, description, logo_uri, status, registration_enabled, created_at, updated_at
+    updated_at = $6,
+    version = version + 1
+WHERE id = $7 AND version = $8
+RETURNING id, client_id, client_type, token_endpoint_auth_method, name, description, logo_uri, status, registration_enabled, created_at, updated_at, version
 `
 
 type UpdateOIDCClientParams struct {
@@ -446,7 +476,7 @@ type UpdateOIDCClientParams struct {
 	RegistrationEnabled bool               `db:"registration_enabled"`
 	UpdatedAt           pgtype.Timestamptz `db:"updated_at"`
 	ID                  uuid.UUID          `db:"id"`
-	ExpectedUpdatedAt   pgtype.Timestamptz `db:"expected_updated_at"`
+	ExpectedVersion     int64              `db:"expected_version"`
 }
 
 func (q *Queries) UpdateOIDCClient(ctx context.Context, arg UpdateOIDCClientParams) (OidcClient, error) {
@@ -458,7 +488,7 @@ func (q *Queries) UpdateOIDCClient(ctx context.Context, arg UpdateOIDCClientPara
 		arg.RegistrationEnabled,
 		arg.UpdatedAt,
 		arg.ID,
-		arg.ExpectedUpdatedAt,
+		arg.ExpectedVersion,
 	)
 	var i OidcClient
 	err := row.Scan(
@@ -473,6 +503,7 @@ func (q *Queries) UpdateOIDCClient(ctx context.Context, arg UpdateOIDCClientPara
 		&i.RegistrationEnabled,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Version,
 	)
 	return i, err
 }

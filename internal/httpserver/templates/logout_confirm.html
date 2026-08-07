@@ -1,0 +1,16 @@
+{{- /* Hosted RP logout confirmation. No RP value or transaction lookup is rendered. */ -}}
+<!doctype html>
+<html lang="{{.Lang}}">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{.Title}}</title></head>
+<body>
+  <main>
+    <h1>{{.Title}}</h1>
+    <p>{{.Message}}</p>
+    <form method="post" action="/oauth2/logout/confirm">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <button type="submit" name="decision" value="confirm">{{.ConfirmLabel}}</button>
+      <button type="submit" name="decision" value="cancel">{{.CancelLabel}}</button>
+    </form>
+  </main>
+</body>
+</html>

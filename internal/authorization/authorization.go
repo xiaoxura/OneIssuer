@@ -41,6 +41,8 @@ var (
 type IssueCommit struct {
 	Transaction        authflow.Transaction
 	UserID             uuid.UUID
+	SessionID          uuid.UUID
+	SessionBindingID   uuid.UUID
 	AuthenticatedAt    time.Time
 	InteractiveConsent bool
 	CodeID             uuid.UUID
@@ -102,10 +104,10 @@ func NewService(repository Repository, randomSource io.Reader, codeTTL time.Dura
 
 // Issue creates one opaque Code and commits it with the transaction/Grant state.
 // A clear Code is returned only after the repository commit succeeds.
-func (s *Service) Issue(ctx context.Context, transaction authflow.Transaction, userID uuid.UUID, authenticatedAt time.Time, interactiveConsent bool, requestID string, now time.Time) (Issued, error) {
+func (s *Service) Issue(ctx context.Context, transaction authflow.Transaction, userID, sessionID, sessionBindingID uuid.UUID, authenticatedAt time.Time, interactiveConsent bool, requestID string, now time.Time) (Issued, error) {
 	now = now.UTC()
 	authenticatedAt = authenticatedAt.UTC()
-	if !validAuthorizationTransaction(transaction) || userID == uuid.Nil || authenticatedAt.IsZero() || authenticatedAt.After(now) ||
+	if !validAuthorizationTransaction(transaction) || userID == uuid.Nil || sessionID == uuid.Nil || sessionBindingID == uuid.Nil || authenticatedAt.IsZero() || authenticatedAt.After(now) ||
 		!now.Before(transaction.ExpiresAt.UTC()) || transaction.ConsumedAt != nil {
 		s.observe("issue", "rejected")
 		return Issued{}, ErrInvalid
@@ -128,7 +130,8 @@ func (s *Service) Issue(ctx context.Context, transaction authflow.Transaction, u
 	}
 	expiresAt := now.Add(s.codeTTL)
 	grant, err := s.repository.IssueAuthorizationCode(ctx, IssueCommit{
-		Transaction: transaction, UserID: userID, AuthenticatedAt: authenticatedAt,
+		Transaction: transaction, UserID: userID, SessionID: sessionID, SessionBindingID: sessionBindingID,
+		AuthenticatedAt:    authenticatedAt,
 		InteractiveConsent: interactiveConsent, CodeID: codeID, CodeHash: HashCode(clearCode),
 		ProposedGrantID: grantID, CreatedAt: now, ExpiresAt: expiresAt, RequestID: requestID,
 	})
@@ -229,7 +232,7 @@ func newCode(source io.Reader) (string, error) {
 func validAuthorizationTransaction(value authflow.Transaction) bool {
 	return value.ID != uuid.Nil && value.Kind == authflow.KindAuthorization && value.ClientID != nil && *value.ClientID != uuid.Nil &&
 		value.ResponseType == "code" && value.ResponseMode == "query" && value.RedirectURI != "" &&
-		value.PKCEMethod == "S256" && len(value.PKCEChallenge) == 43 && len(value.Scopes) >= 1 && len(value.Scopes) <= 3
+		value.PKCEMethod == "S256" && len(value.PKCEChallenge) == 43 && len(value.Scopes) >= 1 && len(value.Scopes) <= 4
 }
 
 func (s *Service) observe(operation, result string) {

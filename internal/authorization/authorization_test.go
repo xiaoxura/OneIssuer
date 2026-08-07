@@ -35,7 +35,7 @@ func TestIssueReturnsClearCodeOnlyAfterDigestCommit(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 8, 1, 2, 3, 4, 0, time.UTC)
 	clientID := uuid.New()
-	grant := consent.Grant{ID: uuid.New(), UserID: uuid.New(), ClientID: clientID, Scopes: []string{"openid"}, CreatedAt: now, UpdatedAt: now}
+	grant := consent.Grant{ID: uuid.New(), UserID: uuid.New(), ClientID: clientID, Scopes: []string{"openid"}, CreatedAt: now, UpdatedAt: now, Version: 1}
 	repository := &captureRepository{grant: grant}
 	randomBytes := bytes.Repeat([]byte{0x42}, 64)
 	service, err := NewService(repository, bytes.NewReader(randomBytes), time.Minute, nil)
@@ -43,7 +43,8 @@ func TestIssueReturnsClearCodeOnlyAfterDigestCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	transaction := testTransaction(clientID, now)
-	issued, err := service.Issue(context.Background(), transaction, grant.UserID, now.Add(-time.Minute), true, "request-1", now)
+	sessionID, bindingID := uuid.New(), uuid.New()
+	issued, err := service.Issue(context.Background(), transaction, grant.UserID, sessionID, bindingID, now.Add(-time.Minute), true, "request-1", now)
 	if err != nil {
 		t.Fatalf("Issue() error = %v", err)
 	}
@@ -53,7 +54,8 @@ func TestIssueReturnsClearCodeOnlyAfterDigestCommit(t *testing.T) {
 	if bytes.Contains(repository.commit.CodeHash, []byte(issued.Code)) || !bytes.Equal(repository.commit.CodeHash, HashCode(issued.Code)) {
 		t.Fatal("repository did not receive only the expected Code digest")
 	}
-	if repository.commit.Transaction.ID != transaction.ID || repository.commit.UserID != grant.UserID || !repository.commit.InteractiveConsent {
+	if repository.commit.Transaction.ID != transaction.ID || repository.commit.UserID != grant.UserID ||
+		repository.commit.SessionID != sessionID || repository.commit.SessionBindingID != bindingID || !repository.commit.InteractiveConsent {
 		t.Fatalf("unexpected commit: %#v", repository.commit)
 	}
 }
@@ -64,7 +66,7 @@ func TestIssueDoesNotReturnCodeWhenCommitFails(t *testing.T) {
 	clientID := uuid.New()
 	repository := &captureRepository{err: ErrConsumed}
 	service, _ := NewService(repository, bytes.NewReader(bytes.Repeat([]byte{1}, 64)), time.Minute, nil)
-	issued, err := service.Issue(context.Background(), testTransaction(clientID, now), uuid.New(), now, false, "", now)
+	issued, err := service.Issue(context.Background(), testTransaction(clientID, now), uuid.New(), uuid.New(), uuid.New(), now, false, "", now)
 	if !errors.Is(err, ErrConsumed) || issued.Code != "" {
 		t.Fatalf("issued=%#v error=%v", issued, err)
 	}

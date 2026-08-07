@@ -12,9 +12,14 @@ import (
 )
 
 type transactionRepository struct {
-	created  Transaction
-	rejected Transaction
-	reason   string
+	created      Transaction
+	rejected     Transaction
+	reason       string
+	expired      int64
+	expireErr    error
+	deleted      int64
+	cleanupErr   error
+	cleanupCalls int
 }
 
 func (r *transactionRepository) CreateAuthTransaction(_ context.Context, value Transaction, _ audit.Event) error {
@@ -38,10 +43,11 @@ func (r *transactionRepository) RejectAuthTransaction(_ context.Context, _ uuid.
 	return r.rejected, nil
 }
 func (r *transactionRepository) ExpireAuthTransactions(context.Context, time.Time) (int64, error) {
-	return 0, nil
+	return r.expired, r.expireErr
 }
 func (r *transactionRepository) CleanupAuthTransactions(context.Context, time.Time) (int64, error) {
-	return 0, nil
+	r.cleanupCalls++
+	return r.deleted, r.cleanupErr
 }
 
 func TestCreateVerifiedPersistsCompleteCanonicalProtocolContext(t *testing.T) {
@@ -89,7 +95,7 @@ func TestCreateVerifiedRejectsIncompleteOrDowngradedContext(t *testing.T) {
 	for _, mutate := range []func(*VerifiedInput){
 		func(value *VerifiedInput) { value.ClientID = uuid.Nil },
 		func(value *VerifiedInput) { value.RedirectURI = "https://rp.example.test/callback#fragment" },
-		func(value *VerifiedInput) { value.Scopes = []string{"openid", "offline_access"} },
+		func(value *VerifiedInput) { value.Scopes = []string{"openid", "unsupported"} },
 		func(value *VerifiedInput) { value.PKCEChallenge = "plain" },
 		func(value *VerifiedInput) { value.ResponseType = "token" },
 		func(value *VerifiedInput) { value.ResponseMode = "fragment" },
@@ -106,5 +112,23 @@ func TestCreateVerifiedRejectsIncompleteOrDowngradedContext(t *testing.T) {
 		if _, _, err := service.CreateVerified(context.Background(), input, "request", time.Now()); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("invalid input %+v error=%v", input, err)
 		}
+	}
+}
+
+func TestCleanupRetainsCommittedExpiryProgress(t *testing.T) {
+	t.Parallel()
+
+	expireErr := errors.New("later expiry batch failed")
+	repository := &transactionRepository{expired: 250, expireErr: expireErr}
+	service, err := NewService(repository, bytes.NewReader(bytes.Repeat([]byte{3}, 64)), time.Minute, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, err := service.Cleanup(context.Background(), time.Unix(1000, 0))
+	if count != 250 || !errors.Is(err, expireErr) {
+		t.Fatalf("Cleanup() count=%d error=%v, want committed count 250 and expiry error", count, err)
+	}
+	if repository.cleanupCalls != 0 {
+		t.Fatalf("CleanupAuthTransactions() calls=%d after expiry failure, want 0", repository.cleanupCalls)
 	}
 }

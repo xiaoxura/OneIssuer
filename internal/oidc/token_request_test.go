@@ -56,8 +56,53 @@ func TestParseTokenRequestPublicAndConfidential(t *testing.T) {
 			want = resolver.confidential.ID
 		}
 		if parsed.Client.ID != want || len(parsed.CodeHash) != 32 || parsed.CodeVerifier == "" {
-			t.Fatalf("confidential=%v parsed=%#v", confidential, parsed)
+			t.Fatalf("confidential=%v parsed client=%s code_hash=%d verifier_len=%d", confidential, parsed.Client.ID, len(parsed.CodeHash), len(parsed.CodeVerifier))
 		}
+	}
+}
+
+func TestParseTokenRequestRefreshPublicAndConfidential(t *testing.T) {
+	t.Parallel()
+	resolver := tokenResolverFixture()
+	tests := []struct {
+		name       string
+		clientID   string
+		authorize  string
+		wantClient uuid.UUID
+	}{
+		{name: "public", clientID: resolver.public.ClientID, wantClient: resolver.public.ID},
+		{name: "confidential", clientID: resolver.confidential.ClientID, authorize: basicHeader(resolver.confidential.ClientID, resolver.secret), wantClient: resolver.confidential.ID},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			form := validRefreshForm(test.clientID)
+			header := make(http.Header)
+			if test.authorize != "" {
+				form.Del("client_id")
+				header.Set("Authorization", test.authorize)
+			}
+			parsed, err := ParseTokenRequest(context.Background(), form, header, resolver)
+			if err != nil {
+				t.Fatalf("ParseTokenRequest() error = %v", err)
+			}
+			if parsed.GrantType != "refresh_token" || parsed.Client.ID != test.wantClient || len(parsed.RefreshTokenHash) != 32 || len(parsed.CodeHash) != 0 || parsed.RedirectURI != "" || parsed.CodeVerifier != "" || form.Get("code") != "" {
+				t.Fatalf("parsed refresh request violated boundary: grant=%q client=%s refresh_hash=%d code_hash=%d redirect=%q verifier=%q", parsed.GrantType, parsed.Client.ID, len(parsed.RefreshTokenHash), len(parsed.CodeHash), parsed.RedirectURI, parsed.CodeVerifier)
+			}
+		})
+	}
+}
+
+func TestParseTokenRequestRefreshRejectsMultipleAuthenticationChannels(t *testing.T) {
+	t.Parallel()
+	resolver := tokenResolverFixture()
+	form := validRefreshForm(resolver.public.ClientID)
+	header := make(http.Header)
+	header.Set("Authorization", basicHeader(resolver.confidential.ClientID, resolver.secret))
+	_, err := ParseTokenRequest(context.Background(), form, header, resolver)
+	var protocolError *TokenError
+	if !errors.As(err, &protocolError) || protocolError.Code != "invalid_client" || !protocolError.BasicChallenge {
+		t.Fatalf("error=%#v want invalid_client with Basic challenge", err)
 	}
 }
 
@@ -70,7 +115,7 @@ func TestParseTokenRequestNegativeMatrix(t *testing.T) {
 		wantCode  string
 		challenge bool
 	}{
-		{name: "refresh unsupported", mutate: func(v url.Values, _ http.Header) { v.Set("grant_type", "refresh_token") }, wantCode: "unsupported_grant_type"},
+		{name: "refresh mixed with code parameters", mutate: func(v url.Values, _ http.Header) { v.Set("grant_type", "refresh_token") }, wantCode: "invalid_request"},
 		{name: "duplicate code", mutate: func(v url.Values, _ http.Header) { v.Add("code", v.Get("code")) }, wantCode: "invalid_request"},
 		{name: "missing redirect", mutate: func(v url.Values, _ http.Header) { v.Del("redirect_uri") }, wantCode: "invalid_request"},
 		{name: "wrong code version", mutate: func(v url.Values, _ http.Header) { v.Set("code", "c2_invalid") }, wantCode: "invalid_grant"},
@@ -134,6 +179,14 @@ func validTokenForm(clientID string) url.Values {
 	return url.Values{
 		"grant_type": {"authorization_code"}, "code": {code},
 		"redirect_uri": {"https://rp.example/cb"}, "code_verifier": {verifier}, "client_id": {clientID},
+	}
+}
+
+func validRefreshForm(clientID string) url.Values {
+	// The all-zero payload is a valid-shape placeholder, never a live token.
+	refresh := "r1_" + base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	return url.Values{
+		"grant_type": {"refresh_token"}, "refresh_token": {refresh}, "client_id": {clientID},
 	}
 }
 

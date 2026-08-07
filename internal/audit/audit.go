@@ -20,7 +20,7 @@ type Result string
 // TargetType identifies the kind of resource affected by an event.
 type TargetType string
 
-// Supported fixed security event types through phase three.
+// Supported fixed security event types through phase four.
 const (
 	AdminBootstrapSucceeded            EventType = "admin_bootstrap_succeeded"
 	AdminBootstrapRejected             EventType = "admin_bootstrap_rejected"
@@ -53,6 +53,16 @@ const (
 	ConsentGrantExpanded               EventType = "consent_grant_expanded"
 	AccessTokenIssued                  EventType = "access_token_issued"
 	SigningKeyLoaded                   EventType = "signing_key_loaded"
+	RefreshTokenIssued                 EventType = "refresh_token_issued"
+	RefreshTokenRotated                EventType = "refresh_token_rotated"
+	RefreshTokenExchangeRejected       EventType = "refresh_token_exchange_rejected"
+	RefreshTokenReuseDetected          EventType = "refresh_token_reuse_detected"
+	RefreshTokenFamilyRevoked          EventType = "refresh_token_family_revoked"
+	AccessTokenRevoked                 EventType = "access_token_revoked"
+	ConsentGrantRevoked                EventType = "consent_grant_revoked"
+	ConsentGrantReactivated            EventType = "consent_grant_reactivated"
+	RPLogoutCompleted                  EventType = "rp_logout_completed"
+	LogoutTransactionRejected          EventType = "logout_transaction_rejected"
 )
 
 // Supported audit result classifications.
@@ -71,6 +81,9 @@ const (
 	TargetConsentGrant      TargetType = "consent_grant"
 	TargetAuthorizationCode TargetType = "authorization_code"
 	TargetAccessToken       TargetType = "access_token"
+	TargetRefreshToken      TargetType = "refresh_token"
+	TargetRefreshFamily     TargetType = "refresh_token_family"
+	TargetLogoutTransaction TargetType = "logout_transaction"
 )
 
 var (
@@ -89,13 +102,18 @@ var (
 		string(AuthorizationGranted), string(AuthorizationDenied), string(AuthorizationCodeIssued),
 		string(AuthorizationCodeExchangeSucceeded), string(AuthorizationCodeExchangeRejected),
 		string(ConsentGrantCreated), string(ConsentGrantExpanded), string(AccessTokenIssued), string(SigningKeyLoaded),
+		string(RefreshTokenIssued), string(RefreshTokenRotated), string(RefreshTokenExchangeRejected),
+		string(RefreshTokenReuseDetected), string(RefreshTokenFamilyRevoked), string(AccessTokenRevoked),
+		string(ConsentGrantRevoked), string(ConsentGrantReactivated), string(RPLogoutCompleted),
+		string(LogoutTransactionRejected),
 	)
 	validResults       = set(string(ResultSuccess), string(ResultRejected), string(ResultFailure))
-	validTargets       = set(string(TargetUser), string(TargetClient), string(TargetSession), string(TargetAuthTransaction), string(TargetConsentGrant), string(TargetAuthorizationCode), string(TargetAccessToken))
+	validTargets       = set(string(TargetUser), string(TargetClient), string(TargetSession), string(TargetAuthTransaction), string(TargetConsentGrant), string(TargetAuthorizationCode), string(TargetAccessToken), string(TargetRefreshToken), string(TargetRefreshFamily), string(TargetLogoutTransaction))
 	validChangedFields = set(
 		"status", "role", "username", "display_name", "email", "name", "description",
 		"logo_uri", "registration_enabled", "redirect_uris", "logout_uris", "scopes",
 		"secret", "revoked", "created", "expanded", "issued", "consumed",
+		"rotated", "reused", "reactivated",
 	)
 )
 

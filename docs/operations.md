@@ -1,8 +1,8 @@
-# Phase-three operations
+# Phase-four operations
 
 This guide covers release sequencing, first-administrator Bootstrap, endpoint
 exposure, backups, restore rehearsal, protocol delivery semantics, cleanup, and
-incident actions for OneIssuer `v0.1.0-dev.3`. It is a development release; adapt
+incident actions for OneIssuer `v0.1.0-dev.4`. It is a development release; adapt
 these controls to a reviewed production platform rather than exposing the local
 Compose file.
 
@@ -15,15 +15,16 @@ Use one migration actor and never let `serve` own schema changes:
 
 1. build and verify the exact immutable image, migration checksums, SBOM, and
    vulnerability report;
-2. validate the canonical HTTPS Issuer, Client Redirect URIs, database TLS,
-   cookies, trusted proxies, and explicit registration policy;
+2. validate the canonical HTTPS Issuer, Client Redirect URIs, an explicit
+   PostgreSQL `sslmode=verify-full` URL for both migration and service jobs,
+   cookies, trusted proxies, authentication rate budgets, and registration policy;
 3. stage the active private JWK and public overlap JWKS with the required file
    ownership/permissions, without placing private material in the image;
 4. take and verify an encrypted PostgreSQL backup; independently verify the
    protected signing-key backup/escrow policy;
 5. stop incompatible writers, run `oneissuer migrate status`, then one
    `oneissuer migrate up`;
-6. run status/version again (expected phase-three version: **10**);
+6. run status/version again (expected Phase-four schema version: **15**);
 7. run `oneissuer config check` in the exact service identity/mount namespace;
 8. Bootstrap only for a new installation;
 9. start replicas and wait for `/health/ready`;
@@ -36,9 +37,15 @@ before opening the listener. Key, database, migration, or Audit failure is fatal
 `/health/ready` subsequently fails during a database outage while liveness stays
 available.
 
-Version 10 is not backward-compatible with a phase-two binary expecting version
-5. Restore the pre-upgrade database for a true rollback; do not run production
+Version 14 is not backward-compatible with a phase-three binary expecting version
+11. Restore the pre-upgrade database for a true rollback; do not run production
 Down migrations or force the old binary to ignore the schema.
+
+The shipped Compose file is a local-development manifest. If it is used as a
+reviewed deployment input, set `ONEISSUER_COMPOSE_DATABASE_URL` to the complete
+container-reachable TLS URL; that exact value is shared by `migrate` and
+`oneissuer`. Setting `ONEISSUER_ENV=production` while retaining the local
+`sslmode=disable` default intentionally fails both jobs.
 
 ## First administrator Bootstrap
 
@@ -100,7 +107,8 @@ At the reverse proxy:
 - set `ONEISSUER_TRUSTED_PROXIES` only to direct proxy networks;
 - preserve the external origin without allowing request headers to rewrite the
   configured Issuer;
-- expose Discovery, JWKS, Authorize, Token, and UserInfo only under the fixed
+- expose Discovery, JWKS, Authorize, Token, UserInfo, Revocation, Introspection,
+  and RP-Initiated Logout only under the fixed
   Issuer paths;
 - restrict `/metrics`, PostgreSQL, and administrator routes with network policy
   where practical;
@@ -111,6 +119,9 @@ At the reverse proxy:
   `Pragma`, `ETag`, `WWW-Authenticate`, and security headers;
 - set request/body/header/time limits at least as strict as the reviewed service
   envelope without truncating valid OAuth form encoding;
+- retain an edge/distributed authentication limiter. The built-in per-IP/global
+  buckets and five-attempt form budget protect one process but are not a cluster-
+  wide reputation or bot-control system;
 - never add permissive CORS around password, protocol, or management endpoints.
 
 Monitor a complete synthetic Code Flow, not only health. Check that Discovery
@@ -195,7 +206,10 @@ them invalid. Revoke/rotate/reconcile before reopening traffic.
 
 The cancellable cleanup loop runs every `ONEISSUER_CLEANUP_INTERVAL`. Expiry is
 enforced on reads and exchanges first, so a late/failed cleanup does not extend
-authority.
+authority. Session, authorization-transaction, protocol-artifact, and active-
+session-count work each receive a fresh five-second context. Storage mutations
+select at most 250 rows with `FOR UPDATE SKIP LOCKED` and commit every batch
+independently, so a later deadline preserves and reports earlier progress.
 
 | Data | Application behavior |
 | --- | --- |
@@ -205,7 +219,9 @@ authority.
 | terminal authorization transaction | deleted after 24 hours |
 | Authorization Code metadata | deleted no earlier than 24 hours after expiry |
 | Access Token metadata | deleted no earlier than 24 hours after expiry |
-| Consent Grant | retained; no phase-three self-service revoke/delete |
+| Consent Grant | retained; revoked rows/version remain owner-visible and require interactive re-consent |
+| Refresh family/digest | retained through absolute expiry plus reuse-evidence window; cleanup never restores authority |
+| Logout transaction | active rows through TTL; terminal rows at least 24 hours before bounded cleanup |
 | Users, credentials, Clients | retained; disabled rather than deleted |
 | Audit event | retained indefinitely; no application delete/update API |
 
@@ -223,16 +239,20 @@ Never silently truncate Audit events to solve capacity pressure.
 
 Monitor table/index size, cleanup failures, available storage, request results,
 Code exchange failures, UserInfo failures, key-load readiness, and PostgreSQL pool
-pressure. Metric labels are intentionally low-cardinality and cannot identify a
-specific User, Client, Code, Token, or key.
+pressure. In particular alert on `oneissuer_audit_write_failures_total` and on
+`oneissuer_cleanup_operations_total{result="failure"}`, and correlate cleanup
+progress with `oneissuer_cleanup_rows_total` and
+`oneissuer_cleanup_duration_seconds`. A failed later batch may legitimately
+increase both the failure operation counter and committed-row counter. Metric
+labels are intentionally fixed/low-cardinality and cannot identify a specific
+User, Client, Code, Token, key, or submitted parameter.
 
 ## Secret and incident actions
 
 - **Lost one-time Client Secret:** rotate; it cannot be read back.
 - **Suspected Client Secret compromise:** rotate atomically, update the RP, and
-  inspect fixed Audit events. Existing Access Tokens cannot be individually
-  revoked in phase three; disable the Client if immediate fail-closed UserInfo is
-  required.
+  inspect fixed Audit events. Revoke owning Access/Refresh values when possible;
+  disabling the Client remains the broad fail-closed containment action.
 - **Suspected Session theft:** revoke the Session or all User Sessions; disabling
   the User invalidates remaining Sessions and UserInfo immediately.
 - **Suspected signing-key compromise:** execute the emergency procedure in the
@@ -248,7 +268,8 @@ specific User, Client, Code, Token, or key.
 - **Database unavailable:** readiness and authority operations fail closed. Do not
   bypass PostgreSQL with cached/in-memory identity or metadata.
 
-Phase three has no Refresh Token, Revocation, Introspection, or RP Logout. Do not
-promise global instantaneous Token invalidation or create ad hoc database edits
-that imitate those lifecycles. Never add credential or private-key material to an
-incident ticket or diagnostic log.
+Refresh reuse, owning revocation, Grant/Session cascade, and User/Client disable
+are fail-closed in PostgreSQL. JWT signature caches still mean that external
+verifiers cannot be promised global instantaneous invalidation; OneIssuer
+UserInfo and Introspection observe authoritative state immediately. Never add
+credential or private-key material to an incident ticket or diagnostic log.

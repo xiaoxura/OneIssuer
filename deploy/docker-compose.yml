@@ -4,7 +4,7 @@ x-oneissuer-build: &oneissuer-build
   context: ..
   dockerfile: Dockerfile
   args:
-    VERSION: ${ONEISSUER_VERSION:-v0.1.0-dev.3}
+    VERSION: ${ONEISSUER_VERSION:-v0.1.0-dev.4}
     COMMIT: ${ONEISSUER_COMMIT:-local}
     BUILD_TIME: ${ONEISSUER_BUILD_TIME:-local}
     GOPROXY: ${ONEISSUER_BUILD_GOPROXY:-https://proxy.golang.org,direct}
@@ -13,13 +13,13 @@ x-example-build: &example-build
   context: ..
   dockerfile: examples/oidc-client/Dockerfile
   args:
-    VERSION: ${ONEISSUER_VERSION:-v0.1.0-dev.3}
+    VERSION: ${ONEISSUER_VERSION:-v0.1.0-dev.4}
     COMMIT: ${ONEISSUER_COMMIT:-local}
     GOPROXY: ${ONEISSUER_BUILD_GOPROXY:-https://proxy.golang.org,direct}
 
 services:
   postgres:
-    image: postgres:17.5-alpine3.22
+    image: postgres:17.10-alpine3.23@sha256:8189a1f6e40904781fc9e2612687877791d21679866db58b1de996b31fc312e4
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-oneissuer}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-oneissuer-local-only}
@@ -38,10 +38,11 @@ services:
 
   migrate:
     build: *oneissuer-build
-    image: oneissuer:${ONEISSUER_VERSION:-v0.1.0-dev.3}
+    image: oneissuer:${ONEISSUER_VERSION:-v0.1.0-dev.4}
     command: ["migrate", "up"]
     environment:
-      ONEISSUER_DATABASE_URL: postgresql://${POSTGRES_USER:-oneissuer}:${POSTGRES_PASSWORD:-oneissuer-local-only}@postgres:5432/${POSTGRES_DB:-oneissuer}?sslmode=disable
+      ONEISSUER_ENV: ${ONEISSUER_ENV:-development}
+      ONEISSUER_DATABASE_URL: "${ONEISSUER_COMPOSE_DATABASE_URL:-postgresql://${POSTGRES_USER:-oneissuer}:${POSTGRES_PASSWORD:-oneissuer-local-only}@postgres:5432/${POSTGRES_DB:-oneissuer}?sslmode=disable}"
       ONEISSUER_DATABASE_MAX_CONNS: ${ONEISSUER_DATABASE_MAX_CONNS:-10}
     depends_on:
       postgres:
@@ -53,12 +54,12 @@ services:
 
   oneissuer:
     build: *oneissuer-build
-    image: oneissuer:${ONEISSUER_VERSION:-v0.1.0-dev.3}
+    image: oneissuer:${ONEISSUER_VERSION:-v0.1.0-dev.4}
     environment:
       ONEISSUER_ENV: ${ONEISSUER_ENV:-development}
       ONEISSUER_ISSUER: ${ONEISSUER_ISSUER:-http://localhost:8080}
       ONEISSUER_HTTP_ADDR: :8080
-      ONEISSUER_DATABASE_URL: postgresql://${POSTGRES_USER:-oneissuer}:${POSTGRES_PASSWORD:-oneissuer-local-only}@postgres:5432/${POSTGRES_DB:-oneissuer}?sslmode=disable
+      ONEISSUER_DATABASE_URL: "${ONEISSUER_COMPOSE_DATABASE_URL:-postgresql://${POSTGRES_USER:-oneissuer}:${POSTGRES_PASSWORD:-oneissuer-local-only}@postgres:5432/${POSTGRES_DB:-oneissuer}?sslmode=disable}"
       ONEISSUER_DATABASE_MAX_CONNS: ${ONEISSUER_DATABASE_MAX_CONNS:-10}
       ONEISSUER_SIGNING_KEY_FILE: /run/secrets/oneissuer-signing-key.jwk
       ONEISSUER_VERIFICATION_KEYS_FILE: ${ONEISSUER_VERIFICATION_KEYS_FILE:-}
@@ -66,6 +67,15 @@ services:
       ONEISSUER_ID_TOKEN_TTL: ${ONEISSUER_ID_TOKEN_TTL:-5m}
       ONEISSUER_ACCESS_TOKEN_TTL: ${ONEISSUER_ACCESS_TOKEN_TTL:-10m}
       ONEISSUER_OIDC_CLOCK_SKEW: ${ONEISSUER_OIDC_CLOCK_SKEW:-30s}
+      ONEISSUER_REFRESH_TOKEN_TTL: ${ONEISSUER_REFRESH_TOKEN_TTL:-720h}
+      ONEISSUER_REFRESH_TOKEN_ABSOLUTE_TTL: ${ONEISSUER_REFRESH_TOKEN_ABSOLUTE_TTL:-2160h}
+      ONEISSUER_LOGOUT_TRANSACTION_TTL: ${ONEISSUER_LOGOUT_TRANSACTION_TTL:-5m}
+      ONEISSUER_LOGOUT_MAX_ACTIVE_PER_SESSION: ${ONEISSUER_LOGOUT_MAX_ACTIVE_PER_SESSION:-3}
+      ONEISSUER_LOGOUT_ID_TOKEN_HINT_MAX_AGE: ${ONEISSUER_LOGOUT_ID_TOKEN_HINT_MAX_AGE:-24h}
+      ONEISSUER_OAUTH_RATE_PER_MINUTE: ${ONEISSUER_OAUTH_RATE_PER_MINUTE:-120}
+      ONEISSUER_OAUTH_RATE_BURST: ${ONEISSUER_OAUTH_RATE_BURST:-30}
+      ONEISSUER_OAUTH_GLOBAL_RATE_PER_SECOND: ${ONEISSUER_OAUTH_GLOBAL_RATE_PER_SECOND:-100}
+      ONEISSUER_OAUTH_GLOBAL_BURST: ${ONEISSUER_OAUTH_GLOBAL_BURST:-200}
       ONEISSUER_LOG_LEVEL: ${ONEISSUER_LOG_LEVEL:-info}
       ONEISSUER_LOG_FORMAT: ${ONEISSUER_LOG_FORMAT:-json}
       ONEISSUER_SHUTDOWN_TIMEOUT: ${ONEISSUER_SHUTDOWN_TIMEOUT:-15s}
@@ -83,6 +93,10 @@ services:
       ONEISSUER_AUTH_TRANSACTION_TTL: ${ONEISSUER_AUTH_TRANSACTION_TTL:-10m}
       ONEISSUER_LOGIN_REAUTH_WINDOW: ${ONEISSUER_LOGIN_REAUTH_WINDOW:-15m}
       ONEISSUER_CLEANUP_INTERVAL: ${ONEISSUER_CLEANUP_INTERVAL:-5m}
+      ONEISSUER_AUTH_RATE_PER_MINUTE: ${ONEISSUER_AUTH_RATE_PER_MINUTE:-20}
+      ONEISSUER_AUTH_RATE_BURST: ${ONEISSUER_AUTH_RATE_BURST:-10}
+      ONEISSUER_AUTH_GLOBAL_RATE_PER_SECOND: ${ONEISSUER_AUTH_GLOBAL_RATE_PER_SECOND:-50}
+      ONEISSUER_AUTH_GLOBAL_BURST: ${ONEISSUER_AUTH_GLOBAL_BURST:-100}
       ONEISSUER_REGISTRATION_ENABLED: ${ONEISSUER_REGISTRATION_ENABLED:-false}
       ONEISSUER_PASSWORD_MIN_LENGTH: ${ONEISSUER_PASSWORD_MIN_LENGTH:-15}
       ONEISSUER_PASSWORD_MAX_BYTES: ${ONEISSUER_PASSWORD_MAX_BYTES:-1024}
@@ -121,7 +135,7 @@ services:
   client-a:
     profiles: ["oidc-demo"]
     build: *example-build
-    image: oneissuer-oidc-example:${ONEISSUER_VERSION:-v0.1.0-dev.3}
+    image: oneissuer-oidc-example:${ONEISSUER_VERSION:-v0.1.0-dev.4}
     environment:
       EXAMPLE_NAME: OneIssuer Client A (Public)
       EXAMPLE_HTTP_ADDR: :8080
@@ -129,7 +143,8 @@ services:
       EXAMPLE_PROVIDER_BACKCHANNEL: http://oneissuer:8080
       EXAMPLE_CLIENT_ID: ${EXAMPLE_CLIENT_A_ID:-}
       EXAMPLE_REDIRECT_URI: ${EXAMPLE_CLIENT_A_REDIRECT_URI:-http://127.0.0.1:8081/callback}
-      EXAMPLE_SCOPES: openid profile email
+      EXAMPLE_SCOPES: openid profile email offline_access
+      EXAMPLE_POST_LOGOUT_REDIRECT_URI: ${EXAMPLE_CLIENT_A_POST_LOGOUT_REDIRECT_URI:-http://127.0.0.1:8081/logged-out}
       EXAMPLE_COOKIE_NAME: oneissuer_example_a
       EXAMPLE_COOKIE_SECURE: "false"
     ports:
@@ -152,7 +167,7 @@ services:
   client-b:
     profiles: ["oidc-demo"]
     build: *example-build
-    image: oneissuer-oidc-example:${ONEISSUER_VERSION:-v0.1.0-dev.3}
+    image: oneissuer-oidc-example:${ONEISSUER_VERSION:-v0.1.0-dev.4}
     environment:
       EXAMPLE_NAME: OneIssuer Client B (Confidential)
       EXAMPLE_HTTP_ADDR: :8080
@@ -161,7 +176,8 @@ services:
       EXAMPLE_CLIENT_ID: ${EXAMPLE_CLIENT_B_ID:-}
       EXAMPLE_CLIENT_SECRET_FILE: /run/secrets/example-client-b-secret
       EXAMPLE_REDIRECT_URI: ${EXAMPLE_CLIENT_B_REDIRECT_URI:-http://127.0.0.1:8082/callback}
-      EXAMPLE_SCOPES: openid profile email
+      EXAMPLE_SCOPES: openid profile email offline_access
+      EXAMPLE_POST_LOGOUT_REDIRECT_URI: ${EXAMPLE_CLIENT_B_POST_LOGOUT_REDIRECT_URI:-http://127.0.0.1:8082/logged-out}
       EXAMPLE_COOKIE_NAME: oneissuer_example_b
       EXAMPLE_COOKIE_SECURE: "false"
     volumes:

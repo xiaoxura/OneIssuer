@@ -59,7 +59,7 @@ func (m *TokenManager) NewAuthenticated(userID uuid.UUID, now time.Time, userAge
 	return Issued{
 		Token: token, CSRFToken: csrf,
 		Record: Record{
-			ID: id, UserID: userID, TokenHash: HashToken(token), CSRFHash: HashCSRF(csrf),
+			ID: id, UserID: userID, SessionBindingID: id, TokenHash: HashToken(token), CSRFHash: HashCSRF(csrf),
 			CSRFExpiresAt: now.Add(m.csrfTTL), CreatedAt: now, LastSeenAt: now,
 			AuthenticatedAt: now, ExpiresAt: expires, IdleExpiresAt: idleExpires,
 			UserAgentHash: hashOptional("oneissuer:user-agent:v1:", userAgent),

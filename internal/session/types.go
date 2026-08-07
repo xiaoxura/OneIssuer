@@ -24,18 +24,19 @@ var (
 // Record is the database-safe representation of a newly issued authenticated
 // session. It contains hashes only, never browser tokens.
 type Record struct {
-	ID              uuid.UUID
-	UserID          uuid.UUID
-	TokenHash       []byte
-	CSRFHash        []byte
-	CSRFExpiresAt   time.Time
-	CreatedAt       time.Time
-	LastSeenAt      time.Time
-	AuthenticatedAt time.Time
-	ExpiresAt       time.Time
-	IdleExpiresAt   time.Time
-	UserAgentHash   []byte
-	IPPrefix        string
+	ID               uuid.UUID
+	UserID           uuid.UUID
+	SessionBindingID uuid.UUID
+	TokenHash        []byte
+	CSRFHash         []byte
+	CSRFExpiresAt    time.Time
+	CreatedAt        time.Time
+	LastSeenAt       time.Time
+	AuthenticatedAt  time.Time
+	ExpiresAt        time.Time
+	IdleExpiresAt    time.Time
+	UserAgentHash    []byte
+	IPPrefix         string
 }
 
 // Issued contains values that may be sent to the browser exactly once and the
@@ -55,6 +56,7 @@ type PreAuthRecord struct {
 	CreatedAt         time.Time
 	ExpiresAt         time.Time
 	ConsumedAt        *time.Time
+	AttemptCount      int16
 }
 
 // IssuedPreAuth is write-only browser material plus its hash-only record.
@@ -67,16 +69,17 @@ type IssuedPreAuth struct {
 // Principal is resolved from a server-side session on every authenticated
 // request; current user status is therefore never cached solely in a cookie.
 type Principal struct {
-	SessionID       uuid.UUID
-	User            identity.User
-	CSRFHash        []byte
-	CSRFExpiresAt   time.Time
-	CreatedAt       time.Time
-	LastSeenAt      time.Time
-	AuthenticatedAt time.Time
-	ExpiresAt       time.Time
-	IdleExpiresAt   time.Time
-	RevokedAt       *time.Time
+	SessionID        uuid.UUID
+	SessionBindingID uuid.UUID
+	User             identity.User
+	CSRFHash         []byte
+	CSRFExpiresAt    time.Time
+	CreatedAt        time.Time
+	LastSeenAt       time.Time
+	AuthenticatedAt  time.Time
+	ExpiresAt        time.Time
+	IdleExpiresAt    time.Time
+	RevokedAt        *time.Time
 }
 
 // Summary is safe for current-user/admin list responses.

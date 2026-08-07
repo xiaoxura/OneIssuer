@@ -1,9 +1,9 @@
 # Signing-key generation and rotation runbook
 
-OneIssuer `v0.1.0-dev.3` has one active file-backed RS256 private key and an
+OneIssuer `v0.1.0-dev.4` has one active file-backed RS256 private key and an
 optional public-only verification JWKS. It loads an immutable ring at process
 startup; there is no hot reload, online rotation, KMS/HSM adapter, or automatic
-key lifecycle in phase three.
+key lifecycle in phase four.
 
 This runbook separates a planned overlap rotation from emergency compromise
 response. Adapt paths and secret-mount mechanics to the deployment platform.
@@ -246,8 +246,9 @@ Consequences must be explicit:
 - external verifiers may continue trusting a cached old JWKS for up to roughly
   the advertised five-minute cache lifetime (or longer if they violate headers);
 - live legitimate Tokens signed by the removed key are intentionally broken;
-- phase three has no Revocation or Introspection endpoint and cannot promise
-  global instantaneous invalidation.
+- JWTs presented to external resource servers cannot be globally invalidated
+  instantly; OneIssuer UserInfo and restricted Introspection observe persisted
+  Revocation and lifecycle state immediately.
 
 Do not keep a suspected key in the overlap ring merely to avoid user disruption.
 

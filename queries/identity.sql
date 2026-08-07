@@ -50,7 +50,7 @@ SELECT EXISTS (
 SELECT
     u.id, u.subject, u.username, u.username_normalized, u.display_name,
     u.email, u.email_normalized, u.email_verified, u.status, u.role,
-    u.created_at, u.updated_at, u.last_login_at,
+    u.created_at, u.updated_at, u.last_login_at, u.version,
     c.password_hash, c.updated_at AS credential_updated_at
 FROM users AS u
 JOIN credentials AS c ON c.user_id = u.id AND c.credential_type = 'password'
@@ -74,8 +74,9 @@ UPDATE users SET
     email_normalized = sqlc.arg(email_normalized),
     status = sqlc.arg(status),
     role = sqlc.arg(role),
-    updated_at = sqlc.arg(updated_at)
-WHERE id = sqlc.arg(id) AND updated_at = sqlc.arg(expected_updated_at)
+    updated_at = sqlc.arg(updated_at),
+    version = version + 1
+WHERE id = sqlc.arg(id) AND version = sqlc.arg(expected_version)
 RETURNING *;
 
 -- name: UpdateCredentialHash :exec

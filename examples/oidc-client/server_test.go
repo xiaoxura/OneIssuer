@@ -8,11 +8,14 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -66,18 +69,95 @@ func TestBeginLoginKeepsStateNonceAndVerifierServerSide(t *testing.T) {
 	}
 }
 
-func TestCallbackValidatesTokensCallsUserInfoAndStoresOnlyJITIdentity(t *testing.T) {
+func TestRPLogoutUsesServerStateAndDestroysSessionOnlyAfterVerifiedReturn(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.August, 3, 12, 0, 0, 0, time.UTC)
+	cfg := exampleTestConfig(t, "http://127.0.0.1:9000")
+	metadata := exampleTestMetadata(cfg.Issuer.String())
+	sessions := newMemorySessions(rand.Reader)
+	sessionValue, err := sessions.create(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionValue.Identity = &jitIdentity{Key: "jit1_test", Issuer: cfg.Issuer.String(), Subject: "subject", Name: "Alice", SignedIn: now}
+	sessionValue.IDToken = "eyJhbGciOiJSUzI1NiJ9.hint.signature"
+	if err := sessions.save(sessionValue, now); err != nil {
+		t.Fatal(err)
+	}
+	application, err := newExampleApplication(cfg, metadata, &http.Client{Timeout: time.Second}, sessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	application.now = func() time.Time { return now }
+
+	logoutBody := url.Values{"csrf_token": {sessionValue.CSRFToken}}.Encode()
+	logoutRequest := httptest.NewRequest(http.MethodPost, "/logout", strings.NewReader(logoutBody))
+	logoutRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	logoutRequest.Header.Set("Origin", "http://127.0.0.1:8081")
+	logoutRequest.Header.Set("Referer", "http://127.0.0.1:8081/")
+	logoutRequest.AddCookie(&http.Cookie{Name: cfg.CookieName, Value: sessionValue.ID})
+	logoutResponse := httptest.NewRecorder()
+	application.ServeHTTP(logoutResponse, logoutRequest)
+	if logoutResponse.Code != http.StatusOK || !strings.Contains(logoutResponse.Body.String(), `method="post"`) ||
+		!strings.Contains(logoutResponse.Body.String(), `name="id_token_hint"`) || !strings.Contains(logoutResponse.Body.String(), sessionValue.IDToken) {
+		t.Fatalf("logout form status=%d body=%s", logoutResponse.Code, logoutResponse.Body)
+	}
+	stateMatch := regexp.MustCompile(`name="state" value="([^"]+)"`).FindStringSubmatch(logoutResponse.Body.String())
+	if len(stateMatch) != 2 || !strings.HasPrefix(stateMatch[1], "logout_") {
+		t.Fatalf("logout state was not rendered in the form: %s", logoutResponse.Body)
+	}
+	state := stateMatch[1]
+	chunkedRequest := httptest.NewRequest(http.MethodPost, "/logout", io.NopCloser(strings.NewReader("unexpected=body")))
+	chunkedRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	chunkedRequest.Header.Set("Origin", "http://127.0.0.1:8081")
+	chunkedRequest.Header.Set("Referer", "http://127.0.0.1:8081/")
+	chunkedRequest.AddCookie(&http.Cookie{Name: cfg.CookieName, Value: sessionValue.ID})
+	chunkedResponse := httptest.NewRecorder()
+	application.ServeHTTP(chunkedResponse, chunkedRequest)
+	if chunkedResponse.Code != http.StatusBadRequest {
+		t.Fatalf("chunked logout body status=%d, want %d", chunkedResponse.Code, http.StatusBadRequest)
+	}
+
+	badReturn := httptest.NewRequest(http.MethodGet, "/logged-out?state=logout_wrong", nil)
+	badReturn.AddCookie(&http.Cookie{Name: cfg.CookieName, Value: sessionValue.ID})
+	badResponse := httptest.NewRecorder()
+	application.ServeHTTP(badResponse, badReturn)
+	if badResponse.Code != http.StatusBadRequest {
+		t.Fatalf("bad logout state status=%d", badResponse.Code)
+	}
+	if _, ok := sessions.get(sessionValue.ID, now); !ok {
+		t.Fatal("bad logout state destroyed the RP session")
+	}
+
+	goodReturn := httptest.NewRequest(http.MethodGet, "/logged-out?state="+url.QueryEscape(state), nil)
+	goodReturn.AddCookie(&http.Cookie{Name: cfg.CookieName, Value: sessionValue.ID})
+	goodResponse := httptest.NewRecorder()
+	application.ServeHTTP(goodResponse, goodReturn)
+	if goodResponse.Code != http.StatusSeeOther || goodResponse.Header().Get("Location") != "/" {
+		t.Fatalf("good logout return status=%d headers=%v", goodResponse.Code, goodResponse.Header())
+	}
+	if _, ok := sessions.get(sessionValue.ID, now); ok {
+		t.Fatal("verified logout state did not destroy the RP session")
+	}
+	cleared := goodResponse.Result().Cookies()
+	if len(cleared) != 1 || cleared[0].Name != cfg.CookieName || cleared[0].MaxAge >= 0 {
+		t.Fatalf("logout cookie was not cleared: %+v", cleared)
+	}
+}
+
+func TestCallbackValidatesTokensCallsUserInfoAndStoresSessionCredentialsServerSide(t *testing.T) {
 	t.Parallel()
 	private := exampleTestRSAKey(t)
 	kid := exampleTestKID(private)
 	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
 	const (
-		state       = "state_server_side_canary"
-		nonce       = "nonce_server_side_canary"
-		verifier    = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
-		code        = "code_callback_canary"
-		accessToken = "access.token.canary"
-		subject     = "usr_subject_for_example"
+		state        = "state_server_side_canary"
+		nonce        = "nonce_server_side_canary"
+		verifier     = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
+		code         = "code_callback_canary"
+		accessToken  = "access.token.canary"
+		refreshToken = "refresh.token.canary"
+		subject      = "usr_subject_for_example"
 	)
 	var issuer string
 	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -99,7 +179,8 @@ func TestCallbackValidatesTokensCallsUserInfoAndStoresOnlyJITIdentity(t *testing
 			}
 			compact := signExampleJWT(t, private, kid, "JWT", claims)
 			_ = json.NewEncoder(writer).Encode(tokenResponse{
-				AccessToken: accessToken, TokenType: "Bearer", ExpiresIn: 600, IDToken: compact, Scope: "email openid profile",
+				AccessToken: accessToken, RefreshToken: refreshToken, TokenType: "Bearer", ExpiresIn: 600, IDToken: compact,
+				Scope: "email offline_access openid profile",
 			})
 		case "/oauth2/jwks":
 			_ = json.NewEncoder(writer).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{
@@ -119,6 +200,7 @@ func TestCallbackValidatesTokensCallsUserInfoAndStoresOnlyJITIdentity(t *testing
 	defer provider.Close()
 	issuer = provider.URL
 	cfg := exampleTestConfig(t, issuer)
+	cfg.Scopes = []string{"email", "offline_access", "openid", "profile"}
 	metadata := exampleTestMetadata(issuer)
 	sessions := newMemorySessions(rand.Reader)
 	sessionValue, err := sessions.create(now)
@@ -126,7 +208,9 @@ func TestCallbackValidatesTokensCallsUserInfoAndStoresOnlyJITIdentity(t *testing
 		t.Fatal(err)
 	}
 	sessionValue.Pending = &authorizationAttempt{State: state, Nonce: nonce, Verifier: verifier, CreatedAt: now.Add(-time.Second)}
-	sessions.save(sessionValue)
+	if err := sessions.save(sessionValue, now); err != nil {
+		t.Fatal(err)
+	}
 	application, err := newExampleApplication(cfg, metadata, provider.Client(), sessions)
 	if err != nil {
 		t.Fatal(err)
@@ -150,8 +234,11 @@ func TestCallbackValidatesTokensCallsUserInfoAndStoresOnlyJITIdentity(t *testing
 		rotated.Identity.Key != jitIdentityKey(issuer, subject) || rotated.Identity.Name != "Alice Current" {
 		t.Fatalf("rotated identity=%+v", rotated.Identity)
 	}
+	if rotated.AccessToken != accessToken || rotated.RefreshToken != refreshToken || rotated.IDToken == "" {
+		t.Fatalf("validated protocol credentials were not retained server-side: access=%q refresh=%q id_token=%q", rotated.AccessToken, rotated.RefreshToken, rotated.IDToken)
+	}
 	serialized, _ := json.Marshal(rotated)
-	for _, forbidden := range []string{accessToken, code, verifier, nonce, "IDToken", "AccessToken"} {
+	for _, forbidden := range []string{code, verifier, nonce} {
 		if strings.Contains(string(serialized), forbidden) {
 			t.Fatalf("server session retained protocol credential %q", forbidden)
 		}
@@ -164,7 +251,17 @@ func TestCallbackValidatesTokensCallsUserInfoAndStoresOnlyJITIdentity(t *testing
 	if homeResponse.Code != http.StatusOK || !strings.Contains(homeResponse.Body.String(), "Alice Current") {
 		t.Fatalf("home status=%d body=%s", homeResponse.Code, homeResponse.Body)
 	}
-	for _, forbidden := range []string{accessToken, code, verifier, nonce, "alice@example.test"} {
+	homeBody := homeResponse.Body.String()
+	for _, action := range []string{"/refresh", "/logout"} {
+		exactForm := `<form method="post" action="` + action + `"><input type="hidden" name="csrf_token" value="` + rotated.CSRFToken + `">`
+		if strings.Count(homeBody, exactForm) != 1 {
+			t.Fatalf("home rendered %s CSRF form %d times, want once", action, strings.Count(homeBody, exactForm))
+		}
+	}
+	if strings.Count(homeBody, `name="csrf_token"`) != 2 || strings.Count(homeBody, rotated.CSRFToken) != 2 {
+		t.Fatalf("home rendered Session CSRF outside the two mutation forms")
+	}
+	for _, forbidden := range []string{accessToken, refreshToken, rotated.IDToken, code, verifier, nonce, "alice@example.test"} {
 		if strings.Contains(homeResponse.Body.String(), forbidden) {
 			t.Fatalf("example page exposed transient/private value %q", forbidden)
 		}
@@ -232,27 +329,98 @@ func TestVerifyIDTokenRejectsAlgorithmHeaderClaimAndKeyConfusion(t *testing.T) {
 			if test.mutate != nil {
 				test.mutate()
 			}
-			if _, err := verifyIDToken(context.Background(), server.Client(), cfg, metadata, test.build(), "nonce", now); err == nil {
+			if _, err := verifyIDToken(context.Background(), server.Client(), cfg, metadata, test.build(), "nonce", cfg.Scopes, now); err == nil {
 				t.Fatal("invalid ID Token was accepted")
 			}
 		})
 	}
 }
 
-func TestProviderResponseRejectsRefreshTokenAndUntrustedEndpoint(t *testing.T) {
+func TestProviderResponseRequiresRefreshTokenForOfflineProfileAndRejectsUntrustedEndpoint(t *testing.T) {
 	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(writer, `{"access_token":"a","token_type":"Bearer","expires_in":600,"id_token":"i","scope":"openid","refresh_token":"forbidden"}`)
+		_, _ = io.WriteString(writer, `{"access_token":"a","token_type":"Bearer","expires_in":600,"id_token":"i","scope":"offline_access openid","refresh_token":"r1_test"}`)
 	}))
 	defer server.Close()
 	cfg := exampleTestConfig(t, server.URL)
 	metadata := exampleTestMetadata(server.URL)
-	if _, err := exchangeAuthorizationCode(context.Background(), server.Client(), cfg, metadata, "code", "verifier"); err == nil {
-		t.Fatal("example accepted a phase-four refresh_token field")
+	cfg.Scopes = []string{"offline_access", "openid"}
+	if _, err := exchangeAuthorizationCode(context.Background(), server.Client(), cfg, metadata, "code", "verifier"); err != nil {
+		t.Fatalf("offline authorization response was rejected: %v", err)
 	}
 	if _, err := cfg.backchannelURL("https://attacker.invalid/oauth2/token"); err == nil {
 		t.Fatal("example accepted an endpoint outside the configured Issuer")
+	}
+}
+
+func TestGrantedScopeReductionControlsClaimValidation(t *testing.T) {
+	t.Parallel()
+
+	private := exampleTestRSAKey(t)
+	kid := exampleTestKID(private)
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	includeProfile := &atomic.Bool{}
+	var issuer string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/oauth2/token":
+			claims := idTokenClaims{
+				Issuer: issuer, Subject: "subject", Audience: "ois_cli_example", AuthorizedParty: "ois_cli_example",
+				ExpiresAt: now.Add(5 * time.Minute).Unix(), IssuedAt: now.Unix(), AuthTime: now.Unix(), Nonce: "nonce",
+			}
+			if includeProfile.Load() {
+				claims.Name = exampleStringPointer("out-of-scope")
+			}
+			_ = json.NewEncoder(writer).Encode(tokenResponse{
+				AccessToken: "access", TokenType: "Bearer", ExpiresIn: 600,
+				IDToken: signExampleJWT(t, private, kid, "JWT", claims), Scope: "openid",
+			})
+		case "/oauth2/jwks":
+			_ = json.NewEncoder(writer).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{
+				Key: &private.PublicKey, KeyID: kid, Algorithm: string(jose.RS256), Use: "sig",
+			}}})
+		case "/oauth2/userinfo":
+			response := userInfoResponse{Subject: "subject"}
+			if includeProfile.Load() {
+				response.Name = exampleStringPointer("out-of-scope")
+			}
+			_ = json.NewEncoder(writer).Encode(response)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	issuer = server.URL
+	cfg := exampleTestConfig(t, issuer)
+	metadata := exampleTestMetadata(issuer)
+
+	tokens, err := exchangeAuthorizationCode(context.Background(), server.Client(), cfg, metadata, "code", "verifier")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tokens.GrantedScopes) != 1 || tokens.GrantedScopes[0] != "openid" {
+		t.Fatalf("granted scopes = %v, want [openid]", tokens.GrantedScopes)
+	}
+	claims, err := verifyIDToken(context.Background(), server.Client(), cfg, metadata, tokens.IDToken, "nonce", tokens.GrantedScopes, now)
+	if err != nil {
+		t.Fatalf("scope-reduced ID Token was rejected: %v", err)
+	}
+	if _, err := fetchUserInfo(context.Background(), server.Client(), cfg, metadata, tokens.AccessToken, claims.Subject, tokens.GrantedScopes); err != nil {
+		t.Fatalf("scope-reduced UserInfo was rejected: %v", err)
+	}
+
+	includeProfile.Store(true)
+	tokens, err = exchangeAuthorizationCode(context.Background(), server.Client(), cfg, metadata, "code", "verifier")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifyIDToken(context.Background(), server.Client(), cfg, metadata, tokens.IDToken, "nonce", tokens.GrantedScopes, now); err == nil {
+		t.Fatal("ID Token profile claim outside the reduced grant was accepted")
+	}
+	if _, err := fetchUserInfo(context.Background(), server.Client(), cfg, metadata, tokens.AccessToken, "subject", tokens.GrantedScopes); err == nil {
+		t.Fatal("UserInfo profile claim outside the reduced grant was accepted")
 	}
 }
 
@@ -264,7 +432,7 @@ func exampleTestConfig(t *testing.T, issuer string) exampleConfig {
 	}
 	return exampleConfig{
 		Name: "Example RP", Addr: ":0", Issuer: parsed, ClientID: "ois_cli_example",
-		RedirectURI: "http://127.0.0.1:8081/callback", Scopes: []string{"email", "openid", "profile"},
+		RedirectURI: "http://127.0.0.1:8081/callback", PostLogoutRedirectURI: "http://127.0.0.1:8081/logged-out", Scopes: []string{"email", "openid", "profile"},
 		CookieName: "example_session", CookieSecure: false,
 	}
 }
@@ -272,10 +440,11 @@ func exampleTestConfig(t *testing.T, issuer string) exampleConfig {
 func exampleTestMetadata(issuer string) providerMetadata {
 	return providerMetadata{
 		Issuer: issuer, AuthorizationEndpoint: issuer + "/oauth2/authorize", TokenEndpoint: issuer + "/oauth2/token",
+		RevocationEndpoint: issuer + "/oauth2/revoke", IntrospectionEndpoint: issuer + "/oauth2/introspect", EndSessionEndpoint: issuer + "/oauth2/logout",
 		UserInfoEndpoint: issuer + "/oauth2/userinfo", JWKSURI: issuer + "/oauth2/jwks",
-		ResponseTypesSupported: []string{"code"}, ResponseModesSupported: []string{"query"}, GrantTypesSupported: []string{"authorization_code"},
+		ResponseTypesSupported: []string{"code"}, ResponseModesSupported: []string{"query"}, GrantTypesSupported: []string{"authorization_code", "refresh_token"},
 		SubjectTypesSupported: []string{"public"}, IDTokenSigningAlgorithmsSupported: []string{"RS256"},
-		TokenEndpointAuthMethodsSupported: []string{"none", "client_secret_basic"}, ScopesSupported: []string{"openid", "profile", "email"},
+		TokenEndpointAuthMethodsSupported: []string{"none", "client_secret_basic"}, RevocationAuthMethodsSupported: []string{"none", "client_secret_basic"}, IntrospectionAuthMethodsSupported: []string{"client_secret_basic"}, ScopesSupported: []string{"openid", "profile", "email", "offline_access"},
 		ClaimsSupported:               []string{"sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "azp", "name", "preferred_username", "email", "email_verified"},
 		CodeChallengeMethodsSupported: []string{"S256"}, PromptValuesSupported: []string{"none", "login", "consent", "create"},
 	}
@@ -340,7 +509,9 @@ func TestMemorySessionDoesNotAliasSensitivePendingState(t *testing.T) {
 		t.Fatal(err)
 	}
 	value.Pending = &authorizationAttempt{State: "state", Nonce: "nonce", Verifier: "verifier", CreatedAt: now}
-	store.save(value)
+	if err := store.save(value, now); err != nil {
+		t.Fatal(err)
+	}
 	loaded, ok := store.get(value.ID, now)
 	if !ok {
 		t.Fatal("saved session missing")
@@ -349,6 +520,68 @@ func TestMemorySessionDoesNotAliasSensitivePendingState(t *testing.T) {
 	reloaded, _ := store.get(value.ID, now)
 	if reloaded.Pending.Verifier != "verifier" {
 		t.Fatal("session store returned an aliased pending authorization value")
+	}
+}
+
+func TestMemorySessionsEnforceCapacityAndPruneExpiredEntries(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 2, 13, 0, 0, 0, time.UTC)
+	store := newMemorySessions(bytes.NewReader(bytes.Repeat([]byte{2}, 128)))
+	for index := 0; index < maxExampleSessions; index++ {
+		id := fmt.Sprintf("existing-%04d", index)
+		store.sessions[id] = browserSession{ID: id, ExpiresAt: now.Add(time.Hour)}
+	}
+	if _, err := store.create(now); err == nil {
+		t.Fatal("session store accepted an entry beyond its fixed capacity")
+	}
+	if got := len(store.sessions); got != maxExampleSessions {
+		t.Fatalf("session count = %d, want %d", got, maxExampleSessions)
+	}
+
+	for id, value := range store.sessions {
+		value.ExpiresAt = now.Add(-time.Second)
+		store.sessions[id] = value
+	}
+	if _, err := store.create(now); err != nil {
+		t.Fatalf("expired sessions were not pruned at capacity: %v", err)
+	}
+	if got := len(store.sessions); got != 1 {
+		t.Fatalf("session count after pruning = %d, want 1", got)
+	}
+}
+
+func TestMemorySessionsCannotReinsertOrCompleteStaleSession(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 2, 13, 0, 0, 0, time.UTC)
+	randomBytes := append(bytes.Repeat([]byte{3}, 32), bytes.Repeat([]byte{4}, 32)...)
+	randomBytes = append(randomBytes, bytes.Repeat([]byte{5}, 32)...)
+	randomBytes = append(randomBytes, bytes.Repeat([]byte{6}, 32)...)
+	store := newMemorySessions(bytes.NewReader(randomBytes))
+	value, err := store.create(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value.Pending = &authorizationAttempt{State: "state", Nonce: "nonce", Verifier: "verifier", CreatedAt: now}
+	if err := store.save(value, now); err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := store.complete(value, jitIdentity{Key: "identity"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rotated.ID == value.ID || len(store.sessions) != 1 {
+		t.Fatalf("unexpected rotation result: old=%q new=%q count=%d", value.ID, rotated.ID, len(store.sessions))
+	}
+	if _, err := store.complete(value, jitIdentity{Key: "second"}, now); err == nil {
+		t.Fatal("stale session completed a second time")
+	}
+	if err := store.save(value, now); err == nil {
+		t.Fatal("stale session was reinserted")
+	}
+	if len(store.sessions) != 1 {
+		t.Fatalf("stale operations grew session store to %d", len(store.sessions))
 	}
 }
 

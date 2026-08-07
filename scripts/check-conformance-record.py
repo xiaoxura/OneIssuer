@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the reviewable, secret-free Phase 3 conformance record."""
+"""Validate the reviewable, secret-free Phase 3 and Phase 4 records."""
 
 from __future__ import annotations
 
@@ -20,6 +20,12 @@ EXPECTED_MODULES = [
     ("oidcc-ensure-request-with-valid-pkce-succeeds", "none"),
     ("oidcc-ensure-request-with-valid-pkce-succeeds", "client_secret_basic"),
 ]
+OPAQUE_CREDENTIAL = re.compile(
+    r"(?<![A-Za-z0-9_-])"
+    r"(?:ois_sec_v1_|s1_|p1_|c1_|t1_|r1_|lt1_|lc1_)"
+    r"[A-Za-z0-9_-]{43}"
+    r"(?![A-Za-z0-9_-])"
+)
 
 
 def load(path: pathlib.Path) -> dict:
@@ -72,10 +78,48 @@ for relative in result.get("configuration_templates", []):
     template = path.read_text(encoding="utf-8")
     if "<runtime-" not in template and "<unique-" not in template:
         raise SystemExit(f"configuration template lacks runtime placeholders: {relative}")
-    if re.search(r"(?:ois_sec_v1_|[spct]1_)[A-Za-z0-9_-]{32,}", template):
+    if OPAQUE_CREDENTIAL.search(template):
         raise SystemExit(f"configuration template contains a secret-shaped value: {relative}")
 
 # Make accidental replacement of the reviewed files visible in CI diagnostics.
 for path in (MATRIX, RESULT):
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    print(f"conformance record valid: {path.relative_to(ROOT)} sha256:{digest}")
+
+
+# Phase four intentionally starts with a secret-free, NOT_RUN evidence record.
+# Keeping the matrix in the same contract gate prevents a later external-suite
+# update from silently changing the applicable client-auth or certification
+# boundary.
+PHASE4_BASE = ROOT / "conformance" / "phase-4"
+PHASE4_MATRIX = PHASE4_BASE / "matrix.json"
+PHASE4_RESULT = PHASE4_BASE / "results" / "2026-08-03.json"
+PHASE4_MODULES = [
+    ("oidcc-refresh-token-rotation", "none"),
+    ("oidcc-refresh-token-rotation", "client_secret_basic"),
+    ("oidcc-rp-initiated-logout", "none"),
+]
+phase4_matrix = load(PHASE4_MATRIX)
+phase4_result = load(PHASE4_RESULT)
+for document, name in ((phase4_matrix, "phase-four matrix"), (phase4_result, "phase-four result")):
+    suite = document.get("suite")
+    if not isinstance(suite, dict) or suite.get("release") != EXPECTED_RELEASE or suite.get("source_commit") != "working-tree-phase4" or suite.get("plan") != "oidcc-test-plan":
+        raise SystemExit(f"{name} does not pin the reviewed phase-four suite boundary")
+selected4 = [(entry.get("test_module"), entry.get("client_auth_type")) for entry in phase4_matrix.get("applicable_modules", [])]
+if selected4 != PHASE4_MODULES:
+    raise SystemExit(f"phase-four applicable module matrix drifted: {selected4!r}")
+records4 = phase4_result.get("results")
+if not isinstance(records4, list) or [(entry.get("test_module"), entry.get("variants", {}).get("client_auth_type")) for entry in records4] != PHASE4_MODULES:
+    raise SystemExit("phase-four result modules do not match the applicable matrix")
+if any(entry.get("result") != "NOT_RUN" for entry in records4) or phase4_result.get("certification_claim") is not False:
+    raise SystemExit("phase-four scaffold must remain explicitly pending and non-certifying")
+for relative in phase4_result.get("configuration_templates", []):
+    path = ROOT / relative
+    template = path.read_text(encoding="utf-8")
+    if "<runtime-" not in template and "<unique-" not in template:
+        raise SystemExit(f"phase-four configuration template lacks runtime placeholders: {relative}")
+    if OPAQUE_CREDENTIAL.search(template):
+        raise SystemExit(f"phase-four configuration template contains a secret-shaped value: {relative}")
+for path in (PHASE4_MATRIX, PHASE4_RESULT):
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     print(f"conformance record valid: {path.relative_to(ROOT)} sha256:{digest}")

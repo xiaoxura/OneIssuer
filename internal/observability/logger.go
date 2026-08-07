@@ -14,7 +14,7 @@ import (
 var (
 	databaseCredentialPattern = regexp.MustCompile(`(?i)(postgres(?:ql)?://[^\s:/@]+:)[^\s@]+(@)`)
 	bearerTokenPattern        = regexp.MustCompile(`(?i)(bearer\s+)[a-z0-9._~+/=-]+`)
-	oneIssuerOpaquePattern    = regexp.MustCompile(`(?i)\b(ois_sec_v1_|[spct]1_)[a-z0-9_-]{43}\b`)
+	oneIssuerOpaquePattern    = regexp.MustCompile(`(^|[^A-Za-z0-9_-])(?:ois_sec_v1_|s1_|p1_|c1_|t1_|r1_|lt1_|lc1_)[A-Za-z0-9_-]{43}([^A-Za-z0-9_-]|$)`)
 	argon2DigestPattern       = regexp.MustCompile(`\$argon2id\$[^\s]+`)
 )
 
@@ -145,6 +145,14 @@ func sensitiveKey(key string) bool {
 func redactText(value string) string {
 	value = databaseCredentialPattern.ReplaceAllString(value, `${1}xxxxx${2}`)
 	value = bearerTokenPattern.ReplaceAllString(value, `${1}[REDACTED]`)
-	value = oneIssuerOpaquePattern.ReplaceAllString(value, `[REDACTED]`)
+	// The boundary matcher consumes separators. Repeating allows adjacent
+	// credentials that share a separator to be redacted without losing it.
+	for {
+		redacted := oneIssuerOpaquePattern.ReplaceAllString(value, `${1}[REDACTED]${2}`)
+		if redacted == value {
+			break
+		}
+		value = redacted
+	}
 	return argon2DigestPattern.ReplaceAllString(value, `[REDACTED]`)
 }

@@ -25,6 +25,7 @@ func (s *Store) IssueAuthorizationCode(ctx context.Context, commit authorization
 		return consent.Grant{}, err
 	}
 	var result consent.Grant
+	var events []audit.Event
 	err := s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
 		transactionRow, err := queries.LockAuthTransactionByID(ctx, commit.Transaction.ID)
 		if isNoRows(err) {
@@ -70,6 +71,8 @@ func (s *Store) IssueAuthorizationCode(ctx context.Context, commit authorization
 			PkceChallenge: transactionRowPKCE(transactionRow), PkceMethod: "S256",
 			NonceValue: transactionRow.NonceValue, AuthTime: timestamp(commit.AuthenticatedAt),
 			CreatedAt: timestamp(commit.CreatedAt), ExpiresAt: timestamp(commit.ExpiresAt),
+			ConsentGrantVersion: grant.Version, OriginSessionID: &commit.SessionID,
+			SessionBindingID: &commit.SessionBindingID,
 		}); err != nil {
 			return wrapError("create authorization code", ErrorKindQuery, err)
 		}
@@ -84,25 +87,34 @@ func (s *Store) IssueAuthorizationCode(ctx context.Context, commit authorization
 
 		if grantChanged != "" {
 			eventType, changed := audit.ConsentGrantCreated, []string{"created"}
-			if grantChanged == "expanded" {
+			switch grantChanged {
+			case "expanded":
 				eventType, changed = audit.ConsentGrantExpanded, []string{"expanded"}
+			case "reactivated":
+				eventType, changed = audit.ConsentGrantReactivated, []string{"reactivated"}
 			}
-			if err := insertProtocolAudit(ctx, queries, eventType, audit.ResultSuccess, commit.UserID, audit.TargetConsentGrant, grant.ID, commit.RequestID, changed, commit.CreatedAt); err != nil {
+			if err := insertProtocolAudit(ctx, queries, eventType, audit.ResultSuccess, commit.UserID, audit.TargetConsentGrant, grant.ID, commit.RequestID, changed, commit.CreatedAt, &events); err != nil {
 				return err
 			}
 		}
-		if err := insertProtocolAudit(ctx, queries, audit.AuthorizationTransactionConsumed, audit.ResultSuccess, commit.UserID, audit.TargetAuthTransaction, transactionRow.ID, commit.RequestID, nil, commit.CreatedAt); err != nil {
+		if err := insertProtocolAudit(ctx, queries, audit.AuthorizationTransactionConsumed, audit.ResultSuccess, commit.UserID, audit.TargetAuthTransaction, transactionRow.ID, commit.RequestID, nil, commit.CreatedAt, &events); err != nil {
 			return err
 		}
-		if err := insertProtocolAudit(ctx, queries, audit.AuthorizationGranted, audit.ResultSuccess, commit.UserID, audit.TargetAuthTransaction, transactionRow.ID, commit.RequestID, nil, commit.CreatedAt); err != nil {
+		if err := insertProtocolAudit(ctx, queries, audit.AuthorizationGranted, audit.ResultSuccess, commit.UserID, audit.TargetAuthTransaction, transactionRow.ID, commit.RequestID, nil, commit.CreatedAt, &events); err != nil {
 			return err
 		}
-		if err := insertProtocolAudit(ctx, queries, audit.AuthorizationCodeIssued, audit.ResultSuccess, commit.UserID, audit.TargetAuthorizationCode, commit.CodeID, commit.RequestID, []string{"issued"}, commit.CreatedAt); err != nil {
+		if err := insertProtocolAudit(ctx, queries, audit.AuthorizationCodeIssued, audit.ResultSuccess, commit.UserID, audit.TargetAuthorizationCode, commit.CodeID, commit.RequestID, []string{"issued"}, commit.CreatedAt, &events); err != nil {
 			return err
 		}
 		result = grant
 		return nil
+	}, func() {
+		result = consent.Grant{}
+		events = nil
 	})
+	if err == nil {
+		s.observeAuditEvents(events)
+	}
 	return result, err
 }
 
@@ -112,7 +124,8 @@ func (s *Store) DenyAuthorization(ctx context.Context, commit authorization.Deny
 	if commit.UserID == uuid.Nil || commit.Transaction.ID == uuid.Nil || commit.DeniedAt.IsZero() {
 		return authorization.ErrInvalid
 	}
-	return s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
+	var events []audit.Event
+	err := s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
 		transactionRow, err := queries.LockAuthTransactionByID(ctx, commit.Transaction.ID)
 		if isNoRows(err) {
 			return authorization.ErrNotFound
@@ -140,15 +153,20 @@ func (s *Store) DenyAuthorization(ctx context.Context, commit authorization.Deny
 		} else if err != nil {
 			return wrapError("consume denied authorization transaction", ErrorKindQuery, err)
 		}
-		if err := insertProtocolAudit(ctx, queries, audit.AuthorizationTransactionRejected, audit.ResultRejected, commit.UserID, audit.TargetAuthTransaction, transactionRow.ID, commit.RequestID, nil, commit.DeniedAt); err != nil {
+		if err := insertProtocolAudit(ctx, queries, audit.AuthorizationTransactionRejected, audit.ResultRejected, commit.UserID, audit.TargetAuthTransaction, transactionRow.ID, commit.RequestID, nil, commit.DeniedAt, &events); err != nil {
 			return err
 		}
-		return insertProtocolAudit(ctx, queries, audit.AuthorizationDenied, audit.ResultRejected, commit.UserID, audit.TargetAuthTransaction, transactionRow.ID, commit.RequestID, nil, commit.DeniedAt)
-	})
+		return insertProtocolAudit(ctx, queries, audit.AuthorizationDenied, audit.ResultRejected, commit.UserID, audit.TargetAuthTransaction, transactionRow.ID, commit.RequestID, nil, commit.DeniedAt, &events)
+	}, func() { events = nil })
+	if err == nil {
+		s.observeAuditEvents(events)
+	}
+	return err
 }
 
 func validateIssueCommit(commit authorization.IssueCommit) error {
-	if commit.UserID == uuid.Nil || commit.CodeID == uuid.Nil || commit.ProposedGrantID == uuid.Nil || len(commit.CodeHash) != 32 ||
+	if commit.UserID == uuid.Nil || commit.SessionID == uuid.Nil || commit.SessionBindingID == uuid.Nil ||
+		commit.CodeID == uuid.Nil || commit.ProposedGrantID == uuid.Nil || len(commit.CodeHash) != 32 ||
 		commit.CreatedAt.IsZero() || commit.AuthenticatedAt.IsZero() || commit.AuthenticatedAt.After(commit.CreatedAt) ||
 		!commit.ExpiresAt.After(commit.CreatedAt) || commit.ExpiresAt.After(commit.CreatedAt.Add(5*time.Minute)) {
 		return authorization.ErrInvalid
@@ -230,8 +248,20 @@ func lockAndApplyConsent(ctx context.Context, queries *sqlcgen.Queries, commit a
 	}
 	grant := mapConsentGrant(row)
 	stored, validationErr := consent.CanonicalScopes(grant.Scopes)
-	if validationErr != nil || grant.ID == uuid.Nil || grant.UserID != commit.UserID || grant.ClientID != clientValue.ID {
+	if validationErr != nil || grant.ID == uuid.Nil || grant.UserID != commit.UserID || grant.ClientID != clientValue.ID || grant.Version < 1 {
 		return consent.Grant{}, "", authorization.ErrInvalid
+	}
+	if grant.RevokedAt != nil {
+		if !commit.InteractiveConsent {
+			return consent.Grant{}, "", authorization.ErrConsentRequired
+		}
+		updated, updateErr := queries.ReactivateConsentGrant(ctx, sqlcgen.ReactivateConsentGrantParams{
+			Scopes: requested, UpdatedAt: timestamp(commit.CreatedAt), ID: grant.ID,
+		})
+		if updateErr != nil {
+			return consent.Grant{}, "", wrapError("reactivate consent grant", ErrorKindQuery, updateErr)
+		}
+		return mapConsentGrant(updated), "reactivated", nil
 	}
 	effective := consent.Intersection(stored, clientValue.Scopes)
 	if !commit.InteractiveConsent {
@@ -258,12 +288,16 @@ func lockAndApplyConsent(ctx context.Context, queries *sqlcgen.Queries, commit a
 	return mapConsentGrant(updated), "expanded", nil
 }
 
-func insertProtocolAudit(ctx context.Context, queries *sqlcgen.Queries, eventType audit.EventType, result audit.Result, actor uuid.UUID, targetType audit.TargetType, target uuid.UUID, requestID string, changed []string, now time.Time) error {
+func insertProtocolAudit(ctx context.Context, queries *sqlcgen.Queries, eventType audit.EventType, result audit.Result, actor uuid.UUID, targetType audit.TargetType, target uuid.UUID, requestID string, changed []string, now time.Time, events *[]audit.Event) error {
 	event, err := audit.New(eventType, result, &actor, targetType, &target, requestID, changed, now)
 	if err != nil {
 		return err
 	}
-	return insertAudit(ctx, queries, event)
+	if err := insertAudit(ctx, queries, event); err != nil {
+		return err
+	}
+	*events = append(*events, event)
+	return nil
 }
 
 func transactionRowRedirect(row sqlcgen.AuthTransaction) string { return valueString(row.RedirectUri) }

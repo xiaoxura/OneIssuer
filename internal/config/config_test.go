@@ -42,6 +42,10 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Browser.CookieName != "oneissuer_session" || cfg.Browser.SessionTTL != 24*time.Hour || cfg.Browser.RegistrationEnabled {
 		t.Fatalf("unexpected browser defaults: %#v", cfg.Browser)
 	}
+	if cfg.Browser.AuthRatePerMinute != 20 || cfg.Browser.AuthRateBurst != 10 ||
+		cfg.Browser.AuthGlobalRate != 50 || cfg.Browser.AuthGlobalBurst != 100 {
+		t.Fatalf("unexpected authentication rate defaults: %#v", cfg.Browser)
+	}
 	if cfg.Password.MinLength != 15 || cfg.Password.MaxBytes < 64 || cfg.Password.Argon2MemoryKiB < 19*1024 {
 		t.Fatalf("unexpected password defaults: %#v", cfg.Password)
 	}
@@ -55,26 +59,30 @@ func TestLoadValidOverrides(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := LoadFrom(env(map[string]string{
-		"ONEISSUER_ENV":                      "test",
-		"ONEISSUER_ISSUER":                   "https://id.example.test:8443",
-		"ONEISSUER_HTTP_ADDR":                "127.0.0.1:9090",
-		"ONEISSUER_DATABASE_URL":             "postgresql://user:pass@db.example.test/app?sslmode=require",
-		"ONEISSUER_LOG_LEVEL":                "debug",
-		"ONEISSUER_LOG_FORMAT":               "text",
-		"ONEISSUER_SHUTDOWN_TIMEOUT":         "20s",
-		"ONEISSUER_HTTP_READ_HEADER_TIMEOUT": "2s",
-		"ONEISSUER_HTTP_READ_TIMEOUT":        "3s",
-		"ONEISSUER_HTTP_WRITE_TIMEOUT":       "4s",
-		"ONEISSUER_HTTP_IDLE_TIMEOUT":        "5s",
-		"ONEISSUER_HTTP_MAX_HEADER_BYTES":    "2048",
-		"ONEISSUER_DATABASE_MAX_CONNS":       "20",
-		"ONEISSUER_TRUSTED_PROXIES":          "10.0.0.1/8, 2001:db8::/32",
-		"ONEISSUER_SIGNING_KEY_FILE":         validSigningKeyFile,
-		"ONEISSUER_VERIFICATION_KEYS_FILE":   "/run/secrets/oneissuer-verification-keys.jwks",
-		"ONEISSUER_AUTHORIZATION_CODE_TTL":   "2m",
-		"ONEISSUER_ID_TOKEN_TTL":             "10m",
-		"ONEISSUER_ACCESS_TOKEN_TTL":         "20m",
-		"ONEISSUER_OIDC_CLOCK_SKEW":          "0s",
+		"ONEISSUER_ENV":                         "test",
+		"ONEISSUER_ISSUER":                      "https://id.example.test:8443",
+		"ONEISSUER_HTTP_ADDR":                   "127.0.0.1:9090",
+		"ONEISSUER_DATABASE_URL":                "postgresql://user:pass@db.example.test/app?sslmode=require",
+		"ONEISSUER_LOG_LEVEL":                   "debug",
+		"ONEISSUER_LOG_FORMAT":                  "text",
+		"ONEISSUER_SHUTDOWN_TIMEOUT":            "20s",
+		"ONEISSUER_HTTP_READ_HEADER_TIMEOUT":    "2s",
+		"ONEISSUER_HTTP_READ_TIMEOUT":           "3s",
+		"ONEISSUER_HTTP_WRITE_TIMEOUT":          "4s",
+		"ONEISSUER_HTTP_IDLE_TIMEOUT":           "5s",
+		"ONEISSUER_HTTP_MAX_HEADER_BYTES":       "2048",
+		"ONEISSUER_DATABASE_MAX_CONNS":          "20",
+		"ONEISSUER_TRUSTED_PROXIES":             "10.0.0.1/8, 2001:db8::/32",
+		"ONEISSUER_SIGNING_KEY_FILE":            validSigningKeyFile,
+		"ONEISSUER_VERIFICATION_KEYS_FILE":      "/run/secrets/oneissuer-verification-keys.jwks",
+		"ONEISSUER_AUTHORIZATION_CODE_TTL":      "2m",
+		"ONEISSUER_ID_TOKEN_TTL":                "10m",
+		"ONEISSUER_ACCESS_TOKEN_TTL":            "20m",
+		"ONEISSUER_OIDC_CLOCK_SKEW":             "0s",
+		"ONEISSUER_AUTH_RATE_PER_MINUTE":        "30",
+		"ONEISSUER_AUTH_RATE_BURST":             "15",
+		"ONEISSUER_AUTH_GLOBAL_RATE_PER_SECOND": "75",
+		"ONEISSUER_AUTH_GLOBAL_BURST":           "150",
 	}), ScopeService)
 	if err != nil {
 		t.Fatalf("LoadFrom() error = %v", err)
@@ -87,6 +95,10 @@ func TestLoadValidOverrides(t *testing.T) {
 	}
 	if cfg.OIDC.AuthorizationCodeTTL != 2*time.Minute || cfg.OIDC.ClockSkew != 0 || cfg.OIDC.VerificationKeysFile == "" {
 		t.Fatalf("OIDC overrides were not applied: %#v", cfg.OIDC)
+	}
+	if cfg.Browser.AuthRatePerMinute != 30 || cfg.Browser.AuthRateBurst != 15 ||
+		cfg.Browser.AuthGlobalRate != 75 || cfg.Browser.AuthGlobalBurst != 150 {
+		t.Fatalf("authentication rate overrides were not applied: %#v", cfg.Browser)
 	}
 }
 
@@ -143,7 +155,7 @@ func TestProductionSafetyValidation(t *testing.T) {
 			name: "issuer must be explicit",
 			values: map[string]string{
 				"ONEISSUER_ENV":              "production",
-				"ONEISSUER_DATABASE_URL":     "postgres://u:p@db/app?sslmode=require",
+				"ONEISSUER_DATABASE_URL":     "postgres://u:p@db/app?sslmode=verify-full",
 				"ONEISSUER_SIGNING_KEY_FILE": validSigningKeyFile,
 			},
 			field: "ONEISSUER_ISSUER",
@@ -153,19 +165,19 @@ func TestProductionSafetyValidation(t *testing.T) {
 			values: map[string]string{
 				"ONEISSUER_ENV":              "production",
 				"ONEISSUER_ISSUER":           "http://id.example.test",
-				"ONEISSUER_DATABASE_URL":     "postgres://u:p@db/app?sslmode=require",
+				"ONEISSUER_DATABASE_URL":     "postgres://u:p@db/app?sslmode=verify-full",
 				"ONEISSUER_SIGNING_KEY_FILE": validSigningKeyFile,
 			},
 			field: "must use https",
 		},
 		{
-			name: "database TLS cannot be disabled",
+			name: "database TLS must verify host",
 			values: map[string]string{
 				"ONEISSUER_ENV":          "production",
 				"ONEISSUER_ISSUER":       "https://id.example.test",
 				"ONEISSUER_DATABASE_URL": validDatabaseURL,
 			},
-			field: "must not disable TLS",
+			field: "must explicitly use sslmode=verify-full",
 		},
 	}
 
@@ -180,13 +192,62 @@ func TestProductionSafetyValidation(t *testing.T) {
 	}
 }
 
-func TestDatabaseScopeIgnoresUnrelatedSettings(t *testing.T) {
+func TestProductionDatabaseRequiresExactlyOneVerifyFullSSLModeInEveryScope(t *testing.T) {
+	t.Parallel()
+
+	base := map[string]string{
+		"ONEISSUER_ENV":                   "production",
+		"ONEISSUER_ISSUER":                "https://id.example.test",
+		"ONEISSUER_SIGNING_KEY_FILE":      validSigningKeyFile,
+		"ONEISSUER_COOKIE_SECURE":         "true",
+		"ONEISSUER_COOKIE_NAME":           "__Host-oneissuer_session",
+		"ONEISSUER_REGISTRATION_ENABLED":  "false",
+		"ONEISSUER_DATABASE_MAX_CONNS":    "5",
+		"ONEISSUER_PASSWORD_MIN_LENGTH":   "15",
+		"ONEISSUER_PASSWORD_MAX_BYTES":    "1024",
+		"ONEISSUER_ARGON2_MAX_CONCURRENT": "2",
+	}
+	for _, scope := range []Scope{ScopeService, ScopeDatabase, ScopeBootstrap} {
+		scope := scope
+		for _, suffix := range []string{
+			"", "?sslmode=disable", "?sslmode=allow", "?sslmode=prefer", "?sslmode=require",
+			"?sslmode=verify-ca", "?sslmode=verify-full&sslmode=verify-full",
+		} {
+			suffix := suffix
+			t.Run(fmt.Sprintf("scope_%d_%s", scope, strings.TrimPrefix(suffix, "?sslmode=")), func(t *testing.T) {
+				t.Parallel()
+				values := make(map[string]string, len(base)+1)
+				for key, value := range base {
+					values[key] = value
+				}
+				values["ONEISSUER_DATABASE_URL"] = "postgres://u:p@db/app" + suffix
+				_, err := LoadFrom(env(values), scope)
+				if err == nil || !strings.Contains(err.Error(), "sslmode=verify-full") {
+					t.Fatalf("scope %d accepted production database URL suffix %q: %v", scope, suffix, err)
+				}
+			})
+		}
+		t.Run(fmt.Sprintf("scope_%d_verify_full", scope), func(t *testing.T) {
+			t.Parallel()
+			values := make(map[string]string, len(base)+1)
+			for key, value := range base {
+				values[key] = value
+			}
+			values["ONEISSUER_DATABASE_URL"] = "postgres://u:p@db/app?sslmode=verify-full"
+			if _, err := LoadFrom(env(values), scope); err != nil {
+				t.Fatalf("scope %d rejected verify-full production database URL: %v", scope, err)
+			}
+		})
+	}
+}
+
+func TestDatabaseScopeIgnoresUnrelatedServiceSettings(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := LoadFrom(env(map[string]string{
 		"ONEISSUER_DATABASE_URL":     "postgres://u:p@db/app?sslmode=disable",
 		"ONEISSUER_SIGNING_KEY_FILE": validSigningKeyFile,
-		"ONEISSUER_ENV":              "invalid",
+		"ONEISSUER_ENV":              "test",
 		"ONEISSUER_ISSUER":           "invalid",
 		"ONEISSUER_HTTP_ADDR":        "invalid",
 	}), ScopeDatabase)
@@ -195,6 +256,18 @@ func TestDatabaseScopeIgnoresUnrelatedSettings(t *testing.T) {
 	}
 	if cfg.Database.URL.UnsafeValue() == "" {
 		t.Fatal("database URL was not loaded")
+	}
+}
+
+func TestDatabaseScopeValidatesEnvironment(t *testing.T) {
+	t.Parallel()
+
+	_, err := LoadFrom(env(map[string]string{
+		"ONEISSUER_DATABASE_URL": validDatabaseURL,
+		"ONEISSUER_ENV":          "invalid",
+	}), ScopeDatabase)
+	if err == nil || !strings.Contains(err.Error(), "ONEISSUER_ENV") {
+		t.Fatalf("database scope accepted an invalid environment: %v", err)
 	}
 }
 
@@ -372,12 +445,57 @@ func TestPhaseTwoSecurityConfigurationValidation(t *testing.T) {
 	}
 }
 
+func TestArgon2CombinedMemoryBudgetIsBounded(t *testing.T) {
+	t.Parallel()
+
+	_, err := LoadFrom(env(map[string]string{
+		"ONEISSUER_DATABASE_URL":          validDatabaseURL,
+		"ONEISSUER_SIGNING_KEY_FILE":      validSigningKeyFile,
+		"ONEISSUER_ARGON2_MEMORY_KIB":     "1048576",
+		"ONEISSUER_ARGON2_MAX_CONCURRENT": "64",
+	}), ScopeService)
+	if err == nil || !strings.Contains(err.Error(), "combined Argon2 memory budget") {
+		t.Fatalf("64 GiB Argon2 concurrency envelope was accepted: %v", err)
+	}
+}
+
+func TestAuthenticationRateConfigurationBounds(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name  string
+		field string
+		value string
+	}{
+		{name: "per minute zero", field: "ONEISSUER_AUTH_RATE_PER_MINUTE", value: "0"},
+		{name: "per minute excessive", field: "ONEISSUER_AUTH_RATE_PER_MINUTE", value: "60001"},
+		{name: "burst zero", field: "ONEISSUER_AUTH_RATE_BURST", value: "0"},
+		{name: "burst excessive", field: "ONEISSUER_AUTH_RATE_BURST", value: "1001"},
+		{name: "global rate zero", field: "ONEISSUER_AUTH_GLOBAL_RATE_PER_SECOND", value: "0"},
+		{name: "global rate excessive", field: "ONEISSUER_AUTH_GLOBAL_RATE_PER_SECOND", value: "10001"},
+		{name: "global burst zero", field: "ONEISSUER_AUTH_GLOBAL_BURST", value: "0"},
+		{name: "global burst excessive", field: "ONEISSUER_AUTH_GLOBAL_BURST", value: "20001"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := LoadFrom(env(map[string]string{
+				"ONEISSUER_DATABASE_URL":     validDatabaseURL,
+				"ONEISSUER_SIGNING_KEY_FILE": validSigningKeyFile,
+				test.field:                   test.value,
+			}), ScopeService)
+			if err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("out-of-range authentication rate value was accepted: %v", err)
+			}
+		})
+	}
+}
+
 func TestProductionBrowserSafetyRequiresExplicitSecureChoices(t *testing.T) {
 	t.Parallel()
 	base := map[string]string{
 		"ONEISSUER_ENV":              "production",
 		"ONEISSUER_ISSUER":           "https://id.example.test",
-		"ONEISSUER_DATABASE_URL":     "postgres://u:p@db/app?sslmode=require",
+		"ONEISSUER_DATABASE_URL":     "postgres://u:p@db/app?sslmode=verify-full",
 		"ONEISSUER_SIGNING_KEY_FILE": validSigningKeyFile,
 	}
 	_, err := LoadFrom(env(base), ScopeService)

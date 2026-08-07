@@ -287,7 +287,7 @@ func TestUserInfoRejectsUntrustedHeadersSignaturesAndClaims(t *testing.T) {
 		}},
 		{name: "unsupported scope", build: func() string {
 			claims := validClaims
-			claims.Scope = "offline_access openid"
+			claims.Scope = "openid unknown"
 			return signClaims(t, fixture.keys, claims, "at+jwt", fixture.keys.kid, nil)
 		}},
 		{name: "unknown claim", build: func() string {
@@ -444,13 +444,14 @@ func (f *tokenFixture) accessAuthority() AccessAuthority {
 	return AccessAuthority{
 		Metadata: AccessMetadata{
 			ID: minted.AccessTokenID, JTIHash: append([]byte(nil), minted.JTIHash...),
-			AuthorizationCodeID: f.authority.CodeID, ConsentGrantID: f.authority.GrantID,
+			AuthorizationCodeID: &f.authority.CodeID, ConsentGrantID: f.authority.GrantID,
 			UserID: f.authority.User.ID, ClientID: f.authority.Client.ID,
 			Scopes: append([]string(nil), f.authority.Scopes...), IssuedAt: minted.IssuedAt, ExpiresAt: minted.AccessExpiresAt,
+			IssuanceSource: IssuanceAuthorizationCode,
 		},
 		Grant: consent.Grant{
 			ID: f.authority.GrantID, UserID: f.authority.User.ID, ClientID: f.authority.Client.ID,
-			Scopes: append([]string(nil), f.authority.Scopes...), CreatedAt: f.now.Add(-time.Hour), UpdatedAt: f.now,
+			Scopes: append([]string(nil), f.authority.Scopes...), CreatedAt: f.now.Add(-time.Hour), UpdatedAt: f.now, Version: 1,
 		},
 		User: f.authority.User, Client: f.authority.Client,
 	}
@@ -490,6 +491,16 @@ func (r *fakeRepository) ExchangeAuthorizationCode(ctx context.Context, input Ex
 		ExpiresIn: int64(minted.AccessExpiresAt.Sub(minted.IssuedAt) / time.Second), IDToken: minted.IDToken,
 		Scope: strings.Join(r.exchangeAuthority.Scopes, " "),
 	}, nil
+}
+
+func (r *fakeRepository) ExchangeRefreshToken(context.Context, RefreshInput, RefreshMintFunc) (Response, error) {
+	return Response{}, ErrInvalidGrant
+}
+
+func (r *fakeRepository) RevokeToken(context.Context, RevocationLookup) error { return nil }
+
+func (r *fakeRepository) GetRefreshTokenAuthority(context.Context, []byte) (RefreshTokenAuthority, error) {
+	return RefreshTokenAuthority{}, ErrInvalidGrant
 }
 
 func (r *fakeRepository) GetAccessTokenAuthority(_ context.Context, hash []byte, _ time.Time) (AccessAuthority, error) {

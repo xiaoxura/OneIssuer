@@ -1,6 +1,7 @@
-import type { ComponentType, ReactNode, SVGProps } from 'react'
+import { useId, type ComponentType, type ReactNode, type SVGProps } from 'react'
 import { ArrowDownRight, ArrowUpRight, X } from 'lucide-react'
 import { useI18n } from '../i18n'
+import { useDialogFocus } from './useDialogFocus'
 
 export type IconComponent = ComponentType<SVGProps<SVGSVGElement> & { size?: number | string }>
 
@@ -100,20 +101,26 @@ export function Modal({
   onClose: () => void
 }) {
   const { t } = useI18n()
+  const titleId = useId()
+  const descriptionId = useId()
+  const dialogRef = useDialogFocus<HTMLElement>(onClose)
 
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
       <section
-        aria-labelledby="modal-title"
+        aria-describedby={descriptionId}
+        aria-labelledby={titleId}
         aria-modal="true"
         className="modal"
+        ref={dialogRef}
         role="dialog"
+        tabIndex={-1}
         onMouseDown={(event) => event.stopPropagation()}
       >
         <header className="modal__header">
           <div>
-            <h2 id="modal-title">{title}</h2>
-            <p>{description}</p>
+            <h2 id={titleId}>{title}</h2>
+            <p id={descriptionId}>{description}</p>
           </div>
           <button className="icon-button" onClick={onClose} type="button" aria-label={t('common.close')}>
             <X size={18} />

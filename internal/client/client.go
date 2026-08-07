@@ -80,7 +80,7 @@ type Client struct {
 	Scopes                  []string   `json:"scopes"`
 	CreatedAt               time.Time  `json:"created_at"`
 	UpdatedAt               time.Time  `json:"updated_at"`
-	Version                 time.Time  `json:"-"`
+	Version                 int64      `json:"-"`
 }
 
 // SecretRecord is the database-safe representation of a confidential secret.
@@ -239,6 +239,7 @@ func (s *Service) Update(ctx context.Context, actor uuid.UUID, id uuid.UUID, inp
 		s.observe("update", "failure")
 		return Client{}, nil, err
 	}
+	updated.Version++
 	s.observe("update", "success")
 	return updated, changed, nil
 }
@@ -330,7 +331,7 @@ func (s *Service) prepareCreate(input CreateInput, now time.Time) (Client, *Secr
 		Name: name, Description: description, LogoURI: logo, Status: StatusActive,
 		RegistrationEnabled: input.RegistrationEnabled, RedirectURIs: redirects,
 		LogoutURIs: logouts, Scopes: scopes, CreatedAt: now, UpdatedAt: now,
-		Version: now,
+		Version: 1,
 	}
 	if input.Type == TypePublic {
 		return value, nil, "", nil

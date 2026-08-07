@@ -1,0 +1,7 @@
+{
+  "alias": "<unique-phase4-confidential-alias>",
+  "description": "OneIssuer v0.1.0-dev.4 phase-four confidential lifecycle profile",
+  "server": {"discoveryUrl": "https://<issuer-host>/.well-known/openid-configuration"},
+  "client": {"client_id": "<runtime-confidential-client-id>", "client_secret": "<runtime-secret-injection>"},
+  "client2": {"client_id": "<runtime-confidential-client-id>", "client_secret": "<runtime-secret-injection>"}
+}

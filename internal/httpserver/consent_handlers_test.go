@@ -61,7 +61,7 @@ func TestConsentTemplateEscapesClientAndUsesFixedScopeCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := &applicationHandler{templates: templates}
-	transaction := authflow.Transaction{Scopes: []string{"email", "openid", "profile"}}
+	transaction := authflow.Transaction{RedirectURI: "https://client.example.test/callback", Scopes: []string{"email", "openid", "profile"}}
 	clientValue := clientdomain.Client{Name: `<img src=x onerror="alert(1)">`}
 	evaluation := consent.Evaluation{AlreadyGranted: []string{"openid"}, NewScopes: []string{"email", "profile"}}
 	request := httptest.NewRequest(http.MethodGet, "/consent?lang=en", nil)
@@ -70,6 +70,9 @@ func TestConsentTemplateEscapesClientAndUsesFixedScopeCopy(t *testing.T) {
 	body := response.Body.String()
 	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("status=%d headers=%v", response.Code, response.Header())
+	}
+	if policy := response.Header().Get("Content-Security-Policy"); !strings.Contains(policy, "form-action 'self' https://client.example.test") {
+		t.Fatalf("Consent CSP did not allow the verified callback origin: %q", policy)
 	}
 	if strings.Contains(body, `<img src=x`) || !strings.Contains(body, "&lt;img src=x") {
 		t.Fatalf("Client name was not HTML escaped: %s", body)

@@ -2,7 +2,7 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-image=${ONEISSUER_IMAGE:-oneissuer:v0.1.0-dev.3}
+image=${ONEISSUER_IMAGE:-oneissuer:v0.1.0-dev.4}
 output_dir=${ONEISSUER_SUPPLY_CHAIN_DIR:-$root/.artifacts/supply-chain}
 
 # Tool releases are deliberately pinned by immutable manifest-list digest. Update

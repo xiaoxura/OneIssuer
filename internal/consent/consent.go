@@ -4,9 +4,14 @@
 package consent
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"io"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -29,6 +34,8 @@ type Grant struct {
 	Scopes    []string
 	CreatedAt time.Time
 	UpdatedAt time.Time
+	RevokedAt *time.Time
+	Version   int64
 }
 
 // Evaluation describes the request-relative view of a persisted grant. The
@@ -41,10 +48,126 @@ type Evaluation struct {
 	Covers         bool
 }
 
+// ManagedGrant is the owner-safe current-user projection. It intentionally has
+// no internal Grant/Client/family/Session identifier.
+type ManagedGrant struct {
+	ClientID               string              `json:"client_id"`
+	ClientName             string              `json:"client_name"`
+	ClientStatus           clientdomain.Status `json:"client_status"`
+	Scopes                 []string            `json:"scopes"`
+	CreatedAt              time.Time           `json:"created_at"`
+	UpdatedAt              time.Time           `json:"updated_at"`
+	RevokedAt              *time.Time          `json:"revoked_at,omitempty"`
+	HasActiveOfflineFamily bool                `json:"has_active_offline_family"`
+}
+
+// GrantCursor uses only the public list ordering keys.
+type GrantCursor struct {
+	UpdatedAt time.Time
+	ClientID  string
+}
+
+// GrantPage is a bounded owner-only list response.
+type GrantPage struct {
+	Items      []ManagedGrant `json:"items"`
+	NextCursor string         `json:"next_cursor,omitempty"`
+}
+
+// RevokeInput carries only the current owner and a public protocol Client ID.
+type RevokeInput struct {
+	UserID         uuid.UUID
+	PublicClientID string
+	RequestID      string
+	Now            time.Time
+}
+
 // Repository is the read boundary used before the final atomic authorization
 // commit. The commit path rechecks the grant under a PostgreSQL lock.
 type Repository interface {
 	GetConsentGrant(context.Context, uuid.UUID, uuid.UUID) (Grant, error)
+	ListCurrentUserGrants(context.Context, uuid.UUID, GrantCursor, int, time.Time) ([]ManagedGrant, error)
+	RevokeCurrentUserGrant(context.Context, RevokeInput) (ManagedGrant, error)
+}
+
+// ListMine returns a keyset page whose opaque cursor never embeds an internal UUID.
+func (s *Service) ListMine(ctx context.Context, userID uuid.UUID, rawCursor string, limit int, now time.Time) (GrantPage, error) {
+	if userID == uuid.Nil || limit < 1 || limit > 100 || now.IsZero() {
+		return GrantPage{}, ErrInvalid
+	}
+	cursor, err := DecodeGrantCursor(rawCursor)
+	if err != nil {
+		return GrantPage{}, ErrInvalid
+	}
+	items, err := s.repository.ListCurrentUserGrants(ctx, userID, cursor, limit+1, now.UTC())
+	if err != nil {
+		return GrantPage{}, err
+	}
+	page := GrantPage{Items: items}
+	if len(items) > limit {
+		page.Items = items[:limit]
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor = EncodeGrantCursor(GrantCursor{UpdatedAt: last.UpdatedAt, ClientID: last.ClientID})
+	}
+	return page, nil
+}
+
+// RevokeMine atomically revokes the owner-selected Grant and all dependent live
+// offline authority. Wrong-owner and unknown Client selectors share ErrNotFound.
+func (s *Service) RevokeMine(ctx context.Context, userID uuid.UUID, publicClientID, requestID string, now time.Time) (ManagedGrant, error) {
+	if userID == uuid.Nil || !validPublicClientID(publicClientID) || now.IsZero() {
+		return ManagedGrant{}, ErrNotFound
+	}
+	return s.repository.RevokeCurrentUserGrant(ctx, RevokeInput{
+		UserID: userID, PublicClientID: publicClientID, RequestID: requestID, Now: now.UTC(),
+	})
+}
+
+type grantCursorWire struct {
+	Version   int    `json:"v"`
+	UpdatedAt string `json:"u"`
+	ClientID  string `json:"c"`
+}
+
+// EncodeGrantCursor emits a versioned opaque cursor containing only safe keys.
+func EncodeGrantCursor(cursor GrantCursor) string {
+	if cursor.UpdatedAt.IsZero() || !validPublicClientID(cursor.ClientID) {
+		return ""
+	}
+	payload, _ := json.Marshal(grantCursorWire{Version: 1, UpdatedAt: cursor.UpdatedAt.UTC().Format(time.RFC3339Nano), ClientID: cursor.ClientID})
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+// DecodeGrantCursor strictly decodes the owner-list cursor.
+func DecodeGrantCursor(raw string) (GrantCursor, error) {
+	if raw == "" {
+		return GrantCursor{}, nil
+	}
+	if len(raw) > 1024 || strings.TrimSpace(raw) != raw {
+		return GrantCursor{}, ErrInvalid
+	}
+	payload, err := base64.RawURLEncoding.Strict().DecodeString(raw)
+	if err != nil {
+		return GrantCursor{}, ErrInvalid
+	}
+	var wire grantCursorWire
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil || decoder.Decode(&struct{}{}) != io.EOF || wire.Version != 1 || !validPublicClientID(wire.ClientID) {
+		return GrantCursor{}, ErrInvalid
+	}
+	updated, err := time.Parse(time.RFC3339Nano, wire.UpdatedAt)
+	if err != nil || updated.IsZero() || wire.UpdatedAt != updated.UTC().Format(time.RFC3339Nano) {
+		return GrantCursor{}, ErrInvalid
+	}
+	return GrantCursor{UpdatedAt: updated.UTC(), ClientID: wire.ClientID}, nil
+}
+
+func validPublicClientID(value string) bool {
+	if !strings.HasPrefix(value, "ois_cli_") || strings.TrimSpace(value) != value {
+		return false
+	}
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(strings.TrimPrefix(value, "ois_cli_"))
+	return err == nil && len(decoded) == 24
 }
 
 // Service applies strict phase-three scope and active-client policy.
@@ -76,8 +199,9 @@ func (s *Service) Evaluate(ctx context.Context, userID uuid.UUID, clientValue cl
 	if err != nil {
 		return Evaluation{}, err
 	}
-	if grant.ID == uuid.Nil || grant.UserID != userID || grant.ClientID != clientValue.ID ||
-		grant.CreatedAt.IsZero() || grant.UpdatedAt.Before(grant.CreatedAt) {
+	if grant.ID == uuid.Nil || grant.UserID != userID || grant.ClientID != clientValue.ID || grant.Version < 1 ||
+		grant.CreatedAt.IsZero() || grant.UpdatedAt.Before(grant.CreatedAt) ||
+		(grant.RevokedAt != nil && grant.RevokedAt.Before(grant.CreatedAt)) {
 		return Evaluation{}, ErrInvalid
 	}
 	grant.Scopes, err = CanonicalScopes(grant.Scopes)
@@ -86,6 +210,9 @@ func (s *Service) Evaluate(ctx context.Context, userID uuid.UUID, clientValue cl
 	}
 
 	effective := Intersection(grant.Scopes, clientValue.Scopes)
+	if grant.RevokedAt != nil {
+		effective = nil
+	}
 	already := Intersection(requested, effective)
 	newScopes := Difference(requested, effective)
 	grantCopy := grant
@@ -95,15 +222,15 @@ func (s *Service) Evaluate(ctx context.Context, userID uuid.UUID, clientValue cl
 	}, nil
 }
 
-// CanonicalScopes validates and returns the sorted, unique phase-three scope
+// CanonicalScopes validates and returns the sorted, unique phase-four scope
 // set. Callers do not get permissive trimming or duplicate normalization.
 func CanonicalScopes(scopes []string) ([]string, error) {
-	if len(scopes) < 1 || len(scopes) > 3 {
+	if len(scopes) < 1 || len(scopes) > 4 {
 		return nil, ErrInvalid
 	}
 	result := append([]string(nil), scopes...)
 	for _, scope := range result {
-		if scope != "openid" && scope != "profile" && scope != "email" {
+		if !supported(scope) {
 			return nil, ErrInvalid
 		}
 	}
@@ -119,7 +246,7 @@ func CanonicalScopes(scopes []string) ([]string, error) {
 	return result, nil
 }
 
-// Union returns a canonical union of two already-valid phase-three scope sets.
+// Union returns a canonical union of two already-valid phase-four scope sets.
 func Union(left, right []string) []string {
 	set := make(map[string]bool, len(left)+len(right))
 	for _, scope := range left {
@@ -135,9 +262,7 @@ func Union(left, right []string) []string {
 	return sortedSet(set)
 }
 
-// Intersection returns the supported canonical intersection. The right-hand
-// side may include future registry scopes such as offline_access; they are not
-// admitted into a phase-three grant.
+// Intersection returns the supported canonical intersection.
 func Intersection(left, right []string) []string {
 	allowed := make(map[string]bool, len(right))
 	for _, scope := range right {
@@ -189,7 +314,7 @@ func subset(values, allowed []string) bool {
 }
 
 func supported(scope string) bool {
-	return scope == "openid" || scope == "profile" || scope == "email"
+	return scope == "openid" || scope == "profile" || scope == "email" || scope == "offline_access"
 }
 
 func contains(scopes []string, target string) bool {

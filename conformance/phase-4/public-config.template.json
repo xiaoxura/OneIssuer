@@ -1,0 +1,7 @@
+{
+  "alias": "<unique-phase4-public-alias>",
+  "description": "OneIssuer v0.1.0-dev.4 phase-four public lifecycle profile",
+  "server": {"discoveryUrl": "https://<issuer-host>/.well-known/openid-configuration"},
+  "client": {"client_id": "<runtime-public-client-id>"},
+  "client2": {"client_id": "<runtime-public-client-id>"}
+}

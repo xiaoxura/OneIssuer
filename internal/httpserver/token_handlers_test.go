@@ -119,7 +119,7 @@ func TestTokenHandlerUsesStableOAuthErrors(t *testing.T) {
 		wantChallenge string
 	}{
 		{name: "method", method: http.MethodGet, form: validHTTPTokenForm(), wantStatus: http.StatusMethodNotAllowed},
-		{name: "unsupported grant", method: http.MethodPost, form: mutateHTTPForm(func(values url.Values) { values.Set("grant_type", "refresh_token") }), wantStatus: http.StatusBadRequest, wantCode: "unsupported_grant_type"},
+		{name: "unsupported grant", method: http.MethodPost, form: mutateHTTPForm(func(values url.Values) { values.Set("grant_type", "client_credentials") }), wantStatus: http.StatusBadRequest, wantCode: "unsupported_grant_type"},
 		{name: "duplicate code", method: http.MethodPost, form: mutateHTTPForm(func(values url.Values) { values.Add("code", values.Get("code")) }), wantStatus: http.StatusBadRequest, wantCode: "invalid_request"},
 		{name: "unknown public", method: http.MethodPost, form: mutateHTTPForm(func(values url.Values) { values.Set("client_id", httpClientID(9)) }), wantStatus: http.StatusUnauthorized, wantCode: "invalid_client"},
 		{name: "bad Basic", method: http.MethodPost, form: mutateHTTPForm(func(values url.Values) { values.Del("client_id") }), header: "Basic !!!", wantStatus: http.StatusUnauthorized, wantCode: "invalid_client", wantChallenge: "Basic"},
@@ -287,6 +287,10 @@ type fakeProtocolTokens struct {
 	exchangeErr      error
 	exchangeInput    token.ExchangeInput
 	exchangeCalls    int
+	refreshResponse  token.Response
+	refreshErr       error
+	refreshInput     token.RefreshInput
+	refreshCalls     int
 	userinfo         token.UserInfo
 	userinfoErr      error
 	bearer           string
@@ -298,6 +302,18 @@ func (f *fakeProtocolTokens) Exchange(_ context.Context, input token.ExchangeInp
 	f.exchangeCalls++
 	f.exchangeInput = input
 	return f.exchangeResponse, f.exchangeErr
+}
+
+func (f *fakeProtocolTokens) Refresh(_ context.Context, input token.RefreshInput) (token.Response, error) {
+	f.refreshCalls++
+	f.refreshInput = input
+	return f.refreshResponse, f.refreshErr
+}
+
+func (f *fakeProtocolTokens) Revoke(context.Context, token.RevocationInput) error { return nil }
+
+func (f *fakeProtocolTokens) Introspect(context.Context, token.IntrospectionInput) (token.IntrospectionResponse, error) {
+	return token.IntrospectionResponse{Active: false}, nil
 }
 
 func (f *fakeProtocolTokens) UserInfoForAccessToken(_ context.Context, bearer string, now time.Time) (token.UserInfo, error) {

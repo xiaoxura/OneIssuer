@@ -84,8 +84,9 @@ func testPhaseTwoUpgrade(ctx context.Context, t *testing.T, adminDatabaseURL str
 	if err := postgres.MigrateUp(ctx, database, productionmigrations.FS, "."); err != nil {
 		t.Fatalf("repeat phase-three migration after upgrade: %v", err)
 	}
-	assertMigrationVersion(ctx, t, database, 10)
+	assertMigrationVersion(ctx, t, database, 15)
 	assertPhaseTwoFixturePreserved(ctx, t, database, fixture)
+	assertPhaseTwoUpgradeIntroducesNoNewAuthority(ctx, t, database)
 	assertPhaseTwoAuthorizationTerminal(ctx, t, database, fixture)
 	assertPhaseThreeSchemaInstalled(ctx, t, database)
 
@@ -103,7 +104,7 @@ func testPhaseTwoUpgrade(ctx context.Context, t *testing.T, adminDatabaseURL str
 	if err := postgres.RunMigrationCommand(ctx, upgradeURL, postgres.MigrationStatus, &status); err != nil {
 		t.Fatalf("migration status after phase-two upgrade: %v", err)
 	}
-	if got := status.String(); !strings.Contains(got, "current_version=10 expected_version=10 status=current") {
+	if got := status.String(); !strings.Contains(got, "current_version=15 expected_version=15 status=current") {
 		t.Fatalf("migration status after phase-two upgrade = %q", got)
 	}
 }
@@ -231,6 +232,24 @@ func insertPhaseTwoUpgradeFixture(ctx context.Context, t *testing.T, database *s
 
 func assertPhaseTwoFixturePreserved(ctx context.Context, t *testing.T, database *sql.DB, fixture phaseTwoUpgradeFixture) {
 	t.Helper()
+	var hardened bool
+	if err := database.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_schema='public' AND table_name='users' AND column_name='version'
+	)`).Scan(&hardened); err != nil {
+		t.Fatalf("detect security-hardening schema: %v", err)
+	}
+	userVersionClause := ""
+	clientVersionClause := ""
+	preAuthAttemptClause := ""
+	sessionBindingClause := ""
+	if hardened {
+		userVersionClause = " AND u.version=1"
+		clientVersionClause = " AND version=1"
+		preAuthAttemptClause = " AND attempt_count=0"
+		sessionBindingClause = " AND session_binding_id=id"
+	}
+
 	assertUpgradeRow(ctx, t, database, "user and credential", `SELECT EXISTS (
 		SELECT 1 FROM users u JOIN credentials c ON c.user_id=u.id
 		WHERE u.id=$1 AND u.subject='phase-two-subject-0001'
@@ -238,7 +257,7 @@ func assertPhaseTwoFixturePreserved(ctx context.Context, t *testing.T, database 
 		  AND u.display_name='Phase Two User' AND u.email='Phase-Two@example.invalid'
 		  AND u.email_normalized='phase-two@example.invalid' AND u.email_verified
 		  AND u.status='active' AND u.role='user' AND u.created_at=$2
-		  AND u.updated_at=$3 AND u.last_login_at=$4
+		  AND u.updated_at=$3 AND u.last_login_at=$4`+userVersionClause+`
 		  AND c.credential_type='password' AND c.password_hash=$5
 		  AND c.created_at=$2 AND c.updated_at=$3
 	)`, fixture.userID, fixture.base, fixture.base.Add(time.Second), fixture.base.Add(2*time.Second), phaseTwoPasswordHash)
@@ -247,7 +266,7 @@ func assertPhaseTwoFixturePreserved(ctx context.Context, t *testing.T, database 
 		WHERE id=$1 AND client_id=$2 AND client_type='public' AND token_endpoint_auth_method='none'
 		  AND name='Phase Two RP' AND description='preserved description'
 		  AND logo_uri='https://phase-two-rp.example/logo.png' AND status='active'
-		  AND registration_enabled AND created_at=$3 AND updated_at=$4
+		  AND registration_enabled AND created_at=$3 AND updated_at=$4`+clientVersionClause+`
 	)`, fixture.clientID, phaseTwoClientID, fixture.base, fixture.base.Add(time.Second))
 	assertUpgradeRow(ctx, t, database, "client redirect URI", `SELECT
 		count(*)=1 AND bool_and(uri=$2 AND created_at=$3)
@@ -263,13 +282,13 @@ func assertPhaseTwoFixturePreserved(ctx context.Context, t *testing.T, database 
 		SELECT 1 FROM login_sessions WHERE id=$1 AND user_id=$2 AND token_hash=$3 AND csrf_hash=$4
 		  AND csrf_expires_at=$5 AND created_at=$6 AND last_seen_at=$7 AND authenticated_at=$6
 		  AND expires_at=$8 AND idle_expires_at=$9 AND revoked_at IS NULL AND revoke_reason IS NULL
-		  AND user_agent_hash=$10 AND ip_prefix='192.0.2.0/24'
+		  AND user_agent_hash=$10 AND ip_prefix='192.0.2.0/24'`+sessionBindingClause+`
 	)`, fixture.sessionID, fixture.userID, fixture.sessionHash, fixture.csrfHash,
 		fixture.base.Add(20*time.Minute), fixture.base.Add(3*time.Second), fixture.base.Add(4*time.Second),
 		fixture.base.Add(24*time.Hour), fixture.base.Add(2*time.Hour), bytes.Repeat([]byte{0x33}, 32))
 	assertUpgradeRow(ctx, t, database, "pre-auth session", `SELECT EXISTS (
 		SELECT 1 FROM preauth_sessions WHERE id=$1 AND token_hash=$2 AND csrf_hash=$3
-		  AND auth_transaction_id=$4 AND created_at=$5 AND expires_at=$6 AND consumed_at IS NULL
+		  AND auth_transaction_id=$4 AND created_at=$5 AND expires_at=$6 AND consumed_at IS NULL`+preAuthAttemptClause+`
 	)`, fixture.preAuthID, fixture.preAuthHash, fixture.csrfHash, fixture.transactionID,
 		fixture.base.Add(6*time.Second), fixture.base.Add(10*time.Minute))
 	assertUpgradeRow(ctx, t, database, "audit event", `SELECT EXISTS (
@@ -278,6 +297,17 @@ func assertPhaseTwoFixturePreserved(ctx context.Context, t *testing.T, database 
 		  AND target_id=$3 AND request_id='phase-two-upgrade' AND changed_fields=ARRAY[]::text[]
 		  AND occurred_at=$4
 	)`, fixture.auditID, fixture.userID, fixture.transactionID, fixture.base.Add(5*time.Second))
+}
+
+func assertPhaseTwoUpgradeIntroducesNoNewAuthority(ctx context.Context, t *testing.T, database *sql.DB) {
+	t.Helper()
+	assertUpgradeRow(ctx, t, database, "no fabricated phase-four authority", `SELECT
+		NOT EXISTS (SELECT 1 FROM consent_grants)
+		AND NOT EXISTS (SELECT 1 FROM authorization_codes)
+		AND NOT EXISTS (SELECT 1 FROM access_tokens)
+		AND NOT EXISTS (SELECT 1 FROM refresh_token_families)
+		AND NOT EXISTS (SELECT 1 FROM refresh_tokens)
+		AND NOT EXISTS (SELECT 1 FROM logout_transactions)`)
 }
 
 func assertPhaseTwoAuthorizationTerminal(ctx context.Context, t *testing.T, database *sql.DB, fixture phaseTwoUpgradeFixture) {
@@ -302,13 +332,43 @@ func assertPhaseThreeSchemaInstalled(ctx context.Context, t *testing.T, database
 		to_regclass('public.consent_grants') IS NOT NULL
 		AND to_regclass('public.authorization_codes') IS NOT NULL
 		AND to_regclass('public.access_tokens') IS NOT NULL
-		AND (SELECT count(*) FROM information_schema.columns
-			 WHERE table_schema='public' AND table_name='auth_transactions'
-			   AND column_name IN ('response_type','response_mode','prompt_values','max_age_seconds'))=4
-		AND (SELECT count(*) FROM pg_constraint WHERE conname IN (
-			'auth_transactions_prompt_valid', 'auth_transactions_authorization_context',
-			'consent_grants_scopes_valid', 'authorization_codes_pkce_valid',
-			'access_tokens_scopes_valid'))=5`)
+			AND (SELECT count(*) FROM information_schema.columns
+				 WHERE table_schema='public' AND table_name='auth_transactions'
+				   AND column_name IN ('response_type','response_mode','prompt_values','max_age_seconds'))=4
+			AND (SELECT count(*) FROM information_schema.columns
+				 WHERE table_schema='public' AND (
+				   (table_name='users' AND column_name='version') OR
+				   (table_name='oidc_clients' AND column_name='version') OR
+				   (table_name='preauth_sessions' AND column_name='attempt_count')))=3
+			AND (SELECT count(*) FROM pg_constraint WHERE conname IN (
+				'auth_transactions_prompt_valid', 'auth_transactions_authorization_context',
+				'consent_grants_scopes_valid', 'authorization_codes_pkce_valid',
+				'access_tokens_scopes_valid', 'users_version_valid', 'oidc_clients_version_valid',
+				'preauth_sessions_attempt_count_valid'))=8
+			AND to_regclass('public.audit_events_code_exchange_rejection_target_idx') IS NOT NULL
+			AND to_regclass('public.preauth_sessions_consumed_retirement_idx') IS NOT NULL
+			AND to_regclass('public.login_sessions_revoked_retirement_idx') IS NOT NULL
+			AND to_regclass('public.login_sessions_expiry_retirement_idx') IS NOT NULL
+			AND to_regclass('public.login_sessions_idle_retirement_idx') IS NOT NULL
+			AND to_regclass('public.auth_transactions_consumed_retirement_idx') IS NOT NULL
+			AND to_regclass('public.authorization_codes_retirement_idx') IS NOT NULL
+				AND (SELECT indisunique FROM pg_index
+					 WHERE indexrelid='public.audit_events_code_exchange_rejection_target_idx'::regclass)`)
+	assertUpgradeRow(ctx, t, database, "phase-four lifecycle tables and authority guards", `SELECT
+		to_regclass('public.refresh_token_families') IS NOT NULL
+		AND to_regclass('public.refresh_tokens') IS NOT NULL
+		AND to_regclass('public.logout_transactions') IS NOT NULL
+		AND to_regclass('public.refresh_token_families_terminal_retirement_idx') IS NOT NULL
+		AND to_regclass('public.access_tokens_authorization_code_source_idx') IS NOT NULL
+		AND to_regclass('public.audit_events_refresh_reuse_target_idx') IS NOT NULL
+		AND EXISTS (SELECT 1 FROM pg_constraint WHERE conname='refresh_token_families_scopes_valid')
+		AND EXISTS (SELECT 1 FROM pg_constraint WHERE conname='refresh_tokens_lifetime_valid')
+		AND EXISTS (SELECT 1 FROM pg_constraint WHERE conname='access_tokens_source_valid')
+		AND EXISTS (SELECT 1 FROM pg_constraint WHERE conname='logout_transactions_authority_stage_valid')
+		AND EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='refresh_token_families_origin_guard' AND NOT tgisinternal)
+		AND EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='refresh_tokens_lifetime_guard' AND NOT tgisinternal)
+		AND EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='access_tokens_authority_guard' AND NOT tgisinternal)
+		AND EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='access_tokens_immutable_source' AND NOT tgisinternal)`)
 }
 
 func assertPhaseTwoAuthorityUsable(ctx context.Context, t *testing.T, store *postgres.Store, fixture phaseTwoUpgradeFixture) {

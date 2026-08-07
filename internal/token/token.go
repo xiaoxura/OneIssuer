@@ -38,6 +38,9 @@ var (
 	ErrInvalidGrant = errors.New("authorization grant is invalid")
 	// ErrInvalidToken deliberately merges all Bearer validation failures.
 	ErrInvalidToken = errors.New("access token is invalid")
+	// ErrInvalidScope identifies a refresh request that would expand or otherwise
+	// violate the current family/Grant/Client scope intersection.
+	ErrInvalidScope = errors.New("requested token scope is invalid")
 )
 
 // KeyStore is the restricted signing/verification view required by the Token
@@ -61,14 +64,16 @@ type ExchangeInput struct {
 // Authority is built by the repository only after locking/revalidating Code,
 // User, Client, Grant, Redirect URI, Scope, and PKCE.
 type Authority struct {
-	CodeID          uuid.UUID
-	GrantID         uuid.UUID
-	User            identity.User
-	Client          clientdomain.Client
-	Scopes          []string
-	Nonce           string
-	AuthenticatedAt time.Time
-	IssuedAt        time.Time
+	CodeID           uuid.UUID
+	GrantID          uuid.UUID
+	OriginSessionID  *uuid.UUID
+	SessionBindingID *uuid.UUID
+	User             identity.User
+	Client           clientdomain.Client
+	Scopes           []string
+	Nonce            string
+	AuthenticatedAt  time.Time
+	IssuedAt         time.Time
 }
 
 // Minted is generated inside the repository transaction. JWTs remain transient;
@@ -81,28 +86,37 @@ type Minted struct {
 	IssuedAt        time.Time
 	AccessExpiresAt time.Time
 	IDExpiresAt     time.Time
+	InitialRefresh  *InitialRefresh
 }
 
 // Response is emitted only after the repository commit succeeds.
 type Response struct {
-	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"`
-	ExpiresIn   int64  `json:"expires_in"`
-	IDToken     string `json:"id_token"`
-	Scope       string `json:"scope"`
+	AccessToken  string `json:"access_token"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int64  `json:"expires_in"`
+	IDToken      string `json:"id_token,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	Scope        string `json:"scope"`
 }
 
 // AccessMetadata is the database authority required for UserInfo acceptance.
 type AccessMetadata struct {
-	ID                  uuid.UUID
-	JTIHash             []byte
-	AuthorizationCodeID uuid.UUID
-	ConsentGrantID      uuid.UUID
-	UserID              uuid.UUID
-	ClientID            uuid.UUID
-	Scopes              []string
-	IssuedAt            time.Time
-	ExpiresAt           time.Time
+	ID                   uuid.UUID
+	JTIHash              []byte
+	AuthorizationCodeID  *uuid.UUID
+	ConsentGrantID       uuid.UUID
+	UserID               uuid.UUID
+	ClientID             uuid.UUID
+	Scopes               []string
+	IssuedAt             time.Time
+	ExpiresAt            time.Time
+	IssuanceSource       IssuanceSource
+	SourceRefreshTokenID *uuid.UUID
+	RefreshFamilyID      *uuid.UUID
+	OriginSessionID      *uuid.UUID
+	SessionBindingID     *uuid.UUID
+	RevokedAt            *time.Time
+	RevokeReason         string
 }
 
 // AccessAuthority joins metadata with current credential-free domain views.
@@ -111,6 +125,7 @@ type AccessAuthority struct {
 	Grant    consent.Grant
 	User     identity.User
 	Client   clientdomain.Client
+	Family   *RefreshFamily
 }
 
 // MintFunc runs after the repository has locked and validated all authority.
@@ -120,7 +135,10 @@ type MintFunc func(context.Context, Authority) (Minted, error)
 // server-authoritative UserInfo metadata lookup.
 type Repository interface {
 	ExchangeAuthorizationCode(context.Context, ExchangeInput, MintFunc) (Response, error)
+	ExchangeRefreshToken(context.Context, RefreshInput, RefreshMintFunc) (Response, error)
+	RevokeToken(context.Context, RevocationLookup) error
 	GetAccessTokenAuthority(context.Context, []byte, time.Time) (AccessAuthority, error)
+	GetRefreshTokenAuthority(context.Context, []byte) (RefreshTokenAuthority, error)
 }
 
 // Metrics records only bounded token operation/result labels.
@@ -130,19 +148,21 @@ type Metrics interface {
 
 // Service implements the fixed RS256 claim and lifecycle profile.
 type Service struct {
-	repository       Repository
-	keys             KeyStore
-	random           io.Reader
-	issuer           string
-	userinfoAudience string
-	idTokenTTL       time.Duration
-	accessTokenTTL   time.Duration
-	clockSkew        time.Duration
-	metrics          Metrics
+	repository         Repository
+	keys               KeyStore
+	random             io.Reader
+	issuer             string
+	userinfoAudience   string
+	idTokenTTL         time.Duration
+	accessTokenTTL     time.Duration
+	clockSkew          time.Duration
+	refreshTokenTTL    time.Duration
+	refreshAbsoluteTTL time.Duration
+	metrics            Metrics
 }
 
 // NewService creates a token service from a canonical origin Issuer.
-func NewService(repository Repository, keys KeyStore, randomSource io.Reader, issuer string, idTokenTTL, accessTokenTTL, clockSkew time.Duration, metrics Metrics) (*Service, error) {
+func NewService(repository Repository, keys KeyStore, randomSource io.Reader, issuer string, idTokenTTL, accessTokenTTL, clockSkew time.Duration, metrics Metrics, options ...ServiceOption) (*Service, error) {
 	parsed, err := url.Parse(issuer)
 	if repository == nil || keys == nil || err != nil || !parsed.IsAbs() || parsed.Host == "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil ||
 		idTokenTTL < time.Minute || idTokenTTL > 15*time.Minute || accessTokenTTL < time.Minute || accessTokenTTL > 30*time.Minute || clockSkew < 0 || clockSkew > 2*time.Minute {
@@ -151,11 +171,19 @@ func NewService(repository Repository, keys KeyStore, randomSource io.Reader, is
 	if randomSource == nil {
 		randomSource = rand.Reader
 	}
-	return &Service{
+	service := &Service{
 		repository: repository, keys: keys, random: randomSource, issuer: issuer,
 		userinfoAudience: issuer + "/oauth2/userinfo", idTokenTTL: idTokenTTL,
-		accessTokenTTL: accessTokenTTL, clockSkew: clockSkew, metrics: metrics,
-	}, nil
+		accessTokenTTL: accessTokenTTL, clockSkew: clockSkew,
+		refreshTokenTTL: defaultRefreshTTL, refreshAbsoluteTTL: defaultAbsoluteTTL,
+		metrics: metrics,
+	}
+	for _, option := range options {
+		if option == nil || option(service) != nil {
+			return nil, ErrInvalid
+		}
+	}
+	return service, nil
 }
 
 // Exchange delegates validation and atomic consumption to the repository. The
@@ -184,6 +212,43 @@ func (s *Service) Exchange(ctx context.Context, input ExchangeInput) (Response, 
 		return Response{}, err
 	}
 	s.observe("exchange", "success")
+	s.observe("issuance", "success")
+	return response, nil
+}
+
+// Refresh rotates one digest-selected generation and mints a new Access Token.
+// Any clear replacement remains inside the callback/response boundary until the
+// repository reports a successful commit.
+func (s *Service) Refresh(ctx context.Context, input RefreshInput) (Response, error) {
+	input.Now = input.Now.UTC()
+	if len(input.TokenHash) != sha256.Size || input.Now.IsZero() || !activeClient(input.Client) {
+		s.observe("refresh", "rejected")
+		return Response{}, ErrInvalidGrant
+	}
+	if input.RequestedScopes != nil {
+		canonical, err := consent.CanonicalScopes(input.RequestedScopes)
+		if err != nil || !slices.Equal(canonical, input.RequestedScopes) {
+			s.observe("refresh", "rejected")
+			return Response{}, ErrInvalidScope
+		}
+	}
+	mintAttempted := false
+	response, err := s.repository.ExchangeRefreshToken(ctx, input, func(mintCtx context.Context, authority RefreshAuthority) (RefreshMinted, error) {
+		mintAttempted = true
+		return s.mintRefresh(mintCtx, authority)
+	})
+	if err != nil {
+		result := "failure"
+		if errors.Is(err, ErrInvalidGrant) || errors.Is(err, ErrInvalidScope) {
+			result = "rejected"
+		}
+		s.observe("refresh", result)
+		if mintAttempted {
+			s.observe("issuance", "failure")
+		}
+		return Response{}, err
+	}
+	s.observe("refresh", "success")
 	s.observe("issuance", "success")
 	return response, nil
 }
@@ -235,9 +300,90 @@ func (s *Service) mint(_ context.Context, authority Authority) (Minted, error) {
 	if err != nil {
 		return Minted{}, errors.New("access token signing failed")
 	}
-	return Minted{
+	minted := Minted{
 		AccessTokenID: accessTokenID, JTIHash: HashJTI(jti), AccessToken: accessToken, IDToken: idToken,
 		IssuedAt: issuedAt, AccessExpiresAt: accessExpires, IDExpiresAt: idExpires,
+	}
+	if slices.Contains(scopes, "offline_access") {
+		if authority.OriginSessionID == nil || *authority.OriginSessionID == uuid.Nil ||
+			authority.SessionBindingID == nil || *authority.SessionBindingID == uuid.Nil {
+			return Minted{}, ErrInvalidGrant
+		}
+		clearRefresh, refreshHash, err := GenerateRefreshToken(s.random)
+		if err != nil {
+			return Minted{}, err
+		}
+		familyID, err := uuid.NewRandomFromReader(s.random)
+		if err != nil {
+			return Minted{}, errors.New("refresh token family identifier generation failed")
+		}
+		refreshID, err := uuid.NewRandomFromReader(s.random)
+		if err != nil {
+			return Minted{}, errors.New("refresh token identifier generation failed")
+		}
+		rolling, absolute, err := RefreshDeadlines(issuedAt, s.refreshTokenTTL, s.refreshAbsoluteTTL)
+		if err != nil {
+			return Minted{}, err
+		}
+		minted.InitialRefresh = &InitialRefresh{
+			FamilyID: familyID, TokenID: refreshID, TokenHash: refreshHash,
+			ClearToken: clearRefresh, ExpiresAt: rolling, AbsoluteExpiresAt: absolute,
+		}
+	}
+	return minted, nil
+}
+
+func (s *Service) mintRefresh(_ context.Context, authority RefreshAuthority) (RefreshMinted, error) {
+	issuedAt := authority.IssuedAt.UTC()
+	scopes, err := consent.CanonicalScopes(authority.AccessScopes)
+	if err != nil || authority.Presented.ID == uuid.Nil || authority.Family.ID == uuid.Nil ||
+		authority.Presented.FamilyID != authority.Family.ID || authority.User.ID != authority.Family.UserID ||
+		authority.Client.ID != authority.Family.ClientID || authority.Grant.ID != authority.Family.ConsentGrantID ||
+		authority.User.Status != identity.StatusActive || !activeClient(authority.Client) ||
+		issuedAt.IsZero() || authority.Family.RevokedAt != nil || !issuedAt.Before(authority.Family.AbsoluteExpiresAt) ||
+		!scopeSubset(scopes, authority.Family.Scopes) || !scopeSubset(scopes, authority.Client.Scopes) {
+		return RefreshMinted{}, ErrInvalidGrant
+	}
+
+	replacementClear, replacementHash, err := GenerateRefreshToken(s.random)
+	if err != nil {
+		return RefreshMinted{}, err
+	}
+	replacementID, err := uuid.NewRandomFromReader(s.random)
+	if err != nil {
+		return RefreshMinted{}, errors.New("replacement refresh token identifier generation failed")
+	}
+	replacementExpires, err := ReplacementRefreshExpiry(issuedAt, s.refreshTokenTTL, authority.Family.AbsoluteExpiresAt)
+	if err != nil {
+		return RefreshMinted{}, err
+	}
+	jti, err := newJTI(s.random)
+	if err != nil {
+		return RefreshMinted{}, err
+	}
+	accessID, err := uuid.NewRandomFromReader(s.random)
+	if err != nil {
+		return RefreshMinted{}, errors.New("access token identifier generation failed")
+	}
+	accessExpires := issuedAt.Add(s.accessTokenTTL)
+	claims := AccessTokenClaims{
+		Issuer: s.issuer, Subject: authority.User.Subject, Audience: s.userinfoAudience,
+		ClientID: authority.Client.ClientID, Scope: strings.Join(scopes, " "),
+		IssuedAt: issuedAt.Unix(), ExpiresAt: accessExpires.Unix(), JWTID: jti,
+	}
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		return RefreshMinted{}, errors.New("access token claim serialization failed")
+	}
+	accessToken, err := s.keys.Sign(payload, "at+jwt")
+	if err != nil {
+		return RefreshMinted{}, errors.New("access token signing failed")
+	}
+	return RefreshMinted{
+		AccessTokenID: accessID, JTIHash: HashJTI(jti), AccessToken: accessToken,
+		IssuedAt: issuedAt, AccessExpiresAt: accessExpires,
+		ReplacementTokenID: replacementID, ReplacementTokenHash: replacementHash,
+		ReplacementClearToken: replacementClear, ReplacementExpiresAt: replacementExpires,
 	}, nil
 }
 
@@ -287,7 +433,15 @@ func (s *Service) UserInfoForAccessToken(ctx context.Context, compact string, no
 		return UserInfo{}, ErrInvalidToken
 	}
 	authority, err := s.repository.GetAccessTokenAuthority(ctx, HashJTI(claims.JWTID), now.UTC())
-	if err != nil || !s.accessAuthorityMatches(authority, claims, now.UTC()) {
+	if err != nil {
+		if errors.Is(err, ErrInvalidToken) {
+			s.observe("userinfo", "rejected")
+			return UserInfo{}, ErrInvalidToken
+		}
+		s.observe("userinfo", "failure")
+		return UserInfo{}, err
+	}
+	if !s.accessAuthorityMatches(authority, claims, now.UTC()) {
 		s.observe("userinfo", "rejected")
 		return UserInfo{}, ErrInvalidToken
 	}
@@ -350,13 +504,42 @@ func (s *Service) verifyAccessToken(compact string, now time.Time) (AccessTokenC
 func (s *Service) accessAuthorityMatches(authority AccessAuthority, claims AccessTokenClaims, now time.Time) bool {
 	metadata := authority.Metadata
 	scopes, err := consent.CanonicalScopes(metadata.Scopes)
-	if err != nil || metadata.ID == uuid.Nil || metadata.AuthorizationCodeID == uuid.Nil || metadata.ConsentGrantID == uuid.Nil ||
+	if err != nil || metadata.ID == uuid.Nil || metadata.ConsentGrantID == uuid.Nil || metadata.RevokedAt != nil ||
 		metadata.UserID == uuid.Nil || metadata.ClientID == uuid.Nil || len(metadata.JTIHash) != sha256.Size ||
 		!now.Before(metadata.ExpiresAt) || metadata.IssuedAt.IsZero() || !metadata.ExpiresAt.After(metadata.IssuedAt) ||
 		authority.User.ID != metadata.UserID || authority.User.Status != identity.StatusActive ||
 		authority.Client.ID != metadata.ClientID || !activeClient(authority.Client) ||
-		authority.Grant.ID != metadata.ConsentGrantID || authority.Grant.UserID != metadata.UserID || authority.Grant.ClientID != metadata.ClientID {
+		authority.Grant.ID != metadata.ConsentGrantID || authority.Grant.UserID != metadata.UserID || authority.Grant.ClientID != metadata.ClientID ||
+		authority.Grant.Version < 1 || authority.Grant.RevokedAt != nil {
 		return false
+	}
+	switch metadata.IssuanceSource {
+	case IssuanceAuthorizationCode:
+		if metadata.SourceRefreshTokenID != nil {
+			return false
+		}
+	case IssuanceRefreshToken:
+		if metadata.AuthorizationCodeID != nil || metadata.SourceRefreshTokenID == nil || metadata.RefreshFamilyID == nil || metadata.SessionBindingID == nil {
+			return false
+		}
+	default:
+		return false
+	}
+	if metadata.RefreshFamilyID == nil {
+		if authority.Family != nil {
+			return false
+		}
+	} else {
+		family := authority.Family
+		if family == nil || family.ID != *metadata.RefreshFamilyID || family.RevokedAt != nil || !now.Before(family.AbsoluteExpiresAt) ||
+			family.UserID != metadata.UserID || family.ClientID != metadata.ClientID || family.ConsentGrantID != metadata.ConsentGrantID ||
+			metadata.SessionBindingID == nil || family.SessionBindingID != *metadata.SessionBindingID {
+			return false
+		}
+		familyScopes, familyErr := CanonicalRefreshScopes(family.Scopes)
+		if familyErr != nil || !scopeSubset(scopes, familyScopes) {
+			return false
+		}
 	}
 	claimScopes, err := parseScopeClaim(claims.Scope)
 	if err != nil || !slices.Equal(scopes, claimScopes) || !scopeSubset(scopes, authority.Client.Scopes) ||

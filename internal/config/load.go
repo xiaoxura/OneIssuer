@@ -13,22 +13,23 @@ import (
 )
 
 const (
-	defaultIssuer           = "http://localhost:8080"
-	defaultMaxHeaderBytes   = 1 << 20
-	maxShutdownTimeout      = 5 * time.Minute
-	maxHTTPTimeout          = 10 * time.Minute
-	maxHeaderBytes          = 16 << 20
-	maxDatabaseConnections  = 100
-	maxSessionTTL           = 30 * 24 * time.Hour
-	maxCSRFTTL              = time.Hour
-	maxAuthTransactionTTL   = time.Hour
-	minAuthorizationCodeTTL = 30 * time.Second
-	maxAuthorizationCodeTTL = 5 * time.Minute
-	minIDTokenTTL           = time.Minute
-	maxIDTokenTTL           = 15 * time.Minute
-	minAccessTokenTTL       = time.Minute
-	maxAccessTokenTTL       = 30 * time.Minute
-	maxOIDCClockSkew        = 2 * time.Minute
+	defaultIssuer            = "http://localhost:8080"
+	defaultMaxHeaderBytes    = 1 << 20
+	maxShutdownTimeout       = 5 * time.Minute
+	maxHTTPTimeout           = 10 * time.Minute
+	maxHeaderBytes           = 16 << 20
+	maxDatabaseConnections   = 100
+	maxArgon2MemoryBudgetKiB = 1024 * 1024
+	maxSessionTTL            = 30 * 24 * time.Hour
+	maxCSRFTTL               = time.Hour
+	maxAuthTransactionTTL    = time.Hour
+	minAuthorizationCodeTTL  = 30 * time.Second
+	maxAuthorizationCodeTTL  = 5 * time.Minute
+	minIDTokenTTL            = time.Minute
+	maxIDTokenTTL            = 15 * time.Minute
+	minAccessTokenTTL        = time.Minute
+	maxAccessTokenTTL        = 30 * time.Minute
+	maxOIDCClockSkew         = 2 * time.Minute
 )
 
 var cookieNamePattern = regexp.MustCompile(`^[!#$%&'*+.^_` + "`" + `|~0-9A-Za-z-]+$`)
@@ -76,13 +77,6 @@ func LoadFrom(lookup LookupEnv, scope Scope) (Config, error) {
 
 	parseInt32(lookup, "ONEISSUER_DATABASE_MAX_CONNS", cfg.Database.MaxConns, 1, maxDatabaseConnections, &cfg.Database.MaxConns, &problems)
 
-	if scope == ScopeDatabase {
-		if len(problems) > 0 {
-			return Config{}, &ValidationError{Problems: problems}
-		}
-		return cfg, nil
-	}
-
 	environmentRaw, _ := valueOrDefault(lookup, "ONEISSUER_ENV", string(cfg.Environment))
 	switch Environment(environmentRaw) {
 	case EnvironmentDevelopment, EnvironmentTest, EnvironmentProduction:
@@ -90,10 +84,18 @@ func LoadFrom(lookup LookupEnv, scope Scope) (Config, error) {
 	default:
 		problems = append(problems, Problem{"ONEISSUER_ENV", "must be one of development, test, production"})
 	}
-	parsePasswordConfig(lookup, &cfg, &problems)
-	if cfg.Environment == EnvironmentProduction && databaseURLSet && databaseDisablesTLS(databaseURL) {
-		problems = append(problems, Problem{"ONEISSUER_DATABASE_URL", "must not disable TLS in production"})
+	if cfg.Environment == EnvironmentProduction && databaseURLSet && !databaseUsesVerifyFull(databaseURL) {
+		problems = append(problems, Problem{"ONEISSUER_DATABASE_URL", "must explicitly use sslmode=verify-full in production"})
 	}
+
+	if scope == ScopeDatabase {
+		if len(problems) > 0 {
+			return Config{}, &ValidationError{Problems: problems}
+		}
+		return cfg, nil
+	}
+
+	parsePasswordConfig(lookup, &cfg, &problems)
 	if scope == ScopeBootstrap {
 		if len(problems) > 0 {
 			return Config{}, &ValidationError{Problems: problems}
@@ -141,6 +143,7 @@ func LoadFrom(lookup LookupEnv, scope Scope) (Config, error) {
 	parseTrustedProxies(lookup, &cfg, &problems)
 	parseBrowserConfig(lookup, &cfg, &problems)
 	parseOIDCConfig(lookup, &cfg, &problems)
+	parseLifecycleConfig(lookup, &cfg, &problems)
 
 	if len(problems) > 0 {
 		return Config{}, &ValidationError{Problems: problems}
@@ -175,6 +178,10 @@ func defaults() Config {
 			AuthTransactionTTL:  10 * time.Minute,
 			LoginReauthWindow:   15 * time.Minute,
 			CleanupInterval:     5 * time.Minute,
+			AuthRatePerMinute:   20,
+			AuthRateBurst:       10,
+			AuthGlobalRate:      50,
+			AuthGlobalBurst:     100,
 			RegistrationEnabled: false,
 		},
 		Password: PasswordConfig{
@@ -190,6 +197,17 @@ func defaults() Config {
 			IDTokenTTL:           5 * time.Minute,
 			AccessTokenTTL:       10 * time.Minute,
 			ClockSkew:            30 * time.Second,
+		},
+		Lifecycle: LifecycleConfig{
+			RefreshTokenTTL:           30 * 24 * time.Hour,
+			RefreshTokenAbsoluteTTL:   90 * 24 * time.Hour,
+			LogoutTransactionTTL:      5 * time.Minute,
+			LogoutMaxActivePerSession: 3,
+			LogoutIDTokenHintMaxAge:   24 * time.Hour,
+			OAuthRatePerMinute:        120,
+			OAuthRateBurst:            30,
+			OAuthGlobalRate:           100,
+			OAuthGlobalBurst:          200,
 		},
 		ShutdownTimeout: 15 * time.Second,
 		TrustedProxies:  []netip.Prefix{},
@@ -273,12 +291,13 @@ func validateDatabaseURL(raw string) error {
 	return nil
 }
 
-func databaseDisablesTLS(raw string) bool {
+func databaseUsesVerifyFull(raw string) bool {
 	parsed, err := url.Parse(raw)
 	if err != nil {
 		return false
 	}
-	return strings.EqualFold(parsed.Query().Get("sslmode"), "disable")
+	values, ok := parsed.Query()["sslmode"]
+	return ok && len(values) == 1 && strings.EqualFold(values[0], "verify-full")
 }
 
 func parseLogLevel(lookup LookupEnv, cfg *Config, problems *[]Problem) {
@@ -403,6 +422,14 @@ func parsePasswordConfig(lookup LookupEnv, cfg *Config, problems *[]Problem) {
 	parseUint32(lookup, "ONEISSUER_ARGON2_TIME", cfg.Password.Argon2Time, 2, 10, &cfg.Password.Argon2Time, problems)
 	parseUint8(lookup, "ONEISSUER_ARGON2_THREADS", cfg.Password.Argon2Threads, 1, 16, &cfg.Password.Argon2Threads, problems)
 	parseInt(lookup, "ONEISSUER_ARGON2_MAX_CONCURRENT", cfg.Password.MaxConcurrent, 1, 64, &cfg.Password.MaxConcurrent, problems)
+	// #nosec G115 -- parseInt constrains MaxConcurrent to 1..64 before this calculation.
+	maxConcurrent := uint64(cfg.Password.MaxConcurrent)
+	if uint64(cfg.Password.Argon2MemoryKiB)*maxConcurrent > maxArgon2MemoryBudgetKiB {
+		*problems = append(*problems, Problem{
+			"ONEISSUER_ARGON2_MAX_CONCURRENT",
+			"combined Argon2 memory budget must not exceed 1048576 KiB",
+		})
+	}
 }
 
 func parseBrowserConfig(lookup LookupEnv, cfg *Config, problems *[]Problem) {
@@ -419,6 +446,10 @@ func parseBrowserConfig(lookup LookupEnv, cfg *Config, problems *[]Problem) {
 	parseDuration(lookup, "ONEISSUER_AUTH_TRANSACTION_TTL", cfg.Browser.AuthTransactionTTL, maxAuthTransactionTTL, &cfg.Browser.AuthTransactionTTL, problems)
 	parseDuration(lookup, "ONEISSUER_LOGIN_REAUTH_WINDOW", cfg.Browser.LoginReauthWindow, 24*time.Hour, &cfg.Browser.LoginReauthWindow, problems)
 	parseDuration(lookup, "ONEISSUER_CLEANUP_INTERVAL", cfg.Browser.CleanupInterval, time.Hour, &cfg.Browser.CleanupInterval, problems)
+	parseInt(lookup, "ONEISSUER_AUTH_RATE_PER_MINUTE", cfg.Browser.AuthRatePerMinute, 1, 60_000, &cfg.Browser.AuthRatePerMinute, problems)
+	parseInt(lookup, "ONEISSUER_AUTH_RATE_BURST", cfg.Browser.AuthRateBurst, 1, 1_000, &cfg.Browser.AuthRateBurst, problems)
+	parseInt(lookup, "ONEISSUER_AUTH_GLOBAL_RATE_PER_SECOND", cfg.Browser.AuthGlobalRate, 1, 10_000, &cfg.Browser.AuthGlobalRate, problems)
+	parseInt(lookup, "ONEISSUER_AUTH_GLOBAL_BURST", cfg.Browser.AuthGlobalBurst, 1, 20_000, &cfg.Browser.AuthGlobalBurst, problems)
 	registrationSet := parseBool(lookup, "ONEISSUER_REGISTRATION_ENABLED", cfg.Browser.RegistrationEnabled, &cfg.Browser.RegistrationEnabled, problems)
 
 	if cfg.Browser.SessionIdleTimeout > cfg.Browser.SessionTTL {
@@ -464,6 +495,30 @@ func parseOIDCConfig(lookup LookupEnv, cfg *Config, problems *[]Problem) {
 		minAccessTokenTTL, maxAccessTokenTTL, false, &cfg.OIDC.AccessTokenTTL, problems)
 	parseDurationRange(lookup, "ONEISSUER_OIDC_CLOCK_SKEW", cfg.OIDC.ClockSkew,
 		0, maxOIDCClockSkew, true, &cfg.OIDC.ClockSkew, problems)
+}
+
+func parseLifecycleConfig(lookup LookupEnv, cfg *Config, problems *[]Problem) {
+	parseDurationRange(lookup, "ONEISSUER_REFRESH_TOKEN_TTL", cfg.Lifecycle.RefreshTokenTTL,
+		time.Hour, 30*24*time.Hour, false, &cfg.Lifecycle.RefreshTokenTTL, problems)
+	parseDurationRange(lookup, "ONEISSUER_REFRESH_TOKEN_ABSOLUTE_TTL", cfg.Lifecycle.RefreshTokenAbsoluteTTL,
+		24*time.Hour, 365*24*time.Hour, false, &cfg.Lifecycle.RefreshTokenAbsoluteTTL, problems)
+	if cfg.Lifecycle.RefreshTokenAbsoluteTTL < cfg.Lifecycle.RefreshTokenTTL {
+		*problems = append(*problems, Problem{"ONEISSUER_REFRESH_TOKEN_ABSOLUTE_TTL", "must be at least ONEISSUER_REFRESH_TOKEN_TTL"})
+	}
+	parseDurationRange(lookup, "ONEISSUER_LOGOUT_TRANSACTION_TTL", cfg.Lifecycle.LogoutTransactionTTL,
+		time.Minute, 15*time.Minute, false, &cfg.Lifecycle.LogoutTransactionTTL, problems)
+	parseInt(lookup, "ONEISSUER_LOGOUT_MAX_ACTIVE_PER_SESSION", cfg.Lifecycle.LogoutMaxActivePerSession,
+		1, 5, &cfg.Lifecycle.LogoutMaxActivePerSession, problems)
+	parseDurationRange(lookup, "ONEISSUER_LOGOUT_ID_TOKEN_HINT_MAX_AGE", cfg.Lifecycle.LogoutIDTokenHintMaxAge,
+		5*time.Minute, 30*24*time.Hour, false, &cfg.Lifecycle.LogoutIDTokenHintMaxAge, problems)
+	parseInt(lookup, "ONEISSUER_OAUTH_RATE_PER_MINUTE", cfg.Lifecycle.OAuthRatePerMinute,
+		1, 60_000, &cfg.Lifecycle.OAuthRatePerMinute, problems)
+	parseInt(lookup, "ONEISSUER_OAUTH_RATE_BURST", cfg.Lifecycle.OAuthRateBurst,
+		1, 1_000, &cfg.Lifecycle.OAuthRateBurst, problems)
+	parseInt(lookup, "ONEISSUER_OAUTH_GLOBAL_RATE_PER_SECOND", cfg.Lifecycle.OAuthGlobalRate,
+		1, 10_000, &cfg.Lifecycle.OAuthGlobalRate, problems)
+	parseInt(lookup, "ONEISSUER_OAUTH_GLOBAL_BURST", cfg.Lifecycle.OAuthGlobalBurst,
+		1, 20_000, &cfg.Lifecycle.OAuthGlobalBurst, problems)
 }
 
 func parseDurationRange(

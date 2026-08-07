@@ -4,7 +4,7 @@
 
 OneIssuer is a pre-release engineering project. No version is declared
 production-ready. Maintainers accept and triage reports affecting the default
-branch and newest development release, currently `v0.1.0-dev.3`.
+branch and newest development release, currently `v0.1.0-dev.4`.
 
 ## Private vulnerability reporting
 
@@ -32,14 +32,17 @@ maintainer availability.
 
 ## Current security surface
 
-The phase-three development release implements:
+The phase-four development release implements:
 
 - local identity, Argon2id passwords, browser Sessions, CSRF, registration, and
   administrator operations;
 - statically managed Public/Confidential OIDC Clients and one-time digest-only
   Client Secrets;
 - Discovery, public JWKS, Authorization Code Flow, hosted Consent, Token, RS256
-  ID/Access Tokens, and UserInfo;
+  ID/Access Tokens, rotating Refresh families, UserInfo, Revocation, and
+  restricted Introspection;
+- owner-bound Grant management, Session/family cascade revocation, and
+  transaction-bound RP-Initiated Logout;
 - mandatory S256 PKCE for every Client and only `none`/
   `client_secret_basic` Client authentication;
 - PostgreSQL-backed single-use authority, fixed append-only Audit events,
@@ -58,9 +61,8 @@ receive real credentials or protocol authority and cannot demonstrate a backend
 identity-state change. The server-side example RP is an interoperability example,
 not a production SDK.
 
-## Deliberate phase-three limits
+## Deliberate phase-four limits
 
-Refresh Tokens, `offline_access`, Revocation, Introspection, RP-Initiated Logout,
 Dynamic Client Registration, `client_secret_post`, automatic/online key rotation,
 HSM/KMS integration, and general business-API Access Tokens are not implemented.
 Reports that an undocumented endpoint is absent are feature requests; reports
@@ -74,8 +76,9 @@ recovered. The Client must initiate a new authorization.
 
 Planned key rotation is restart-style. Emergency public-key removal cannot force
 external verifiers to discard an already cached JWKS for up to approximately five
-minutes. Phase three therefore makes no claim of global instantaneous Token
-revocation.
+minutes. JWTs presented to external resource servers therefore have no global
+instantaneous revocation guarantee; OneIssuer UserInfo and Introspection enforce
+the persisted lifecycle state immediately.
 
 ## Key and evidence handling
 

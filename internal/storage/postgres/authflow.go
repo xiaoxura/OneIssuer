@@ -13,7 +13,7 @@ import (
 
 // CreateAuthTransaction atomically inserts a transaction and audit event.
 func (s *Store) CreateAuthTransaction(ctx context.Context, transaction authflow.Transaction, event audit.Event) error {
-	return s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
+	return s.inTxWithAudit(ctx, pgx.TxOptions{}, []audit.Event{event}, func(queries *sqlcgen.Queries) error {
 		if err := queries.CreateAuthTransaction(ctx, authTransactionParams(transaction)); err != nil {
 			return wrapError("create authorization transaction", ErrorKindQuery, err)
 		}
@@ -36,7 +36,7 @@ func (s *Store) FindAuthTransaction(ctx context.Context, tokenHash []byte) (auth
 // ConsumeAuthTransaction marks a transaction used once and appends audit atomically.
 func (s *Store) ConsumeAuthTransaction(ctx context.Context, id uuid.UUID, now time.Time, event audit.Event) (authflow.Transaction, error) {
 	var result authflow.Transaction
-	err := s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
+	err := s.inTxWithAudit(ctx, pgx.TxOptions{}, []audit.Event{event}, func(queries *sqlcgen.Queries) error {
 		row, err := queries.ConsumeAuthTransaction(ctx, sqlcgen.ConsumeAuthTransactionParams{ConsumedAt: timestamp(now), ID: id})
 		if isNoRows(err) {
 			return authflow.ErrConsumed
@@ -49,7 +49,7 @@ func (s *Store) ConsumeAuthTransaction(ctx context.Context, id uuid.UUID, now ti
 		}
 		result = mapAuthTransaction(row)
 		return nil
-	})
+	}, func() { result = authflow.Transaction{} })
 	return result, err
 }
 
@@ -57,7 +57,7 @@ func (s *Store) ConsumeAuthTransaction(ctx context.Context, id uuid.UUID, now ti
 // protocol reason and appends the supplied value-free audit event atomically.
 func (s *Store) RejectAuthTransaction(ctx context.Context, id uuid.UUID, reason string, now time.Time, event audit.Event) (authflow.Transaction, error) {
 	var result authflow.Transaction
-	err := s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
+	err := s.inTxWithAudit(ctx, pgx.TxOptions{}, []audit.Event{event}, func(queries *sqlcgen.Queries) error {
 		row, err := queries.RejectAuthTransaction(ctx, sqlcgen.RejectAuthTransactionParams{
 			ConsumedAt: timestamp(now), FailureReason: pointerString(reason), ID: id,
 		})
@@ -72,40 +72,65 @@ func (s *Store) RejectAuthTransaction(ctx context.Context, id uuid.UUID, reason 
 		}
 		result = mapAuthTransaction(row)
 		return nil
-	})
+	}, func() { result = authflow.Transaction{} })
 	return result, err
 }
 
 // ExpireAuthTransactions marks elapsed live transactions expired.
 func (s *Store) ExpireAuthTransactions(ctx context.Context, now time.Time) (int64, error) {
-	var count int64
-	err := s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
-		ids, err := queries.ExpireAuthTransactions(ctx, timestamp(now))
+	var total int64
+	for {
+		var count int64
+		var events []audit.Event
+		err := s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
+			ids, err := queries.ExpireAuthTransactions(ctx, sqlcgen.ExpireAuthTransactionsParams{
+				Now: timestamp(now), BatchLimit: cleanupBatchSize,
+			})
+			if err != nil {
+				return wrapError("expire authorization transactions", ErrorKindQuery, err)
+			}
+			for _, id := range ids {
+				event, eventErr := audit.New(audit.AuthorizationTransactionExpired, audit.ResultSuccess, nil, audit.TargetAuthTransaction, &id, "", nil, now)
+				if eventErr != nil {
+					return eventErr
+				}
+				if err := insertAudit(ctx, queries, event); err != nil {
+					return err
+				}
+				events = append(events, event)
+			}
+			count = int64(len(ids))
+			return nil
+		}, func() {
+			count = 0
+			events = nil
+		})
 		if err != nil {
-			return wrapError("expire authorization transactions", ErrorKindQuery, err)
+			return total, err
 		}
-		for _, id := range ids {
-			event, eventErr := audit.New(audit.AuthorizationTransactionExpired, audit.ResultSuccess, nil, audit.TargetAuthTransaction, &id, "", nil, now)
-			if eventErr != nil {
-				return eventErr
-			}
-			if err := insertAudit(ctx, queries, event); err != nil {
-				return err
-			}
+		s.observeAuditEvents(events)
+		total += count
+		if count < int64(cleanupBatchSize) {
+			return total, nil
 		}
-		count = int64(len(ids))
-		return nil
-	})
-	return count, err
+	}
 }
 
 // CleanupAuthTransactions deletes terminal transactions older than the cutoff.
 func (s *Store) CleanupAuthTransactions(ctx context.Context, cutoff time.Time) (int64, error) {
-	count, err := s.queries.DeleteRetiredAuthTransactions(ctx, timestamp(cutoff))
-	if err != nil {
-		return 0, wrapError("clean authorization transactions", ErrorKindQuery, err)
+	var total int64
+	for {
+		count, err := s.queries.DeleteRetiredAuthTransactions(ctx, sqlcgen.DeleteRetiredAuthTransactionsParams{
+			Cutoff: timestamp(cutoff), BatchLimit: cleanupBatchSize,
+		})
+		if err != nil {
+			return total, wrapError("clean authorization transactions", ErrorKindQuery, err)
+		}
+		total += count
+		if count < int64(cleanupBatchSize) {
+			return total, nil
+		}
 	}
-	return count, nil
 }
 
 func authTransactionParams(value authflow.Transaction) sqlcgen.CreateAuthTransactionParams {

@@ -113,12 +113,35 @@ func (q *Queries) CreateAuthTransaction(ctx context.Context, arg CreateAuthTrans
 }
 
 const deleteRetiredAuthTransactions = `-- name: DeleteRetiredAuthTransactions :execrows
-DELETE FROM auth_transactions
-WHERE consumed_at IS NOT NULL AND consumed_at <= $1
+WITH candidates AS (
+    SELECT transactions.id
+    FROM auth_transactions AS transactions
+    WHERE transactions.consumed_at IS NOT NULL
+      AND transactions.consumed_at <= $1
+      AND NOT EXISTS (
+          SELECT 1 FROM preauth_sessions AS preauth
+          WHERE preauth.auth_transaction_id = transactions.id
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM authorization_codes AS codes
+          WHERE codes.auth_transaction_id = transactions.id
+      )
+    ORDER BY transactions.consumed_at, transactions.id
+    LIMIT $2
+    FOR UPDATE OF transactions SKIP LOCKED
+)
+DELETE FROM auth_transactions AS transactions
+USING candidates
+WHERE transactions.id = candidates.id
 `
 
-func (q *Queries) DeleteRetiredAuthTransactions(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteRetiredAuthTransactions, cutoff)
+type DeleteRetiredAuthTransactionsParams struct {
+	Cutoff     pgtype.Timestamptz `db:"cutoff"`
+	BatchLimit int32              `db:"batch_limit"`
+}
+
+func (q *Queries) DeleteRetiredAuthTransactions(ctx context.Context, arg DeleteRetiredAuthTransactionsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteRetiredAuthTransactions, arg.Cutoff, arg.BatchLimit)
 	if err != nil {
 		return 0, err
 	}
@@ -126,14 +149,28 @@ func (q *Queries) DeleteRetiredAuthTransactions(ctx context.Context, cutoff pgty
 }
 
 const expireAuthTransactions = `-- name: ExpireAuthTransactions :many
-UPDATE auth_transactions
+WITH candidates AS (
+    SELECT id
+    FROM auth_transactions
+    WHERE consumed_at IS NULL AND expires_at <= $1
+    ORDER BY expires_at, id
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE auth_transactions AS transactions
 SET consumed_at = $1, failure_reason = 'expired'
-WHERE consumed_at IS NULL AND expires_at <= $1
-RETURNING id
+FROM candidates
+WHERE transactions.id = candidates.id
+RETURNING transactions.id
 `
 
-func (q *Queries) ExpireAuthTransactions(ctx context.Context, now pgtype.Timestamptz) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, expireAuthTransactions, now)
+type ExpireAuthTransactionsParams struct {
+	Now        pgtype.Timestamptz `db:"now"`
+	BatchLimit int32              `db:"batch_limit"`
+}
+
+func (q *Queries) ExpireAuthTransactions(ctx context.Context, arg ExpireAuthTransactionsParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, expireAuthTransactions, arg.Now, arg.BatchLimit)
 	if err != nil {
 		return nil, err
 	}

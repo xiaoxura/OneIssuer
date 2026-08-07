@@ -211,11 +211,11 @@ func localAuthorizationError(code ErrorCode, status int) error {
 
 func validQueryUTF8(values url.Values) bool {
 	for key, entries := range values {
-		if !utf8.ValidString(key) {
+		if !utf8.ValidString(key) || strings.ContainsRune(key, '\x00') {
 			return false
 		}
 		for _, value := range entries {
-			if !utf8.ValidString(value) {
+			if !utf8.ValidString(value) || strings.ContainsRune(value, '\x00') {
 				return false
 			}
 		}
@@ -224,7 +224,7 @@ func validQueryUTF8(values url.Values) bool {
 }
 
 func validOpaqueParameter(value string) bool {
-	return len(value) >= 1 && len(value) <= maxOpaqueParameterBytes && utf8.ValidString(value)
+	return len(value) >= 1 && len(value) <= maxOpaqueParameterBytes && utf8.ValidString(value) && !strings.ContainsRune(value, '\x00')
 }
 
 func parseScope(raw string, allowed []string) ([]string, bool) {
@@ -239,7 +239,7 @@ func parseScope(raw string, allowed []string) ([]string, bool) {
 	result := make([]string, 0, len(parts))
 	seen := make(map[string]bool, len(parts))
 	for _, scope := range parts {
-		if (scope != "openid" && scope != "profile" && scope != "email") || !allowedSet[scope] {
+		if (scope != "openid" && scope != "profile" && scope != "email" && scope != "offline_access") || !allowedSet[scope] {
 			return nil, false
 		}
 		if !seen[scope] {

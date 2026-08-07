@@ -103,8 +103,9 @@ func TestHealthContractsAndRequestIDs(t *testing.T) {
 			if test.requestID != "" && gotRequestID != test.requestID {
 				t.Fatalf("request ID = %q, want propagated %q", gotRequestID, test.requestID)
 			}
-			if response.Header().Get("X-Content-Type-Options") != "nosniff" {
-				t.Fatal("security headers are missing")
+			if response.Header().Get("X-Content-Type-Options") != "nosniff" ||
+				response.Header().Get("Referrer-Policy") != "same-origin" {
+				t.Fatalf("security headers are missing or browser-form incompatible: %v", response.Header())
 			}
 			if test.name == "method" && !headerContainsToken(response.Header(), "Allow", http.MethodGet) {
 				t.Fatal("405 response is missing Allow: GET")
@@ -126,6 +127,24 @@ func TestInvalidRequestIDsAreReplaced(t *testing.T) {
 		if !ValidRequestID(got) || got == invalid {
 			t.Errorf("invalid request ID %q was not replaced: %q", invalid, got)
 		}
+	}
+}
+
+func TestFormActionPolicyKeepsSelfAndOnlyValidHTTPOrigins(t *testing.T) {
+	t.Parallel()
+	header := make(http.Header)
+	setFormActionPolicy(header,
+		"https://client.example.test/callback",
+		"javascript:alert(1)",
+		"https://client.example.test/other",
+		"http://user:pass@client.example.test/callback",
+	)
+	policy := header.Get("Content-Security-Policy")
+	if !strings.Contains(policy, "form-action 'self' https://client.example.test") {
+		t.Fatalf("valid callback origin missing from CSP: %q", policy)
+	}
+	if strings.Contains(policy, "javascript:") || strings.Contains(policy, "user:pass") || strings.Count(policy, "https://client.example.test") != 1 {
+		t.Fatalf("invalid or duplicate form action source in CSP: %q", policy)
 	}
 }
 
@@ -194,8 +213,8 @@ func TestPanicRecoveryDoesNotLeakPanicValue(t *testing.T) {
 	if strings.Contains(response.Body.String(), secret) || strings.Contains(logs.String(), secret) {
 		t.Fatalf("panic secret leaked; body=%s logs=%s", response.Body, logs)
 	}
-	if !strings.Contains(logs.String(), "stack") {
-		t.Fatal("server-side panic stack was not logged")
+	if strings.Contains(logs.String(), "stack") || strings.Contains(logs.String(), secret) {
+		t.Fatalf("panic recovery log leaked stack or panic value: %s", logs.String())
 	}
 }
 

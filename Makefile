@@ -1,6 +1,6 @@
 SHELL := /bin/sh
 
-VERSION ?= v0.1.0-dev.3
+VERSION ?= v0.1.0-dev.4
 COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -18,7 +18,7 @@ GOVULNCHECK := $(TOOLS_DIR)/govulncheck
 ACTIONLINT := $(TOOLS_DIR)/actionlint
 LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildTime=$(BUILD_TIME)
 
-.PHONY: tools generate generate-check migration-check openapi-check sensitive-check conformance-record-check doc-link-check workflow-check fuzz-smoke fmt fmt-check go-lint lint test integration-test vuln build go-check web-install web-check contract-check check migrate-up migrate-status dev web compose-up compose-down compose-smoke phase-3-smoke container-scan sbom container-check clean
+.PHONY: tools generate generate-check migration-check openapi-check sensitive-check conformance-record-check doc-link-check workflow-check fuzz-smoke fmt fmt-check go-lint lint test integration-test vuln build go-check web-install web-check contract-check check migrate-up migrate-status dev web compose-up compose-down compose-smoke phase-3-smoke phase-4-smoke container-scan sbom container-check clean
 
 tools: $(SQLC) $(GOOSE) $(GOLANGCI_LINT) $(GOVULNCHECK) $(ACTIONLINT)
 
@@ -54,6 +54,8 @@ openapi-check:
 
 sensitive-check:
 	./scripts/check-sensitive-examples.sh
+	./scripts/test-sensitive-gates.sh
+	./scripts/test-prepare-smoke-exposure.sh
 
 conformance-record-check:
 	./scripts/check-conformance-record.py
@@ -135,6 +137,9 @@ compose-smoke:
 	./scripts/smoke-compose.sh
 
 phase-3-smoke: compose-smoke
+
+phase-4-smoke:
+	./scripts/smoke-compose.sh
 
 container-scan:
 	ONEISSUER_IMAGE=$${ONEISSUER_IMAGE:-oneissuer:$(VERSION)} ./scripts/container-security.sh scan

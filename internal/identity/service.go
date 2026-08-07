@@ -102,7 +102,7 @@ func (s *Service) PrepareUser(ctx context.Context, input CreateInput, role Role,
 			Role:               role,
 			CreatedAt:          now,
 			UpdatedAt:          now,
-			Version:            now,
+			Version:            1,
 		},
 		PasswordHash: passwordHash,
 	}, nil

@@ -134,8 +134,9 @@ func (a *applicationHandler) postRegister(writer http.ResponseWriter, request *h
 	}
 	issued, err := a.authn.Register(request.Context(), authn.RegisterInput{
 		PreAuthToken: a.cookies.PreAuthToken(request), CSRFToken: form.Get("csrf_token"), TransactionToken: form.Get("transaction"),
-		Account:   identity.CreateInput{Username: form.Get("username"), DisplayName: form.Get("display_name"), Email: form.Get("email"), Password: form.Get("password")},
-		UserAgent: request.UserAgent(), ClientIP: requestClientIP(request), RequestID: RequestID(request.Context()),
+		Account:              identity.CreateInput{Username: form.Get("username"), DisplayName: form.Get("display_name"), Email: form.Get("email"), Password: form.Get("password")},
+		ExistingSessionToken: a.cookies.SessionToken(request),
+		UserAgent:            request.UserAgent(), ClientIP: requestClientIP(request), RequestID: RequestID(request.Context()),
 	}, a.now().UTC())
 	if err != nil {
 		status, code := browserError(err)
@@ -186,11 +187,23 @@ func (a *applicationHandler) getComplete(writer http.ResponseWriter, request *ht
 }
 
 func (a *applicationHandler) postLogout(writer http.ResponseWriter, request *http.Request) {
+	if request.URL.RawQuery != "" || request.URL.ForceQuery {
+		a.renderErrorPage(writer, request, http.StatusBadRequest, "invalid_input")
+		return
+	}
+	operationCtx, cancel := operationContext(request)
+	defer cancel()
+	request = request.WithContext(operationCtx)
+
 	principal, err := a.authenticate(request)
 	if err != nil {
-		a.cookies.ClearAuthenticated(writer)
-		writer.Header().Set("Location", "/login")
-		writer.WriteHeader(http.StatusSeeOther)
+		if errors.Is(err, session.ErrUnauthenticated) {
+			a.cookies.ClearAuthenticated(writer)
+			writer.Header().Set("Location", "/login")
+			writer.WriteHeader(http.StatusSeeOther)
+			return
+		}
+		a.renderErrorPage(writer, request, http.StatusInternalServerError, "internal_error")
 		return
 	}
 	form, err := parseAuthForm(writer, request, "csrf_token")
@@ -201,7 +214,7 @@ func (a *applicationHandler) postLogout(writer http.ResponseWriter, request *htt
 		}
 		return
 	}
-	err = a.sessions.Logout(request.Context(), principal, a.cookies.SessionToken(request), RequestID(request.Context()), a.now().UTC())
+	err = a.sessions.Logout(operationCtx, principal, a.cookies.SessionToken(request), RequestID(request.Context()), a.now().UTC())
 	if err != nil && !errors.Is(err, session.ErrNotFound) {
 		a.renderErrorPage(writer, request, http.StatusInternalServerError, "internal_error")
 		return

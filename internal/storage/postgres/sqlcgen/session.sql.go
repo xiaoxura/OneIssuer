@@ -50,36 +50,38 @@ func (q *Queries) CountActiveLoginSessions(ctx context.Context, now pgtype.Times
 
 const createLoginSession = `-- name: CreateLoginSession :exec
 INSERT INTO login_sessions (
-    id, user_id, token_hash, csrf_hash, csrf_expires_at,
+    id, user_id, session_binding_id, token_hash, csrf_hash, csrf_expires_at,
     created_at, last_seen_at, authenticated_at, expires_at, idle_expires_at,
     user_agent_hash, ip_prefix
 ) VALUES (
-    $1, $2, $3, $4,
-    $5, $6, $7,
-    $8, $9, $10,
-    $11, $12
+    $1, $2, $3, $4, $5,
+    $6, $7, $8,
+    $9, $10, $11,
+    $12, $13
 )
 `
 
 type CreateLoginSessionParams struct {
-	ID              uuid.UUID          `db:"id"`
-	UserID          uuid.UUID          `db:"user_id"`
-	TokenHash       []byte             `db:"token_hash"`
-	CsrfHash        []byte             `db:"csrf_hash"`
-	CsrfExpiresAt   pgtype.Timestamptz `db:"csrf_expires_at"`
-	CreatedAt       pgtype.Timestamptz `db:"created_at"`
-	LastSeenAt      pgtype.Timestamptz `db:"last_seen_at"`
-	AuthenticatedAt pgtype.Timestamptz `db:"authenticated_at"`
-	ExpiresAt       pgtype.Timestamptz `db:"expires_at"`
-	IdleExpiresAt   pgtype.Timestamptz `db:"idle_expires_at"`
-	UserAgentHash   []byte             `db:"user_agent_hash"`
-	IpPrefix        *string            `db:"ip_prefix"`
+	ID               uuid.UUID          `db:"id"`
+	UserID           uuid.UUID          `db:"user_id"`
+	SessionBindingID uuid.UUID          `db:"session_binding_id"`
+	TokenHash        []byte             `db:"token_hash"`
+	CsrfHash         []byte             `db:"csrf_hash"`
+	CsrfExpiresAt    pgtype.Timestamptz `db:"csrf_expires_at"`
+	CreatedAt        pgtype.Timestamptz `db:"created_at"`
+	LastSeenAt       pgtype.Timestamptz `db:"last_seen_at"`
+	AuthenticatedAt  pgtype.Timestamptz `db:"authenticated_at"`
+	ExpiresAt        pgtype.Timestamptz `db:"expires_at"`
+	IdleExpiresAt    pgtype.Timestamptz `db:"idle_expires_at"`
+	UserAgentHash    []byte             `db:"user_agent_hash"`
+	IpPrefix         *string            `db:"ip_prefix"`
 }
 
 func (q *Queries) CreateLoginSession(ctx context.Context, arg CreateLoginSessionParams) error {
 	_, err := q.db.Exec(ctx, createLoginSession,
 		arg.ID,
 		arg.UserID,
+		arg.SessionBindingID,
 		arg.TokenHash,
 		arg.CsrfHash,
 		arg.CsrfExpiresAt,
@@ -125,13 +127,27 @@ func (q *Queries) CreatePreAuthSession(ctx context.Context, arg CreatePreAuthSes
 }
 
 const deleteExpiredPreAuthSessions = `-- name: DeleteExpiredPreAuthSessions :execrows
-DELETE FROM preauth_sessions
-WHERE expires_at <= $1
-   OR (consumed_at IS NOT NULL AND consumed_at <= $1)
+WITH candidates AS (
+    SELECT preauth.id
+    FROM preauth_sessions AS preauth
+    WHERE preauth.expires_at <= $1
+       OR (preauth.consumed_at IS NOT NULL AND preauth.consumed_at <= $1)
+    ORDER BY LEAST(preauth.expires_at, COALESCE(preauth.consumed_at, preauth.expires_at)), preauth.id
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+)
+DELETE FROM preauth_sessions AS sessions
+USING candidates
+WHERE sessions.id = candidates.id
 `
 
-func (q *Queries) DeleteExpiredPreAuthSessions(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteExpiredPreAuthSessions, cutoff)
+type DeleteExpiredPreAuthSessionsParams struct {
+	Cutoff     pgtype.Timestamptz `db:"cutoff"`
+	BatchLimit int32              `db:"batch_limit"`
+}
+
+func (q *Queries) DeleteExpiredPreAuthSessions(ctx context.Context, arg DeleteExpiredPreAuthSessionsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteExpiredPreAuthSessions, arg.Cutoff, arg.BatchLimit)
 	if err != nil {
 		return 0, err
 	}
@@ -139,14 +155,28 @@ func (q *Queries) DeleteExpiredPreAuthSessions(ctx context.Context, cutoff pgtyp
 }
 
 const deleteRetiredLoginSessions = `-- name: DeleteRetiredLoginSessions :execrows
-DELETE FROM login_sessions
-WHERE (revoked_at IS NOT NULL AND revoked_at <= $1)
-   OR expires_at <= $1
-   OR idle_expires_at <= $1
+WITH candidates AS (
+    SELECT login.id
+    FROM login_sessions AS login
+    WHERE (login.revoked_at IS NOT NULL AND login.revoked_at <= $1)
+       OR login.expires_at <= $1
+       OR login.idle_expires_at <= $1
+    ORDER BY LEAST(login.expires_at, login.idle_expires_at, COALESCE(login.revoked_at, login.expires_at)), login.id
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+)
+DELETE FROM login_sessions AS sessions
+USING candidates
+WHERE sessions.id = candidates.id
 `
 
-func (q *Queries) DeleteRetiredLoginSessions(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteRetiredLoginSessions, cutoff)
+type DeleteRetiredLoginSessionsParams struct {
+	Cutoff     pgtype.Timestamptz `db:"cutoff"`
+	BatchLimit int32              `db:"batch_limit"`
+}
+
+func (q *Queries) DeleteRetiredLoginSessions(ctx context.Context, arg DeleteRetiredLoginSessionsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteRetiredLoginSessions, arg.Cutoff, arg.BatchLimit)
 	if err != nil {
 		return 0, err
 	}
@@ -155,43 +185,46 @@ func (q *Queries) DeleteRetiredLoginSessions(ctx context.Context, cutoff pgtype.
 
 const getLoginSessionByTokenHash = `-- name: GetLoginSessionByTokenHash :one
 SELECT
-    s.id, s.user_id, s.token_hash, s.csrf_hash, s.csrf_expires_at,
+    s.id, s.user_id, s.session_binding_id, s.token_hash, s.csrf_hash, s.csrf_expires_at,
     s.created_at, s.last_seen_at, s.authenticated_at, s.expires_at,
     s.idle_expires_at, s.revoked_at, s.revoke_reason,
     s.user_agent_hash, s.ip_prefix,
     u.subject, u.username, u.display_name, u.email, u.email_verified,
     u.status AS user_status, u.role AS user_role, u.created_at AS user_created_at,
-    u.updated_at AS user_updated_at, u.last_login_at AS user_last_login_at
+    u.updated_at AS user_updated_at, u.last_login_at AS user_last_login_at,
+    u.version AS user_version
 FROM login_sessions AS s
 JOIN users AS u ON u.id = s.user_id
 WHERE s.token_hash = $1
 `
 
 type GetLoginSessionByTokenHashRow struct {
-	ID              uuid.UUID          `db:"id"`
-	UserID          uuid.UUID          `db:"user_id"`
-	TokenHash       []byte             `db:"token_hash"`
-	CsrfHash        []byte             `db:"csrf_hash"`
-	CsrfExpiresAt   pgtype.Timestamptz `db:"csrf_expires_at"`
-	CreatedAt       pgtype.Timestamptz `db:"created_at"`
-	LastSeenAt      pgtype.Timestamptz `db:"last_seen_at"`
-	AuthenticatedAt pgtype.Timestamptz `db:"authenticated_at"`
-	ExpiresAt       pgtype.Timestamptz `db:"expires_at"`
-	IdleExpiresAt   pgtype.Timestamptz `db:"idle_expires_at"`
-	RevokedAt       pgtype.Timestamptz `db:"revoked_at"`
-	RevokeReason    *string            `db:"revoke_reason"`
-	UserAgentHash   []byte             `db:"user_agent_hash"`
-	IpPrefix        *string            `db:"ip_prefix"`
-	Subject         string             `db:"subject"`
-	Username        string             `db:"username"`
-	DisplayName     string             `db:"display_name"`
-	Email           string             `db:"email"`
-	EmailVerified   bool               `db:"email_verified"`
-	UserStatus      string             `db:"user_status"`
-	UserRole        string             `db:"user_role"`
-	UserCreatedAt   pgtype.Timestamptz `db:"user_created_at"`
-	UserUpdatedAt   pgtype.Timestamptz `db:"user_updated_at"`
-	UserLastLoginAt pgtype.Timestamptz `db:"user_last_login_at"`
+	ID               uuid.UUID          `db:"id"`
+	UserID           uuid.UUID          `db:"user_id"`
+	SessionBindingID uuid.UUID          `db:"session_binding_id"`
+	TokenHash        []byte             `db:"token_hash"`
+	CsrfHash         []byte             `db:"csrf_hash"`
+	CsrfExpiresAt    pgtype.Timestamptz `db:"csrf_expires_at"`
+	CreatedAt        pgtype.Timestamptz `db:"created_at"`
+	LastSeenAt       pgtype.Timestamptz `db:"last_seen_at"`
+	AuthenticatedAt  pgtype.Timestamptz `db:"authenticated_at"`
+	ExpiresAt        pgtype.Timestamptz `db:"expires_at"`
+	IdleExpiresAt    pgtype.Timestamptz `db:"idle_expires_at"`
+	RevokedAt        pgtype.Timestamptz `db:"revoked_at"`
+	RevokeReason     *string            `db:"revoke_reason"`
+	UserAgentHash    []byte             `db:"user_agent_hash"`
+	IpPrefix         *string            `db:"ip_prefix"`
+	Subject          string             `db:"subject"`
+	Username         string             `db:"username"`
+	DisplayName      string             `db:"display_name"`
+	Email            string             `db:"email"`
+	EmailVerified    bool               `db:"email_verified"`
+	UserStatus       string             `db:"user_status"`
+	UserRole         string             `db:"user_role"`
+	UserCreatedAt    pgtype.Timestamptz `db:"user_created_at"`
+	UserUpdatedAt    pgtype.Timestamptz `db:"user_updated_at"`
+	UserLastLoginAt  pgtype.Timestamptz `db:"user_last_login_at"`
+	UserVersion      int64              `db:"user_version"`
 }
 
 func (q *Queries) GetLoginSessionByTokenHash(ctx context.Context, tokenHash []byte) (GetLoginSessionByTokenHashRow, error) {
@@ -200,6 +233,7 @@ func (q *Queries) GetLoginSessionByTokenHash(ctx context.Context, tokenHash []by
 	err := row.Scan(
 		&i.ID,
 		&i.UserID,
+		&i.SessionBindingID,
 		&i.TokenHash,
 		&i.CsrfHash,
 		&i.CsrfExpiresAt,
@@ -222,12 +256,13 @@ func (q *Queries) GetLoginSessionByTokenHash(ctx context.Context, tokenHash []by
 		&i.UserCreatedAt,
 		&i.UserUpdatedAt,
 		&i.UserLastLoginAt,
+		&i.UserVersion,
 	)
 	return i, err
 }
 
 const getPreAuthSessionByTokenHash = `-- name: GetPreAuthSessionByTokenHash :one
-SELECT id, token_hash, csrf_hash, auth_transaction_id, created_at, expires_at, consumed_at FROM preauth_sessions WHERE token_hash = $1
+SELECT id, token_hash, csrf_hash, auth_transaction_id, created_at, expires_at, consumed_at, attempt_count FROM preauth_sessions WHERE token_hash = $1
 `
 
 func (q *Queries) GetPreAuthSessionByTokenHash(ctx context.Context, tokenHash []byte) (PreauthSession, error) {
@@ -241,6 +276,7 @@ func (q *Queries) GetPreAuthSessionByTokenHash(ctx context.Context, tokenHash []
 		&i.CreatedAt,
 		&i.ExpiresAt,
 		&i.ConsumedAt,
+		&i.AttemptCount,
 	)
 	return i, err
 }
@@ -382,6 +418,113 @@ func (q *Queries) ListUserLoginSessions(ctx context.Context, arg ListUserLoginSe
 	return items, nil
 }
 
+const lockActiveLoginSessionsByUser = `-- name: LockActiveLoginSessionsByUser :many
+SELECT id, user_id, token_hash, csrf_hash, csrf_expires_at, created_at, last_seen_at, authenticated_at, expires_at, idle_expires_at, revoked_at, revoke_reason, user_agent_hash, ip_prefix, session_binding_id
+FROM login_sessions
+WHERE user_id = $1
+  AND revoked_at IS NULL
+ORDER BY id
+FOR UPDATE
+`
+
+func (q *Queries) LockActiveLoginSessionsByUser(ctx context.Context, userID uuid.UUID) ([]LoginSession, error) {
+	rows, err := q.db.Query(ctx, lockActiveLoginSessionsByUser, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []LoginSession{}
+	for rows.Next() {
+		var i LoginSession
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.TokenHash,
+			&i.CsrfHash,
+			&i.CsrfExpiresAt,
+			&i.CreatedAt,
+			&i.LastSeenAt,
+			&i.AuthenticatedAt,
+			&i.ExpiresAt,
+			&i.IdleExpiresAt,
+			&i.RevokedAt,
+			&i.RevokeReason,
+			&i.UserAgentHash,
+			&i.IpPrefix,
+			&i.SessionBindingID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockLoginSessionByTokenHash = `-- name: LockLoginSessionByTokenHash :one
+SELECT id, user_id, session_binding_id, revoked_at, expires_at, idle_expires_at
+FROM login_sessions
+WHERE token_hash = $1
+FOR UPDATE
+`
+
+type LockLoginSessionByTokenHashRow struct {
+	ID               uuid.UUID          `db:"id"`
+	UserID           uuid.UUID          `db:"user_id"`
+	SessionBindingID uuid.UUID          `db:"session_binding_id"`
+	RevokedAt        pgtype.Timestamptz `db:"revoked_at"`
+	ExpiresAt        pgtype.Timestamptz `db:"expires_at"`
+	IdleExpiresAt    pgtype.Timestamptz `db:"idle_expires_at"`
+}
+
+func (q *Queries) LockLoginSessionByTokenHash(ctx context.Context, tokenHash []byte) (LockLoginSessionByTokenHashRow, error) {
+	row := q.db.QueryRow(ctx, lockLoginSessionByTokenHash, tokenHash)
+	var i LockLoginSessionByTokenHashRow
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.SessionBindingID,
+		&i.RevokedAt,
+		&i.ExpiresAt,
+		&i.IdleExpiresAt,
+	)
+	return i, err
+}
+
+const reservePreAuthAttempt = `-- name: ReservePreAuthAttempt :one
+UPDATE preauth_sessions
+SET attempt_count = attempt_count + 1
+WHERE id = $1
+  AND consumed_at IS NULL
+  AND expires_at > $2
+  AND attempt_count < $3
+RETURNING id, token_hash, csrf_hash, auth_transaction_id, created_at, expires_at, consumed_at, attempt_count
+`
+
+type ReservePreAuthAttemptParams struct {
+	ID          uuid.UUID          `db:"id"`
+	Now         pgtype.Timestamptz `db:"now"`
+	MaxAttempts int16              `db:"max_attempts"`
+}
+
+func (q *Queries) ReservePreAuthAttempt(ctx context.Context, arg ReservePreAuthAttemptParams) (PreauthSession, error) {
+	row := q.db.QueryRow(ctx, reservePreAuthAttempt, arg.ID, arg.Now, arg.MaxAttempts)
+	var i PreauthSession
+	err := row.Scan(
+		&i.ID,
+		&i.TokenHash,
+		&i.CsrfHash,
+		&i.AuthTransactionID,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+		&i.ConsumedAt,
+		&i.AttemptCount,
+	)
+	return i, err
+}
+
 const revokeAllUserLoginSessions = `-- name: RevokeAllUserLoginSessions :many
 UPDATE login_sessions
 SET revoked_at = $1, revoke_reason = $2
@@ -462,6 +605,32 @@ func (q *Queries) RevokeLoginSessionByHash(ctx context.Context, arg RevokeLoginS
 	row := q.db.QueryRow(ctx, revokeLoginSessionByHash, arg.RevokedAt, arg.RevokeReason, arg.TokenHash)
 	var i RevokeLoginSessionByHashRow
 	err := row.Scan(&i.ID, &i.UserID)
+	return i, err
+}
+
+const revokeLoginSessionByID = `-- name: RevokeLoginSessionByID :one
+UPDATE login_sessions
+SET revoked_at = $1, revoke_reason = $2
+WHERE id = $3 AND revoked_at IS NULL
+RETURNING id, user_id, session_binding_id
+`
+
+type RevokeLoginSessionByIDParams struct {
+	RevokedAt    pgtype.Timestamptz `db:"revoked_at"`
+	RevokeReason *string            `db:"revoke_reason"`
+	ID           uuid.UUID          `db:"id"`
+}
+
+type RevokeLoginSessionByIDRow struct {
+	ID               uuid.UUID `db:"id"`
+	UserID           uuid.UUID `db:"user_id"`
+	SessionBindingID uuid.UUID `db:"session_binding_id"`
+}
+
+func (q *Queries) RevokeLoginSessionByID(ctx context.Context, arg RevokeLoginSessionByIDParams) (RevokeLoginSessionByIDRow, error) {
+	row := q.db.QueryRow(ctx, revokeLoginSessionByID, arg.RevokedAt, arg.RevokeReason, arg.ID)
+	var i RevokeLoginSessionByIDRow
+	err := row.Scan(&i.ID, &i.UserID, &i.SessionBindingID)
 	return i, err
 }
 

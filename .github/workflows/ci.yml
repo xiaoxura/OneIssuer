@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 30
     services:
       postgres:
-        image: postgres:17.5-alpine3.22@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
+        image: postgres:17.10-alpine3.23@sha256:8189a1f6e40904781fc9e2612687877791d21679866db58b1de996b31fc312e4
         env:
           POSTGRES_USER: oneissuer
           POSTGRES_PASSWORD: ci-only-password
@@ -59,7 +59,7 @@ jobs:
         run: go test ./internal/observability ./internal/httpserver -run 'Redact|Leak|Privacy' -count=1
       - name: Race-enabled tests
         run: go test -race ./...
-      - name: Explicit Phase-three PostgreSQL integration and concurrency suite
+      - name: Explicit Phase-four PostgreSQL integration and concurrency suite
         run: go test -run '^TestPostgresIntegration$' -count=1 ./internal/storage/postgres
       - name: Dependency vulnerability scan
         run: GOTELEMETRY=off .tools/bin/govulncheck ./...
@@ -74,7 +74,7 @@ jobs:
         run: make build
 
   fuzz:
-    name: Phase-three protocol fuzz smoke
+    name: Phase-four protocol fuzz smoke
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -106,7 +106,7 @@ jobs:
         uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: 24
-      - name: Validate Phase-three public contracts, workflow, and conformance record
+      - name: Validate Phase-four public contracts, workflow, and conformance record
         run: make contract-check
 
   web:
@@ -133,7 +133,7 @@ jobs:
         run: npm audit --audit-level=high --fetch-retries=5 --fetch-retry-mintimeout=1000 --fetch-retry-maxtimeout=10000 --fetch-timeout=30000
 
   container:
-    name: Phase-three Compose, image scan, and SBOM
+    name: Phase-four Compose, image scan, and SBOM
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -142,31 +142,31 @@ jobs:
       - name: Build image
         run: |
           docker build \
-            --build-arg VERSION=v0.1.0-dev.3 \
+            --build-arg VERSION=v0.1.0-dev.4 \
             --build-arg COMMIT="${GITHUB_SHA}" \
             --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            -t oneissuer:ci -t oneissuer:v0.1.0-dev.3 .
+            -t oneissuer:ci -t oneissuer:v0.1.0-dev.4 .
       - name: Verify configured and effective non-root user
         run: |
           test "$(docker image inspect oneissuer:ci --format '{{.Config.User}}')" = "65532:65532"
           docker run --rm --entrypoint /bin/sh oneissuer:ci -c 'test "$(id -u)" = "65532"'
-      - name: Phase-three empty-volume OIDC Compose acceptance
+      - name: Phase-four empty-volume OIDC Compose acceptance
         run: |
           cp .env.example .env
-          make phase-3-smoke
+          make phase-4-smoke
       - name: Generate and validate CycloneDX SBOM
         env:
-          ONEISSUER_IMAGE: oneissuer:v0.1.0-dev.3
+          ONEISSUER_IMAGE: oneissuer:v0.1.0-dev.4
         run: make sbom
       - name: Scan High and Critical image vulnerabilities
         env:
-          ONEISSUER_IMAGE: oneissuer:v0.1.0-dev.3
+          ONEISSUER_IMAGE: oneissuer:v0.1.0-dev.4
         run: make container-scan
       - name: Upload supply-chain evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: oneissuer-v0.1.0-dev.3-supply-chain
+          name: oneissuer-v0.1.0-dev.4-supply-chain
           path: .artifacts/supply-chain/
           if-no-files-found: error
           retention-days: 30

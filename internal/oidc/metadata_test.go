@@ -4,11 +4,10 @@ import (
 	"encoding/json"
 	"net/url"
 	"reflect"
-	"strings"
 	"testing"
 )
 
-func TestProviderMetadataExactPhaseThreeSnapshot(t *testing.T) {
+func TestProviderMetadataExactPhaseFourLifecycleSnapshot(t *testing.T) {
 	t.Parallel()
 
 	issuer, err := url.Parse("https://id.example.test:8443")
@@ -23,7 +22,7 @@ func TestProviderMetadataExactPhaseThreeSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalProviderMetadata() error = %v", err)
 	}
-	const want = `{"issuer":"https://id.example.test:8443","authorization_endpoint":"https://id.example.test:8443/oauth2/authorize","token_endpoint":"https://id.example.test:8443/oauth2/token","userinfo_endpoint":"https://id.example.test:8443/oauth2/userinfo","jwks_uri":"https://id.example.test:8443/oauth2/jwks","response_types_supported":["code"],"response_modes_supported":["query"],"grant_types_supported":["authorization_code"],"subject_types_supported":["public"],"id_token_signing_alg_values_supported":["RS256"],"token_endpoint_auth_methods_supported":["none","client_secret_basic"],"scopes_supported":["openid","profile","email"],"claims_supported":["sub","iss","aud","exp","iat","auth_time","nonce","azp","name","preferred_username","email","email_verified"],"code_challenge_methods_supported":["S256"],"prompt_values_supported":["none","login","consent","create"]}` + "\n"
+	const want = `{"issuer":"https://id.example.test:8443","authorization_endpoint":"https://id.example.test:8443/oauth2/authorize","token_endpoint":"https://id.example.test:8443/oauth2/token","revocation_endpoint":"https://id.example.test:8443/oauth2/revoke","introspection_endpoint":"https://id.example.test:8443/oauth2/introspect","userinfo_endpoint":"https://id.example.test:8443/oauth2/userinfo","jwks_uri":"https://id.example.test:8443/oauth2/jwks","response_types_supported":["code"],"response_modes_supported":["query"],"grant_types_supported":["authorization_code","refresh_token"],"subject_types_supported":["public"],"id_token_signing_alg_values_supported":["RS256"],"token_endpoint_auth_methods_supported":["none","client_secret_basic"],"revocation_endpoint_auth_methods_supported":["none","client_secret_basic"],"introspection_endpoint_auth_methods_supported":["client_secret_basic"],"scopes_supported":["openid","profile","email","offline_access"],"claims_supported":["sub","iss","aud","exp","iat","auth_time","nonce","azp","name","preferred_username","email","email_verified"],"code_challenge_methods_supported":["S256"],"prompt_values_supported":["none","login","consent","create"]}` + "\n"
 	if string(encoded) != want {
 		t.Fatalf("metadata snapshot mismatch\n got: %s\nwant: %s", encoded, want)
 	}
@@ -33,15 +32,12 @@ func TestProviderMetadataExactPhaseThreeSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, forbidden := range []string{
-		"revocation_endpoint", "introspection_endpoint", "end_session_endpoint",
+		"end_session_endpoint",
 		"registration_endpoint", "request_parameter_supported", "request_uri_parameter_supported",
 	} {
 		if _, exists := fields[forbidden]; exists {
 			t.Fatalf("metadata advertised unavailable capability %q", forbidden)
 		}
-	}
-	if strings.Contains(string(encoded), "refresh_token") || strings.Contains(string(encoded), "offline_access") {
-		t.Fatalf("metadata advertised phase-four capability: %s", encoded)
 	}
 }
 

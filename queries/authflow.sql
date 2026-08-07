@@ -39,11 +39,38 @@ WHERE id = sqlc.arg(id)
 RETURNING *;
 
 -- name: ExpireAuthTransactions :many
-UPDATE auth_transactions
+WITH candidates AS (
+    SELECT id
+    FROM auth_transactions
+    WHERE consumed_at IS NULL AND expires_at <= sqlc.arg(now)
+    ORDER BY expires_at, id
+    LIMIT sqlc.arg(batch_limit)
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE auth_transactions AS transactions
 SET consumed_at = sqlc.arg(now), failure_reason = 'expired'
-WHERE consumed_at IS NULL AND expires_at <= sqlc.arg(now)
-RETURNING id;
+FROM candidates
+WHERE transactions.id = candidates.id
+RETURNING transactions.id;
 
 -- name: DeleteRetiredAuthTransactions :execrows
-DELETE FROM auth_transactions
-WHERE consumed_at IS NOT NULL AND consumed_at <= sqlc.arg(cutoff);
+WITH candidates AS (
+    SELECT transactions.id
+    FROM auth_transactions AS transactions
+    WHERE transactions.consumed_at IS NOT NULL
+      AND transactions.consumed_at <= sqlc.arg(cutoff)
+      AND NOT EXISTS (
+          SELECT 1 FROM preauth_sessions AS preauth
+          WHERE preauth.auth_transaction_id = transactions.id
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM authorization_codes AS codes
+          WHERE codes.auth_transaction_id = transactions.id
+      )
+    ORDER BY transactions.consumed_at, transactions.id
+    LIMIT sqlc.arg(batch_limit)
+    FOR UPDATE OF transactions SKIP LOCKED
+)
+DELETE FROM auth_transactions AS transactions
+USING candidates
+WHERE transactions.id = candidates.id;

@@ -1,7 +1,8 @@
 # OneIssuer
 
 OneIssuer is a lightweight, self-hosted, **single-Issuer** identity service.
-The current development release is **`v0.1.0-dev.3` / phase three**. It joins
+The current repository default is **`v0.1.0-dev.4`**; this working tree
+implements phase four with release gates still pending. It joins
 the existing identity, password, browser-session, Client registry,
 administrator, and audit foundations to a minimal OpenID Connect Authorization
 Code Flow.
@@ -24,23 +25,26 @@ Code Flow.
 - hosted login, optional registration, Session reuse, `prompt=none`, `login`,
   `consent`, and `create`, plus `max_age`;
 - hosted Consent and persistent `(user, client)` grants;
+- explicit `offline_access` Consent, rotating Refresh Token families, reuse
+  detection, Revocation, and owner-bound Introspection;
+- owner-bound Grant management, Session/Grant/family cascade revocation, and
+  RP-Initiated Logout with transaction-bound confirmation;
 - digest-only, short-lived, single-use Authorization Codes with atomic exchange;
 - RS256 ID Tokens and RFC 9068 JWT Access Tokens;
 - UserInfo with scope-minimized `profile` and `email` claims and current
   User/Client/Grant status checks;
 - administrator Users, Clients, Sessions, and append-only Audit APIs;
-- explicit migrations through production schema version 10, low-cardinality
+- explicit migrations through production schema version 15, low-cardinality
   metrics, non-root/read-only Compose services, an A/B example RP, SBOM and
   container vulnerability gates.
 
 The Discovery document is the machine-readable protocol contract. The supported
-scope set is exactly `openid`, `profile`, and `email`.
+scope set is exactly `openid`, `profile`, `email`, and `offline_access`.
 
 ### Intentionally not implemented
 
-Phase three does **not** implement Refresh Tokens, `offline_access`, Revocation,
-Introspection, RP-Initiated Logout, Dynamic Client Registration,
-`client_secret_post`, Implicit/Hybrid flows, PAR/JAR/JARM, DPoP, mTLS, or a
+Phase four does **not** implement Dynamic Client Registration, `client_secret_post`,
+Implicit/Hybrid flows, PAR/JAR/JARM, DPoP, mTLS, or a
 general-purpose resource-server authorization model. Requests for these
 capabilities fail rather than return placeholder success, and Discovery does not
 advertise them.
@@ -48,26 +52,30 @@ advertise them.
 An Access Token issued here is intended only for this OneIssuer instance's
 UserInfo endpoint. Do not treat it as a general business API token.
 
-## Automated phase-three demonstration
+## Automated phase-four demonstration
 
 With Go 1.26.x, Docker with Compose, Make, and curl installed:
 
 ```bash
 make tools
-make phase-3-smoke
+make phase-4-smoke
 ```
 
 The smoke test creates a disposable signing key and empty database, applies all
 migrations explicitly, Bootstraps an administrator, creates Public Client A and
 Confidential Client B, and verifies registration, Session reuse, separate
-Consent, S256 Code exchange, ID Token/UserInfo processing, concurrent Code
-exchange, disabled principals, restart persistence, privacy, database outage,
-non-root/read-only operation, and graceful shutdown. It removes the stack and
-clear runtime material on exit.
+Consent, offline Access and rotating Refresh families, Revocation,
+owner-bound Introspection and Grant management, RP-Initiated Logout, S256 Code
+exchange, ID Token/UserInfo processing, concurrent exchanges, disabled
+principals, restart persistence, privacy, database outage, non-root/read-only
+operation, and graceful shutdown. It removes the stack and clear runtime
+material on exit.
 
 The Relying Party under `examples/oidc-client/` is an interoperability example,
 **not a production SDK**. It validates state, nonce, Issuer, Audience, signature,
-time claims, and UserInfo subject instead of merely decoding JWTs.
+time claims, the Token endpoint's actual granted Scope, and UserInfo subject
+instead of merely decoding JWTs. Its in-memory Session store is capped at 1024
+entries and fails closed when full.
 
 ## Native local development
 
@@ -123,8 +131,11 @@ docker compose -f deploy/docker-compose.yml \
 | `/.well-known/openid-configuration` | `GET`; exact implemented metadata |
 | `/oauth2/jwks` | `GET`; public RSA keys only, ETag and five-minute cache |
 | `/oauth2/authorize` | browser `GET`; `response_type=code`, query response mode, S256 |
-| `/oauth2/token` | `POST application/x-www-form-urlencoded`; Code Grant only |
+| `/oauth2/token` | `POST application/x-www-form-urlencoded`; Code and rotating Refresh Grants |
 | `/oauth2/userinfo` | `GET` or empty-body `POST`; Bearer header only |
+| `/oauth2/revoke` | `POST application/x-www-form-urlencoded`; RFC 7009 uniform response |
+| `/oauth2/introspect` | `POST application/x-www-form-urlencoded`; Confidential owning Client only |
+| `/oauth2/logout` | `GET` or form `POST`; RP-Initiated Logout with hosted confirmation |
 
 Hosted browser routes are `GET/POST /login`, `GET/POST /register`,
 `GET/POST /consent`, `POST /logout`, and internal continuation routes. The
@@ -132,11 +143,16 @@ current-user and administrator JSON APIs remain documented in
 [`api/openapi.yaml`](./api/openapi.yaml). Standard OIDC endpoints are
 intentionally not duplicated in that management OpenAPI document.
 
+`GET /oauth2/authorize` and the login/registration form endpoints have bounded
+per-client and process-wide token buckets before database/password work. Each
+issued pre-authentication form also permits at most five submissions. These
+in-process controls complement, and do not replace, an edge/distributed limiter.
+
 Redirect URIs are registered and compared byte-for-byte. Production Clients use
 HTTPS; explicit loopback HTTP is allowed only for local development. State,
 nonce, and PKCE values are never authority stores and are not logged or audited.
 
-## Token exchange delivery semantics
+## Token and lifecycle delivery semantics
 
 Authorization Code consumption and Access Token metadata insertion commit in one
 PostgreSQL transaction. Delivery is therefore **at most once**: if the database
@@ -148,7 +164,14 @@ Disabling a User or Client causes exchange and UserInfo to fail closed. Re-
 enabling it does not restore a consumed Code; only a still-unconsumed and
 unexpired Code can proceed. Expired Code and Access Token metadata are retained
 for an additional 24 hours for bounded security evidence, while every read path
-enforces expiry immediately.
+enforces expiry immediately. Cleanup commits in batches of 250 and reports
+already committed rows even if a later batch reaches its operation deadline.
+
+Refresh Tokens are clear-value, single-use generations held only by the Client;
+successful exchange atomically replaces the generation. Reuse or Revocation
+invalidates the family and linked live Access metadata. JWTs presented to external
+resource servers cannot be revoked centrally; OneIssuer UserInfo and Introspection
+observe lifecycle state immediately.
 
 ## Common development commands
 
@@ -162,7 +185,7 @@ make check                     run the Go/Web quality gate
 make contract-check            validate migrations, docs, workflow, Conformance, OpenAPI
 make migrate-up                explicitly apply embedded migrations
 make migrate-status            display current and expected versions
-make phase-3-smoke             run the complete disposable Compose acceptance test
+make phase-4-smoke             run the complete disposable Compose acceptance test
 make sbom                      generate a CycloneDX image SBOM
 make container-scan            reject fixable High/Critical image vulnerabilities
 make container-check           run SBOM, private-key, and vulnerability gates
@@ -195,8 +218,13 @@ two matching newline-terminated entries from a controlled secret source; see the
 - [Operations, backup, and retention](./docs/operations.md)
 - [Signing-key generation and rotation](./docs/key-rotation-runbook.md)
 - [Troubleshooting](./docs/troubleshooting.md)
-- [Phase-three release notes](./docs/phase-3-release-notes.md)
+- [Phase-three release notes](./docs/phase-3-release-notes.md) (historical baseline)
 - [Conformance evidence and limitations](./docs/phase-3-conformance.md)
+- [Phase-four Conformance matrix and result](./conformance/phase-4/matrix.json)
+- [Phase-four development plan](./docs/phase-4-development-plan.md)
+- [Phase-four threat model](./docs/phase-4-threat-model.md)
+- [ADR 0003: phase-four token lifecycle](./docs/adr/0003-phase-four-token-lifecycle.md)
+- [Phase-four release notes](./docs/phase-4-release-notes.md)
 
 ## Repository layout
 
@@ -217,7 +245,8 @@ migrations/                    embedded production Goose migrations
 queries/                       sqlc query source
 api/openapi.yaml               management/current-user JSON contract
 examples/oidc-client/          strict server-side interoperability example
-conformance/phase-3/           secret-free suite matrix, templates, result summary
+conformance/phase-3/           historical secret-free suite matrix and result summary
+conformance/phase-4/           current secret-free suite matrix and pending evidence
 deploy/docker-compose.yml      local PostgreSQL/application/example stack
 web/                           independent non-authoritative React mock
 ```

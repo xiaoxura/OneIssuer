@@ -166,8 +166,8 @@ GET  /oauth2/userinfo
 POST /oauth2/userinfo
 POST /oauth2/revoke
 POST /oauth2/introspect
-GET  /oauth2/end-session
-POST /oauth2/end-session
+GET  /oauth2/logout
+POST /oauth2/logout
 ```
 
 浏览器交互及内部端点：
@@ -179,6 +179,10 @@ GET  /register
 POST /register
 GET  /consent
 POST /consent
+GET  /oauth2/logout/confirm
+POST /oauth2/logout/confirm
+GET  /api/v1/me/grants
+POST /api/v1/me/grants/revoke
 GET  /health/live
 GET  /health/ready
 GET  /metrics
@@ -196,7 +200,7 @@ Issuer 生成，而不是根据不可信的请求 `Host` 或 `X-Forwarded-Host` 
 - Refresh Token Grant；
 - Public Client 使用 `token_endpoint_auth_method=none`；
 - Confidential Client 使用 `client_secret_basic`；
-- PKCE 只允许 `S256`，所有 Public Client 强制启用；
+- PKCE 只允许 `S256`，Public 和 Confidential Client 都强制启用；
 - `openid`、`profile`、`email`、`offline_access` Scope；
 - OIDC Core 的 `state`、`nonce`、`prompt` 和 `max_age` 基础语义；
 - Initiating User Registration via OpenID Connect 的 `prompt=create`；
@@ -223,7 +227,7 @@ sequenceDiagram
     User->>Client: 携带一次性 Authorization Code
     Client->>OP: POST /oauth2/token<br/>code + code_verifier
     OP->>OP: 一次性消费 Code 并校验 PKCE
-    OP-->>Client: ID Token + Access Token + Refresh Token
+    OP-->>Client: ID Token + Access Token<br/>(+ Refresh only with offline_access consent)
 ```
 
 ### 6.4 业务站点发起用户注册与 JIT Provisioning
@@ -339,7 +343,7 @@ OneIssuer 负责证明“用户是谁”，业务网站负责判断“用户可�
 | Authorization Code | 256-bit 随机不透明字符串 | 1 分钟 | 只保存 SHA-256 摘要，一次性消费 |
 | ID Token | RS256 JWT | 5 分钟 | 不保存完整 Token |
 | Access Token | RFC 9068 JWT | 10 分钟 | 保存 `jti`、状态及会话关联 |
-| Refresh Token | 256-bit 随机不透明字符串 | 30 天 | 只保存摘要，按 family 轮换 |
+| Refresh Token | 256-bit 随机不透明字符串 | rolling 30 天；family absolute 90 天 | 只保存摘要，按 family 轮换 |
 
 选择 RS256 作为初始默认算法是为了最大化客户端兼容性。代码必须通过 `KeyStore`
 抽象算法和密钥来源，不能把算法名称散落在业务代码中。
@@ -360,9 +364,12 @@ OneIssuer 负责证明“用户是谁”，业务网站负责判断“用户可�
 JWT Access Token 支持 API 通过 JWKS 离线校验，因此撤销信息不会自动传播。默认依靠
 较短的 10 分钟有效期限制风险：
 
-- 对即时撤销要求不高的 API，可以离线校验 JWT；
-- 对即时撤销要求高的 API，应调用 Introspection Endpoint；
-- 撤销 Refresh Token 或登录会话后，不再签发新的 Access Token；
+- OneIssuer UserInfo 会在线检查 Access metadata、Grant、family、User 和 Client 状态；
+- 本阶段没有 Resource Server Registry，业务 API 不应把该 JWT 当通用 API Token，也不能把
+  受限的 owning-Confidential Introspection 当作通用资源服务；未来资源服务需另行设计
+  Audience、调用凭据和权限模型；
+- 撤销 Refresh Token 或显式登录会话后，不再签发新的 Access Token；被动 Session expiry
+  不会自动撤销已批准的 offline family；
 - 文档必须明确说明离线校验带来的最长撤销延迟。
 
 ## 8. 数据模型
@@ -375,15 +382,17 @@ JWT Access Token 支持 API 通过 JWKS 离线校验，因此撤销信息不会�
 | `credentials` | Argon2id 密码摘要以及未来的 MFA 凭证 |
 | `oidc_clients` | Client ID、类型、认证方式、注册策略、展示信息和状态 |
 | `oidc_client_secrets` | Client Secret 摘要、创建及失效时间 |
-| `oidc_redirect_uris` | 登录回调地址白名单 |
-| `oidc_logout_redirect_uris` | 退出后的回调地址白名单 |
+| `oidc_client_redirect_uris` | 登录回调地址白名单 |
+| `oidc_client_logout_uris` | 退出后的回调地址白名单 |
 | `oidc_client_scopes` | Client 允许申请的 Scope |
 | `login_sessions` | 浏览器登录会话及最近认证时间 |
-| `authorization_requests` | 短期授权请求上下文，包括是否进入注册流程 |
+| `auth_transactions` | 短期授权请求上下文，包括是否进入注册流程 |
 | `authorization_codes` | 一次性授权码摘要及 PKCE 信息 |
 | `consent_grants` | 用户对 Client 授予的 Scope |
 | `access_tokens` | Access Token 的 `jti`、状态和关联关系 |
-| `refresh_tokens` | Refresh Token 摘要、family 和轮换状态 |
+| `refresh_token_families` | Refresh Token family、Grant/Session binding 和绝对期限 |
+| `refresh_tokens` | Refresh Token 摘要、generation 和轮换状态 |
+| `logout_transactions` | 短期 RP logout 上下文；Client/URI 已验证，opaque State 仅绑定返回 |
 | `audit_events` | 登录、授权、撤销和管理操作事件 |
 
 所有时间在数据库中使用 `timestamptz`，在 Go 中统一按 UTC 处理。用户、Client 和
@@ -425,6 +434,67 @@ oneissuer keys generate --alg RS256 --out ./data/signing-key.jwk
 - 只信任显式配置的反向代理，避免伪造 Forwarded Headers；
 - 登录、Token 和管理接口分别限流；
 - 日志自动过滤密码、Authorization Header、Cookie、Code 和 Token。
+
+### 10.1 RP-Initiated Logout 确认边界
+
+- 标准 `GET /oauth2/logout` query 与 `POST /oauth2/logout` form 都只校验 Logout Request、
+  建立短期 zero-authority pre-confirm transaction，不读取/绑定主 Session cookie，也不撤销
+  Session 或 Token；GET 无 body，POST 只接受 bounded form body 且无 query，重复/跨 channel 参数
+  一律在 Hint 验签前拒绝；
+- clear transaction lookup value 只能存于 dedicated、短期、生产环境 `Secure`、HttpOnly、host-only、
+  `SameSite=Lax` 且 Path 为 `/oauth2/logout/confirm` 的 transient cookie；不能进入 Location、query
+  或 Hosted hidden form；
+- end-session 响应以 route-specific `Referrer-Policy: no-referrer` 的 303 进入无 query 的
+  `GET /oauth2/logout/confirm`；只有 clean GET 可以一次性绑定当前 Session/User，并生成只对该
+  transaction、stage 和 Session 有效的一次性 CSRF proof；同一 bound Session 的 reload 会轮换
+  proof，其他 Session 或旧页面固定失败；
+- clean GET 不变更 authority，并以无外部资源、`Referrer-Policy: same-origin` 的 Hosted 页面保留
+  后续同源 Origin/Referer 校验。Hint Subject 与当前 Principal 不一致时丢弃外部 Redirect/State，
+  但仍可确认 local logout；
+- `POST /oauth2/logout/confirm` 只接受 transaction-bound CSRF proof 和固定
+  `decision=confirm|cancel`；transaction 只能从 HttpOnly cookie 恢复，且必须已经精确绑定当前
+  Session/User，POST 绝不把 pre-confirm stage 绑定或升级；
+- cancel 只 consume transaction、清 transient cookie 并显示本地“未退出”结果，绝不外跳或
+  返回 `state`；confirm 在同一数据库事务内撤销当前 stable Session binding、关联 Refresh
+  family/Access metadata 并写 Audit，commit 后才清主 Session 与 transient cookie；
+- 外部回跳只发生在 confirmed commit 后，并要求有效 `id_token_hint` 所识别的 Active Client、
+  逐字节登记且提交前重检的 Logout URI；只有该 URI 可接收原 `state`。URI 在追加参数前匹配，
+  byte-preserving builder 只编码 State；registered query 已有解码后的 `state` key 时降级 local-only；
+- missing、invalid、expired 或 terminal transaction 只返回固定本地结果并清 transient cookie，
+  不变更 authority、不恢复旧 transaction、不外跳；
+- confirm/cancel terminal response 均为 at-most-once；confirmed Redirect/State 丢失后不能从 consumed
+  transaction 重放，cancel 响应丢失也不能改成 confirm；
+- recently-expired Hint 的最大年龄、clock skew 与 verification-key overlap 仍由 Phase 4 P4-00
+  Spike 冻结，在批准前不实现 Hint 接受分支。
+
+这条 clean continuation 使跨站 RP POST 即使没有携带 `SameSite=Lax` 主 Session cookie，也不需要
+把主 Cookie 放宽为 `SameSite=None`。浏览器门禁必须证明 transaction cookie 的 Path/清理行为，
+原始 Hint/State 不会出现在 confirmation request 的 Referer、Location 或 HTML 中，并证明后续
+request 覆盖 cookie、旧页面或双标签页不能把用户的 confirm 重定向到另一 transaction。初始
+zero-authority rows 还必须受 global/per-IP limiter、短 TTL 和经容量评审的 worst-case live-row
+budget 约束；per-Session cap 在 clean GET 绑定时执行。
+
+标准要求同时支持 GET 与 POST Logout Request；接入/示例默认推荐 form POST，减少 Hint/State 在
+浏览器历史和上游日志中的暴露。应用与受管反向代理必须对两种方法的 query/body 做脱敏；
+`no-referrer` 303 只能防止向 confirmation 继续传播，不能撤回上游已经记录的 GET URL。
+
+现有 same-origin `POST /logout` 保持独立：不接受任何 RP Logout 参数，不创建外部 Redirect/State，
+继续要求 Session、double-submit CSRF 与 Origin/Referer。Phase 4 只把其内部 revoke 升级为与
+confirmed RP logout、当前用户/管理员显式 Session revoke 共用的原子 Session-binding/family/
+Access cascade，绝不能与 authority-read-only 的 `/oauth2/logout` POST 共用 form schema。
+
+### 10.2 当前用户 Grant 边界
+
+Grant list 只从当前 Session Principal 查询，返回安全 Client 展示信息、public `client_id`、Scope/
+时间/状态和是否存在 active offline family 的布尔值；不返回内部 Grant UUID、family/Session ID、
+Token 或 URI。分页延续 bounded keyset/error 契约，但 cursor 只编码 `updated_at + public
+client_id`，不复用包含内部 UUID 的管理端 cursor payload。撤销使用无 identifier path 的
+`POST /api/v1/me/grants/revoke`，严格 JSON body 只含 public `client_id`，Repository 按唯一
+`(principal, client)` 解析 Grant。unknown 与 wrong-owner 使用相同 404；操作仍要求 double-submit
+CSRF 与 same-origin，并在一个事务中完成 Grant version++、旧 Code 失效、family/Access revoke
+和固定 Audit。
+
+### 10.3 密码存储
 
 密码使用 Argon2id。参数保存在配置中，但需要设置安全下限；登录成功后如果发现旧摘要
 参数低于当前标准，可在同一流程中重新哈希。
@@ -524,12 +594,15 @@ timestamp, level, message, request_id, route, method, status, duration
 - Client 禁止注册、全局关闭注册及并发重复注册场景；
 - Confidential/Public Client；
 - Token Refresh、Revoke 和 Introspection；
+- RP Logout GET/POST no-op、clean confirmation、cookie-only transaction、cancel/confirm 级联；
 - 进程重启后 Client、用户和会话行为；
 - 并发使用同一个 Code 或 Refresh Token 时只允许一个请求成功。
 
 ### 安全和兼容性测试
 
 - 对 URI 解析、Authorize 参数和 JWT Claim 解析增加 Go Fuzz 测试；
+- 用真实浏览器验证跨站 Logout POST 的 SameSite 303 continuation、Referer 隔离、CSRF 和 cookie
+  terminal cleanup；
 - CI 运行 `go test -race ./...`、`go vet ./...` 和 `govulncheck ./...`；
 - 发布候选版本接入 OpenID Foundation Conformance Suite；
 - 对依赖启用 Dependabot 或 Renovate，并生成 SBOM。
@@ -566,8 +639,15 @@ timestamp, level, message, request_id, route, method, status, duration
 
 - Refresh Token rotation/reuse detection；
 - Revoke、Introspection 和 RP-Initiated Logout；
-- 限流、CSRF、安全响应头；
-- 集成测试、Fuzz 测试和故障场景测试。
+- `offline_access` Consent、当前用户 Grant 撤销和 Session/Token 级联；
+- 保留阶段三已实现的限流、CSRF、安全响应头，并扩展到 Token lifecycle 端点；
+- 集成测试、并发/故障注入、Fuzz、Conformance 和生命周期运维文档。
+
+详细范围、已接受决策和 P4-00 实施输入见
+[`phase-4-development-plan.md`](./phase-4-development-plan.md)、
+[`phase-4-threat-model.md`](./phase-4-threat-model.md) 与
+[`adr/0003-phase-four-token-lifecycle.md`](./adr/0003-phase-four-token-lifecycle.md)，以及
+[`phase-4-dependency-concurrency-spike.md`](./phase-4-dependency-concurrency-spike.md)。
 
 ### 阶段五：`v0.1` 发布
 

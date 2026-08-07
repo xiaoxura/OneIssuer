@@ -39,6 +39,9 @@ func Decode(raw string) (Cursor, error) {
 	if err != nil || len(payload) != 25 || payload[0] != 1 {
 		return Cursor{}, ErrInvalidCursor
 	}
+	if base64.RawURLEncoding.EncodeToString(payload) != raw {
+		return Cursor{}, ErrInvalidCursor
+	}
 	var id uuid.UUID
 	copy(id[:], payload[9:])
 	if id == uuid.Nil {

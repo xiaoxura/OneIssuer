@@ -82,6 +82,10 @@ type BrowserConfig struct {
 	AuthTransactionTTL  time.Duration
 	LoginReauthWindow   time.Duration
 	CleanupInterval     time.Duration
+	AuthRatePerMinute   int
+	AuthRateBurst       int
+	AuthGlobalRate      int
+	AuthGlobalBurst     int
 	RegistrationEnabled bool
 }
 
@@ -108,6 +112,20 @@ type OIDCConfig struct {
 	ClockSkew            time.Duration
 }
 
+// LifecycleConfig contains Phase 4 Refresh, logout-transaction, and OAuth
+// endpoint capacity bounds. It contains no token, hint, state, or credential.
+type LifecycleConfig struct {
+	RefreshTokenTTL           time.Duration
+	RefreshTokenAbsoluteTTL   time.Duration
+	LogoutTransactionTTL      time.Duration
+	LogoutMaxActivePerSession int
+	LogoutIDTokenHintMaxAge   time.Duration
+	OAuthRatePerMinute        int
+	OAuthRateBurst            int
+	OAuthGlobalRate           int
+	OAuthGlobalBurst          int
+}
+
 // Config is the complete service configuration.
 type Config struct {
 	Environment     Environment
@@ -118,6 +136,7 @@ type Config struct {
 	Browser         BrowserConfig
 	Password        PasswordConfig
 	OIDC            OIDCConfig
+	Lifecycle       LifecycleConfig
 	ShutdownTimeout time.Duration
 	TrustedProxies  []netip.Prefix
 }
@@ -224,6 +243,10 @@ func (c Config) SafeMap() map[string]any {
 			"auth_transaction_ttl": c.Browser.AuthTransactionTTL.String(),
 			"login_reauth_window":  c.Browser.LoginReauthWindow.String(),
 			"cleanup_interval":     c.Browser.CleanupInterval.String(),
+			"auth_rate_per_minute": c.Browser.AuthRatePerMinute,
+			"auth_rate_burst":      c.Browser.AuthRateBurst,
+			"auth_global_rate":     c.Browser.AuthGlobalRate,
+			"auth_global_burst":    c.Browser.AuthGlobalBurst,
 			"registration_enabled": c.Browser.RegistrationEnabled,
 		},
 		"password": map[string]any{
@@ -241,6 +264,17 @@ func (c Config) SafeMap() map[string]any {
 			"id_token_ttl":                 c.OIDC.IDTokenTTL.String(),
 			"access_token_ttl":             c.OIDC.AccessTokenTTL.String(),
 			"clock_skew":                   c.OIDC.ClockSkew.String(),
+		},
+		"lifecycle": map[string]any{
+			"refresh_token_ttl":             c.Lifecycle.RefreshTokenTTL.String(),
+			"refresh_token_absolute_ttl":    c.Lifecycle.RefreshTokenAbsoluteTTL.String(),
+			"logout_transaction_ttl":        c.Lifecycle.LogoutTransactionTTL.String(),
+			"logout_max_active_per_session": c.Lifecycle.LogoutMaxActivePerSession,
+			"logout_id_token_hint_max_age":  c.Lifecycle.LogoutIDTokenHintMaxAge.String(),
+			"oauth_rate_per_minute":         c.Lifecycle.OAuthRatePerMinute,
+			"oauth_rate_burst":              c.Lifecycle.OAuthRateBurst,
+			"oauth_global_rate":             c.Lifecycle.OAuthGlobalRate,
+			"oauth_global_burst":            c.Lifecycle.OAuthGlobalBurst,
 		},
 		"http": map[string]any{
 			"read_header_timeout": c.HTTP.ReadHeaderTimeout.String(),

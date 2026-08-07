@@ -26,7 +26,7 @@ func (s *Store) HasAdmin(ctx context.Context) (bool, error) {
 
 // BootstrapAdmin atomically creates the first administrator and audit event.
 func (s *Store) BootstrapAdmin(ctx context.Context, prepared identity.PreparedUser, event audit.Event) error {
-	return s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
+	return s.inTxWithAudit(ctx, pgx.TxOptions{}, []audit.Event{event}, func(queries *sqlcgen.Queries) error {
 		if err := queries.LockAdminSet(ctx); err != nil {
 			return wrapError("lock administrator bootstrap", ErrorKindQuery, err)
 		}
@@ -82,7 +82,7 @@ func (s *Store) ListUsers(ctx context.Context, search string, cursor pagination.
 
 // CreateManagedUser atomically creates a managed identity and audit event.
 func (s *Store) CreateManagedUser(ctx context.Context, prepared identity.PreparedUser, event audit.Event) error {
-	return s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
+	return s.inTxWithAudit(ctx, pgx.TxOptions{}, []audit.Event{event}, func(queries *sqlcgen.Queries) error {
 		if err := lockAndCheckIdentifiers(ctx, queries, prepared.User, uuid.Nil); err != nil {
 			return err
 		}
@@ -102,7 +102,11 @@ func (s *Store) CreateManagedUser(ctx context.Context, prepared identity.Prepare
 // UpdateManagedUser atomically applies an optimistic user update, revocations, and audit.
 func (s *Store) UpdateManagedUser(ctx context.Context, commit admin.UpdateUserCommit) (identity.User, error) {
 	var result identity.User
-	err := s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
+	events := []audit.Event{commit.Event}
+	if commit.RevokeSessions && commit.SessionEvent != nil {
+		events = append(events, *commit.SessionEvent)
+	}
+	err := s.inTxWithAudit(ctx, pgx.TxOptions{}, events, func(queries *sqlcgen.Queries) error {
 		if err := queries.LockAdminSet(ctx); err != nil {
 			return wrapError("lock administrator set", ErrorKindQuery, err)
 		}
@@ -132,7 +136,7 @@ func (s *Store) UpdateManagedUser(ctx context.Context, commit admin.UpdateUserCo
 			DisplayName: commit.Updated.DisplayName, Email: commit.Updated.Email,
 			EmailNormalized: commit.Updated.EmailNormalized, Status: string(commit.Updated.Status),
 			Role: string(commit.Updated.Role), UpdatedAt: timestamp(commit.Updated.UpdatedAt),
-			ID: commit.Updated.ID, ExpectedUpdatedAt: timestamp(commit.Updated.Version),
+			ID: commit.Updated.ID, ExpectedVersion: commit.Updated.Version,
 		})
 		if isNoRows(err) {
 			return identity.ErrConflict
@@ -140,15 +144,54 @@ func (s *Store) UpdateManagedUser(ctx context.Context, commit admin.UpdateUserCo
 		if err != nil {
 			return mapIdentityWriteError("update managed user", err)
 		}
+		var sessionRows []sqlcgen.LoginSession
+		if commit.RevokeSessions {
+			var lockErr error
+			sessionRows, lockErr = queries.LockActiveLoginSessionsByUser(ctx, commit.Updated.ID)
+			if lockErr != nil {
+				return wrapError("lock sessions after user change", ErrorKindQuery, lockErr)
+			}
+		}
+		if commit.Updated.Status == identity.StatusDisabled {
+			if _, err := queries.LockUnrevokedRefreshTokenFamiliesByUser(ctx, commit.Updated.ID); err != nil {
+				return wrapError("lock disabled user refresh families", ErrorKindQuery, err)
+			}
+			if _, err := queries.LockLiveAccessTokensByUser(ctx, sqlcgen.LockLiveAccessTokensByUserParams{
+				UserID: commit.Updated.ID, Now: timestamp(commit.Updated.UpdatedAt),
+			}); err != nil {
+				return wrapError("lock disabled user access metadata", ErrorKindQuery, err)
+			}
+			if _, err := queries.RevokeRefreshTokenFamiliesByUser(ctx, sqlcgen.RevokeRefreshTokenFamiliesByUserParams{
+				RevokedAt: timestamp(commit.Updated.UpdatedAt), RevokeReason: pointerString("user_disabled"), UserID: commit.Updated.ID,
+			}); err != nil {
+				return wrapError("revoke disabled user refresh families", ErrorKindQuery, err)
+			}
+			if _, err := queries.RevokeLiveAccessTokensByUser(ctx, sqlcgen.RevokeLiveAccessTokensByUserParams{
+				RevokedAt: timestamp(commit.Updated.UpdatedAt), RevokeReason: pointerString("user_disabled"), UserID: commit.Updated.ID,
+			}); err != nil {
+				return wrapError("revoke disabled user access metadata", ErrorKindQuery, err)
+			}
+		}
 		if commit.RevokeSessions {
 			reason := "role_changed"
+			familyReason := "session_revoked"
 			if commit.Updated.Status == identity.StatusDisabled {
 				reason = "user_disabled"
+				familyReason = reason
 			}
-			if _, err := queries.RevokeAllUserLoginSessions(ctx, sqlcgen.RevokeAllUserLoginSessionsParams{
-				RevokedAt: timestamp(commit.Updated.UpdatedAt), RevokeReason: pointerString(reason), UserID: commit.Updated.ID,
-			}); err != nil {
-				return wrapError("revoke sessions after user change", ErrorKindQuery, err)
+			bindingIDs := make([]uuid.UUID, 0, len(sessionRows))
+			for _, sessionRow := range sessionRows {
+				bindingIDs = append(bindingIDs, sessionRow.SessionBindingID)
+			}
+			if err := revokeSessionBindingsCascade(ctx, queries, bindingIDs, commit.Updated.UpdatedAt, familyReason); err != nil {
+				return err
+			}
+			for _, sessionRow := range sessionRows {
+				if _, revokeErr := queries.RevokeLoginSessionBindingByID(ctx, sqlcgen.RevokeLoginSessionBindingByIDParams{
+					RevokedAt: timestamp(commit.Updated.UpdatedAt), RevokeReason: pointerString(reason), ID: sessionRow.ID,
+				}); revokeErr != nil {
+					return wrapError("revoke session after user change", ErrorKindQuery, revokeErr)
+				}
 			}
 			if commit.SessionEvent != nil {
 				if err := insertAudit(ctx, queries, *commit.SessionEvent); err != nil {
@@ -161,31 +204,43 @@ func (s *Store) UpdateManagedUser(ctx context.Context, commit admin.UpdateUserCo
 		}
 		result = mapUser(row)
 		return nil
-	})
+	}, func() { result = identity.User{} })
 	return result, err
 }
 
 // RevokeAllManagedUserSessions revokes a user's sessions and appends audit atomically.
 func (s *Store) RevokeAllManagedUserSessions(ctx context.Context, userID uuid.UUID, now time.Time, event audit.Event) (int64, error) {
 	var count int64
-	err := s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
+	err := s.inTxWithAudit(ctx, pgx.TxOptions{}, []audit.Event{event}, func(queries *sqlcgen.Queries) error {
 		if _, err := queries.GetUserByID(ctx, userID); isNoRows(err) {
 			return identity.ErrNotFound
 		} else if err != nil {
 			return wrapError("find user for session revocation", ErrorKindQuery, err)
 		}
-		ids, err := queries.RevokeAllUserLoginSessions(ctx, sqlcgen.RevokeAllUserLoginSessionsParams{
-			RevokedAt: timestamp(now), RevokeReason: pointerString("admin"), UserID: userID,
-		})
+		rows, err := queries.LockActiveLoginSessionsByUser(ctx, userID)
 		if err != nil {
-			return wrapError("revoke all managed user sessions", ErrorKindQuery, err)
+			return wrapError("lock all managed user sessions", ErrorKindQuery, err)
+		}
+		bindingIDs := make([]uuid.UUID, 0, len(rows))
+		for _, row := range rows {
+			bindingIDs = append(bindingIDs, row.SessionBindingID)
+		}
+		if err := revokeSessionBindingsCascade(ctx, queries, bindingIDs, now, "session_revoked"); err != nil {
+			return err
+		}
+		for _, row := range rows {
+			if _, revokeErr := queries.RevokeLoginSessionBindingByID(ctx, sqlcgen.RevokeLoginSessionBindingByIDParams{
+				RevokedAt: timestamp(now), RevokeReason: pointerString("admin"), ID: row.ID,
+			}); revokeErr != nil {
+				return wrapError("revoke managed user session", ErrorKindQuery, revokeErr)
+			}
+			count++
 		}
 		if err := insertAudit(ctx, queries, event); err != nil {
 			return err
 		}
-		count = int64(len(ids))
 		return nil
-	})
+	}, func() { count = 0 })
 	return count, err
 }
 
@@ -212,14 +267,23 @@ func (s *Store) ListManagedSessions(ctx context.Context, cursor pagination.Curso
 
 // RevokeManagedSession revokes one session and appends audit atomically.
 func (s *Store) RevokeManagedSession(ctx context.Context, id uuid.UUID, now time.Time, event audit.Event) error {
-	return s.inTx(ctx, pgx.TxOptions{}, func(queries *sqlcgen.Queries) error {
-		_, err := queries.RevokeLoginSessionAdmin(ctx, sqlcgen.RevokeLoginSessionAdminParams{
-			RevokedAt: timestamp(now), RevokeReason: pointerString("admin"), ID: id,
-		})
+	return s.inTxWithAudit(ctx, pgx.TxOptions{}, []audit.Event{event}, func(queries *sqlcgen.Queries) error {
+		row, err := queries.LockLoginSessionByID(ctx, id)
 		if isNoRows(err) {
 			return session.ErrNotFound
 		}
 		if err != nil {
+			return wrapError("lock managed session", ErrorKindQuery, err)
+		}
+		if row.RevokedAt.Valid {
+			return session.ErrNotFound
+		}
+		if err := revokeSessionBindingCascade(ctx, queries, row.SessionBindingID, now, "session_revoked"); err != nil {
+			return err
+		}
+		if _, err := queries.RevokeLoginSessionBindingByID(ctx, sqlcgen.RevokeLoginSessionBindingByIDParams{
+			RevokedAt: timestamp(now), RevokeReason: pointerString("admin"), ID: id,
+		}); err != nil {
 			return wrapError("revoke managed session", ErrorKindQuery, err)
 		}
 		return insertAudit(ctx, queries, event)

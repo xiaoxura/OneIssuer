@@ -2,13 +2,15 @@
 INSERT INTO authorization_codes (
     id, code_hash, auth_transaction_id, consent_grant_id, user_id, client_id,
     redirect_uri, scopes, pkce_challenge, pkce_method, nonce_value,
-    auth_time, created_at, expires_at
+    auth_time, created_at, expires_at, consent_grant_version,
+    origin_session_id, session_binding_id
 ) VALUES (
     sqlc.arg(id), sqlc.arg(code_hash), sqlc.arg(auth_transaction_id),
     sqlc.arg(consent_grant_id), sqlc.arg(user_id), sqlc.arg(client_id),
     sqlc.arg(redirect_uri), sqlc.arg(scopes), sqlc.arg(pkce_challenge),
     sqlc.arg(pkce_method), sqlc.arg(nonce_value), sqlc.arg(auth_time),
-    sqlc.arg(created_at), sqlc.arg(expires_at)
+    sqlc.arg(created_at), sqlc.arg(expires_at), sqlc.arg(consent_grant_version),
+    sqlc.arg(origin_session_id), sqlc.arg(session_binding_id)
 );
 
 -- name: GetAuthorizationCodeByHash :one
@@ -26,6 +28,14 @@ WHERE id = sqlc.arg(id)
 RETURNING *;
 
 -- name: DeleteRetiredAuthorizationCodes :execrows
-DELETE FROM authorization_codes
-WHERE expires_at <= sqlc.arg(cutoff)
-  AND (consumed_at IS NOT NULL OR expires_at <= sqlc.arg(cutoff));
+WITH candidates AS (
+    SELECT codes.id
+    FROM authorization_codes AS codes
+    WHERE codes.expires_at <= sqlc.arg(cutoff)
+    ORDER BY codes.expires_at, codes.id
+    LIMIT sqlc.arg(batch_limit)
+    FOR UPDATE OF codes SKIP LOCKED
+)
+DELETE FROM authorization_codes AS codes
+USING candidates
+WHERE codes.id = candidates.id;

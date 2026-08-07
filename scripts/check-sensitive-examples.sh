@@ -3,52 +3,56 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 temporary=$(mktemp "${TMPDIR:-/tmp}/oneissuer-sensitive.XXXXXX")
-trap 'rm -f "$temporary"' EXIT HUP INT TERM
+file_list=
+cleanup() {
+  rm -f "$temporary"
+  if [ -n "$file_list" ]; then
+    rm -f "$file_list"
+  fi
+}
+trap cleanup 0 HUP INT TERM
+file_list=$(mktemp "${TMPDIR:-/tmp}/oneissuer-sensitive-files.XXXXXX")
 
 # Scope this gate to maintained public documentation/contracts. Test
 # fixtures intentionally contain synthetic secrets and are covered by runtime
 # privacy assertions instead.
-set -- \
-  "$root/.env.example" \
+for file in \
   "$root/README.md" \
   "$root/SECURITY.md" \
-  "$root/api/openapi.yaml" \
-  "$root/docs/README.md" \
-  "$root/docs/development.md" \
-  "$root/docs/configuration.md" \
-  "$root/docs/migrations.md" \
-  "$root/docs/troubleshooting.md" \
-  "$root/docs/operations.md" \
-  "$root/docs/key-rotation-runbook.md" \
-  "$root/docs/oidc-client-integration.md" \
-  "$root/docs/phase-2-release-notes.md" \
-  "$root/docs/phase-2-threat-model.md" \
-  "$root/docs/phase-3-handoff.md" \
-  "$root/docs/phase-3-development-plan.md" \
-  "$root/docs/phase-3-threat-model.md" \
-  "$root/docs/phase-3-dependency-spike.md" \
-  "$root/docs/phase-3-conformance.md" \
-  "$root/docs/phase-3-release-notes.md" \
-  "$root/examples/oidc-client/README.md" \
-  "$root/conformance/phase-3/matrix.json" \
-  "$root/conformance/phase-3/public-config.template.json" \
-  "$root/conformance/phase-3/confidential-config.template.json" \
-  "$root/conformance/phase-3/results/2026-08-01.json" \
-  "$root/docs/adr/0001-phase-two-identity-and-client-security.md" \
-  "$root/docs/adr/0002-phase-three-oidc-security-profile.md"
-
-: > "$temporary"
-for file in "$@"; do
+  "$root/CONTRIBUTING.md"; do
   if [ ! -f "$file" ]; then
     echo "sensitive-example scan input is missing: $file" >&2
     exit 1
   fi
+  printf '%s\n' "$file" >> "$file_list"
+done
+
+for directory in "$root/docs" "$root/examples" "$root/conformance"; do
+  if [ ! -d "$directory" ]; then
+    echo "sensitive-example scan directory is missing: $directory" >&2
+    exit 1
+  fi
+done
+
+find "$root/docs" -type f -name '*.md' -print >> "$file_list"
+find "$root/examples" -type f -name 'README*.md' -print >> "$file_list"
+find "$root/conformance" -type f -name '*.json' -print >> "$file_list"
+LC_ALL=C sort -u -o "$file_list" "$file_list"
+
+: > "$temporary"
+while IFS= read -r file; do
   # Real-format clear opaque values and PHC digests must never be documentation fixtures.
-  grep -nE '(ois_sec_v1_|[spct]1_)[A-Za-z0-9_-]{32,}|\$argon2id\$v=[0-9]+' "$file" >> "$temporary" || true
+  grep -nE '(^|[^A-Za-z0-9_-])(ois_sec_v1_|s1_|p1_|c1_|t1_|r1_|lt1_|lc1_)[A-Za-z0-9_-]{43}([^A-Za-z0-9_-]|$)|\$argon2id\$v=[0-9]+' "$file" |
+    while IFS=: read -r line _; do
+      printf '%s:%s: opaque credential or password digest\n' "$file" "$line"
+    done >> "$temporary" || true
   # Reject obvious literal credential assignments while permitting placeholders,
   # variable names, prose, and the documented no-password CLI option.
-  grep -nEi '(^|[,{[:space:]])("?(password|client_secret|session_token|csrf_token)"?)[[:space:]]*[:=][[:space:]]*["'"'"'`][^<$[{][^"'"'"'`]{7,}["'"'"'`]' "$file" >> "$temporary" || true
-done
+  grep -nEi '(^|[,{[:space:]])("?(password|client_secret|session_token|csrf_token)"?)[[:space:]]*[:=][[:space:]]*["'"'"'`][^<$[{][^"'"'"'`]{7,}["'"'"'`]' "$file" |
+    while IFS=: read -r line _; do
+      printf '%s:%s: literal credential assignment\n' "$file" "$line"
+    done >> "$temporary" || true
+done < "$file_list"
 
 if [ -s "$temporary" ]; then
   echo "public documentation contains a secret-shaped example:" >&2

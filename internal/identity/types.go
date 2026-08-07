@@ -79,7 +79,7 @@ type User struct {
 	CreatedAt          time.Time  `json:"created_at"`
 	UpdatedAt          time.Time  `json:"updated_at"`
 	LastLoginAt        *time.Time `json:"last_login_at,omitempty"`
-	Version            time.Time  `json:"-"`
+	Version            int64      `json:"-"`
 }
 
 // LoginRecord is a narrow internal projection. It must never be serialized,

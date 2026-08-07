@@ -35,7 +35,9 @@ func (a *applicationHandler) handleToken(writer http.ResponseWriter, request *ht
 		writeOAuthError(writer, &oidc.TokenError{Code: "invalid_request", HTTPStatus: http.StatusBadRequest})
 		return
 	}
-	verified, err := oidc.ParseTokenRequest(request.Context(), form, request.Header, a.tokenClients)
+	operationCtx, cancel := operationContext(request)
+	defer cancel()
+	verified, err := oidc.ParseTokenRequest(operationCtx, form, request.Header, a.tokenClients)
 	if err != nil {
 		var protocolError *oidc.TokenError
 		if !errors.As(err, &protocolError) {
@@ -44,14 +46,28 @@ func (a *applicationHandler) handleToken(writer http.ResponseWriter, request *ht
 		writeOAuthError(writer, protocolError)
 		return
 	}
-	response, err := a.tokens.Exchange(request.Context(), token.ExchangeInput{
-		CodeHash: verified.CodeHash, Client: verified.Client, RedirectURI: verified.RedirectURI,
-		CodeVerifier: verified.CodeVerifier, RequestID: RequestID(request.Context()), Now: a.now().UTC(),
-	})
+	if a.oauthClientRateLimited(verified.Client.ID) {
+		a.writeOAuthRateLimitResponse(writer, request)
+		return
+	}
+	var response token.Response
+	if verified.GrantType == "refresh_token" {
+		response, err = a.tokens.Refresh(operationCtx, token.RefreshInput{
+			TokenHash: verified.RefreshTokenHash, Client: verified.Client,
+			RequestedScopes: verified.Scopes, RequestID: RequestID(request.Context()), Now: a.now().UTC(),
+		})
+	} else {
+		response, err = a.tokens.Exchange(operationCtx, token.ExchangeInput{
+			CodeHash: verified.CodeHash, Client: verified.Client, RedirectURI: verified.RedirectURI,
+			CodeVerifier: verified.CodeVerifier, RequestID: RequestID(request.Context()), Now: a.now().UTC(),
+		})
+	}
 	if err != nil {
 		protocolError := &oidc.TokenError{Code: "server_error", HTTPStatus: http.StatusInternalServerError}
 		if errors.Is(err, token.ErrInvalidGrant) {
 			protocolError = &oidc.TokenError{Code: "invalid_grant", HTTPStatus: http.StatusBadRequest}
+		} else if errors.Is(err, token.ErrInvalidScope) {
+			protocolError = &oidc.TokenError{Code: "invalid_scope", HTTPStatus: http.StatusBadRequest}
 		}
 		writeOAuthError(writer, protocolError)
 		return
@@ -70,9 +86,15 @@ func (a *applicationHandler) handleUserInfo(writer http.ResponseWriter, request 
 		writeBearerError(writer, "invalid_token", http.StatusUnauthorized)
 		return
 	}
-	result, err := a.tokens.UserInfoForAccessToken(request.Context(), compact, a.now().UTC())
+	operationCtx, cancel := operationContext(request)
+	defer cancel()
+	result, err := a.tokens.UserInfoForAccessToken(operationCtx, compact, a.now().UTC())
 	if err != nil {
-		writeBearerError(writer, "invalid_token", http.StatusUnauthorized)
+		if errors.Is(err, token.ErrInvalidToken) {
+			writeBearerError(writer, "invalid_token", http.StatusUnauthorized)
+			return
+		}
+		writeOAuthError(writer, &oidc.TokenError{Code: "server_error", HTTPStatus: http.StatusInternalServerError})
 		return
 	}
 	writeProtocolJSON(writer, http.StatusOK, result)

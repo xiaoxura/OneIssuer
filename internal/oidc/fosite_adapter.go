@@ -30,7 +30,7 @@ func (c *fositeClientAdapter) GetRedirectURIs() []string {
 }
 
 func (c *fositeClientAdapter) GetGrantTypes() fosite.Arguments {
-	return fosite.Arguments{"authorization_code"}
+	return fosite.Arguments{"authorization_code", "refresh_token"}
 }
 
 func (c *fositeClientAdapter) GetResponseTypes() fosite.Arguments {
@@ -38,9 +38,9 @@ func (c *fositeClientAdapter) GetResponseTypes() fosite.Arguments {
 }
 
 func (c *fositeClientAdapter) GetScopes() fosite.Arguments {
-	result := make([]string, 0, 3)
+	result := make([]string, 0, 4)
 	for _, scope := range c.value.Scopes {
-		if scope == "openid" || scope == "profile" || scope == "email" {
+		if scope == "openid" || scope == "profile" || scope == "email" || scope == "offline_access" {
 			result = append(result, scope)
 		}
 	}

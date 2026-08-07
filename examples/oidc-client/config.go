@@ -13,16 +13,17 @@ import (
 )
 
 type exampleConfig struct {
-	Name                string
-	Addr                string
-	Issuer              *url.URL
-	ProviderBackchannel *url.URL
-	ClientID            string
-	ClientSecret        string
-	RedirectURI         string
-	Scopes              []string
-	CookieName          string
-	CookieSecure        bool
+	Name                  string
+	Addr                  string
+	Issuer                *url.URL
+	ProviderBackchannel   *url.URL
+	ClientID              string
+	ClientSecret          string
+	RedirectURI           string
+	PostLogoutRedirectURI string
+	Scopes                []string
+	CookieName            string
+	CookieSecure          bool
 }
 
 func loadExampleConfig() (exampleConfig, error) {
@@ -39,11 +40,28 @@ func loadExampleConfig() (exampleConfig, error) {
 	}
 	redirect := os.Getenv("EXAMPLE_REDIRECT_URI")
 	redirectURL, err := url.Parse(redirect)
-	if err != nil || !redirectURL.IsAbs() || redirectURL.Host == "" || redirectURL.User != nil || redirectURL.Fragment != "" || redirectURL.RawQuery != "" {
+	if err != nil || !redirectURL.IsAbs() || redirectURL.Host == "" || redirectURL.User != nil || redirectURL.Opaque != "" ||
+		redirectURL.RawPath != "" || redirectURL.Fragment != "" || redirectURL.RawQuery != "" || redirectURL.ForceQuery {
 		return exampleConfig{}, errors.New("EXAMPLE_REDIRECT_URI must be an absolute URL without userinfo, query, or fragment")
 	}
 	if redirectURL.Scheme != "https" && (redirectURL.Scheme != "http" || !isLoopbackHost(redirectURL.Hostname())) {
 		return exampleConfig{}, errors.New("EXAMPLE_REDIRECT_URI must use HTTPS except on loopback")
+	}
+	postLogoutRedirect := os.Getenv("EXAMPLE_POST_LOGOUT_REDIRECT_URI")
+	if postLogoutRedirect == "" {
+		postLogoutRedirect = redirectURL.Scheme + "://" + redirectURL.Host + "/logged-out"
+	}
+	postLogoutURL, err := url.Parse(postLogoutRedirect)
+	if err != nil || !postLogoutURL.IsAbs() || postLogoutURL.Host == "" || postLogoutURL.User != nil || postLogoutURL.Opaque != "" ||
+		postLogoutURL.RawPath != "" || postLogoutURL.Fragment != "" || postLogoutURL.RawQuery != "" || postLogoutURL.ForceQuery ||
+		postLogoutURL.Path != "/logged-out" {
+		return exampleConfig{}, errors.New("EXAMPLE_POST_LOGOUT_REDIRECT_URI must be an absolute URL without userinfo, query, or fragment")
+	}
+	if postLogoutURL.Scheme != "https" && (postLogoutURL.Scheme != "http" || !isLoopbackHost(postLogoutURL.Hostname())) {
+		return exampleConfig{}, errors.New("EXAMPLE_POST_LOGOUT_REDIRECT_URI must use HTTPS except on loopback")
+	}
+	if !sameURLOrigin(postLogoutURL, redirectURL) {
+		return exampleConfig{}, errors.New("EXAMPLE_POST_LOGOUT_REDIRECT_URI must use the authorization callback origin")
 	}
 	clientID := os.Getenv("EXAMPLE_CLIENT_ID")
 	if clientID == "" || len(clientID) > 256 || strings.TrimSpace(clientID) != clientID {
@@ -87,7 +105,7 @@ func loadExampleConfig() (exampleConfig, error) {
 	}
 	return exampleConfig{
 		Name: name, Addr: addr, Issuer: issuer, ProviderBackchannel: backchannel,
-		ClientID: clientID, ClientSecret: secret, RedirectURI: redirect, Scopes: scopes,
+		ClientID: clientID, ClientSecret: secret, RedirectURI: redirect, PostLogoutRedirectURI: postLogoutRedirect, Scopes: scopes,
 		CookieName: cookieName, CookieSecure: cookieSecure,
 	}, nil
 }
@@ -106,13 +124,13 @@ func parseOrigin(raw string) (*url.URL, error) {
 }
 
 func canonicalExampleScopes(values []string) ([]string, error) {
-	if len(values) < 1 || len(values) > 3 {
-		return nil, errors.New("EXAMPLE_SCOPES must contain openid and only profile/email additions")
+	if len(values) < 1 || len(values) > 4 {
+		return nil, errors.New("EXAMPLE_SCOPES must contain openid and only profile/email/offline_access additions")
 	}
 	result := append([]string(nil), values...)
 	slices.Sort(result)
 	for index, value := range result {
-		if value != "openid" && value != "profile" && value != "email" {
+		if value != "openid" && value != "profile" && value != "email" && value != "offline_access" {
 			return nil, errors.New("EXAMPLE_SCOPES contains an unsupported scope")
 		}
 		if index > 0 && result[index-1] == value {

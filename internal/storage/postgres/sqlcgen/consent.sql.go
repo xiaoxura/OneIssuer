@@ -15,7 +15,7 @@ import (
 const createConsentGrant = `-- name: CreateConsentGrant :one
 INSERT INTO consent_grants (id, user_id, client_id, scopes, created_at, updated_at)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, user_id, client_id, scopes, created_at, updated_at
+RETURNING id, user_id, client_id, scopes, created_at, updated_at, revoked_at, version
 `
 
 type CreateConsentGrantParams struct {
@@ -44,12 +44,14 @@ func (q *Queries) CreateConsentGrant(ctx context.Context, arg CreateConsentGrant
 		&i.Scopes,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.RevokedAt,
+		&i.Version,
 	)
 	return i, err
 }
 
 const getConsentGrantByUserClient = `-- name: GetConsentGrantByUserClient :one
-SELECT id, user_id, client_id, scopes, created_at, updated_at FROM consent_grants
+SELECT id, user_id, client_id, scopes, created_at, updated_at, revoked_at, version FROM consent_grants
 WHERE user_id = $1 AND client_id = $2
 `
 
@@ -68,12 +70,99 @@ func (q *Queries) GetConsentGrantByUserClient(ctx context.Context, arg GetConsen
 		&i.Scopes,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.RevokedAt,
+		&i.Version,
 	)
 	return i, err
 }
 
+const listCurrentUserConsentGrants = `-- name: ListCurrentUserConsentGrants :many
+SELECT grants.id, grants.user_id, grants.client_id, grants.scopes,
+       grants.created_at, grants.updated_at, grants.revoked_at, grants.version,
+       clients.client_id AS public_client_id, clients.name AS client_name,
+       clients.status AS client_status,
+       EXISTS (
+           SELECT 1 FROM refresh_token_families AS families
+           WHERE families.consent_grant_id = grants.id
+             AND families.revoked_at IS NULL
+             AND families.absolute_expires_at > $1
+       ) AS has_active_offline_family
+FROM consent_grants AS grants
+JOIN oidc_clients AS clients ON clients.id = grants.client_id
+WHERE grants.user_id = $2
+  AND (
+      $3::timestamptz IS NULL
+      OR (grants.updated_at, clients.client_id) <
+         ($3::timestamptz, $4::text)
+  )
+ORDER BY grants.updated_at DESC, clients.client_id DESC
+LIMIT $5
+`
+
+type ListCurrentUserConsentGrantsParams struct {
+	Now            pgtype.Timestamptz `db:"now"`
+	UserID         uuid.UUID          `db:"user_id"`
+	CursorTime     pgtype.Timestamptz `db:"cursor_time"`
+	CursorClientID string             `db:"cursor_client_id"`
+	PageLimit      int32              `db:"page_limit"`
+}
+
+type ListCurrentUserConsentGrantsRow struct {
+	ID                     uuid.UUID          `db:"id"`
+	UserID                 uuid.UUID          `db:"user_id"`
+	ClientID               uuid.UUID          `db:"client_id"`
+	Scopes                 []string           `db:"scopes"`
+	CreatedAt              pgtype.Timestamptz `db:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `db:"updated_at"`
+	RevokedAt              pgtype.Timestamptz `db:"revoked_at"`
+	Version                int64              `db:"version"`
+	PublicClientID         string             `db:"public_client_id"`
+	ClientName             string             `db:"client_name"`
+	ClientStatus           string             `db:"client_status"`
+	HasActiveOfflineFamily bool               `db:"has_active_offline_family"`
+}
+
+func (q *Queries) ListCurrentUserConsentGrants(ctx context.Context, arg ListCurrentUserConsentGrantsParams) ([]ListCurrentUserConsentGrantsRow, error) {
+	rows, err := q.db.Query(ctx, listCurrentUserConsentGrants,
+		arg.Now,
+		arg.UserID,
+		arg.CursorTime,
+		arg.CursorClientID,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCurrentUserConsentGrantsRow{}
+	for rows.Next() {
+		var i ListCurrentUserConsentGrantsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.ClientID,
+			&i.Scopes,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.RevokedAt,
+			&i.Version,
+			&i.PublicClientID,
+			&i.ClientName,
+			&i.ClientStatus,
+			&i.HasActiveOfflineFamily,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockConsentGrantByUserClient = `-- name: LockConsentGrantByUserClient :one
-SELECT id, user_id, client_id, scopes, created_at, updated_at FROM consent_grants
+SELECT id, user_id, client_id, scopes, created_at, updated_at, revoked_at, version FROM consent_grants
 WHERE user_id = $1 AND client_id = $2
 FOR UPDATE
 `
@@ -93,15 +182,81 @@ func (q *Queries) LockConsentGrantByUserClient(ctx context.Context, arg LockCons
 		&i.Scopes,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.RevokedAt,
+		&i.Version,
+	)
+	return i, err
+}
+
+const reactivateConsentGrant = `-- name: ReactivateConsentGrant :one
+UPDATE consent_grants
+SET scopes = $1,
+    revoked_at = NULL,
+    updated_at = $2,
+    version = version + 1
+WHERE id = $3 AND revoked_at IS NOT NULL
+RETURNING id, user_id, client_id, scopes, created_at, updated_at, revoked_at, version
+`
+
+type ReactivateConsentGrantParams struct {
+	Scopes    []string           `db:"scopes"`
+	UpdatedAt pgtype.Timestamptz `db:"updated_at"`
+	ID        uuid.UUID          `db:"id"`
+}
+
+func (q *Queries) ReactivateConsentGrant(ctx context.Context, arg ReactivateConsentGrantParams) (ConsentGrant, error) {
+	row := q.db.QueryRow(ctx, reactivateConsentGrant, arg.Scopes, arg.UpdatedAt, arg.ID)
+	var i ConsentGrant
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.ClientID,
+		&i.Scopes,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.RevokedAt,
+		&i.Version,
+	)
+	return i, err
+}
+
+const revokeConsentGrant = `-- name: RevokeConsentGrant :one
+UPDATE consent_grants
+SET revoked_at = $1,
+    updated_at = $1,
+    version = version + 1
+WHERE id = $2 AND revoked_at IS NULL
+RETURNING id, user_id, client_id, scopes, created_at, updated_at, revoked_at, version
+`
+
+type RevokeConsentGrantParams struct {
+	RevokedAt pgtype.Timestamptz `db:"revoked_at"`
+	ID        uuid.UUID          `db:"id"`
+}
+
+func (q *Queries) RevokeConsentGrant(ctx context.Context, arg RevokeConsentGrantParams) (ConsentGrant, error) {
+	row := q.db.QueryRow(ctx, revokeConsentGrant, arg.RevokedAt, arg.ID)
+	var i ConsentGrant
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.ClientID,
+		&i.Scopes,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.RevokedAt,
+		&i.Version,
 	)
 	return i, err
 }
 
 const updateConsentGrantScopes = `-- name: UpdateConsentGrantScopes :one
 UPDATE consent_grants
-SET scopes = $1, updated_at = $2
-WHERE id = $3
-RETURNING id, user_id, client_id, scopes, created_at, updated_at
+SET scopes = $1,
+    updated_at = $2,
+    version = version + 1
+WHERE id = $3 AND revoked_at IS NULL
+RETURNING id, user_id, client_id, scopes, created_at, updated_at, revoked_at, version
 `
 
 type UpdateConsentGrantScopesParams struct {
@@ -120,6 +275,8 @@ func (q *Queries) UpdateConsentGrantScopes(ctx context.Context, arg UpdateConsen
 		&i.Scopes,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.RevokedAt,
+		&i.Version,
 	)
 	return i, err
 }

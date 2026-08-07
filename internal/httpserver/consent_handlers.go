@@ -40,18 +40,20 @@ var consentTranslations = map[string]consentText{
 		Title: "Authorize application", Intro: "This application is requesting access to your account.",
 		Approve: "Allow", Deny: "Deny", NewStatus: "New request", ExistingStatus: "Previously granted",
 		Scopes: map[string][2]string{
-			"openid":  {"Basic identity", "Confirm your stable account identifier."},
-			"profile": {"Profile", "Read your display name and username."},
-			"email":   {"Email", "Read your email address and verification status."},
+			"openid":         {"Basic identity", "Confirm your stable account identifier."},
+			"profile":        {"Profile", "Read your display name and username."},
+			"email":          {"Email", "Read your email address and verification status."},
+			"offline_access": {"Offline access", "Keep long-lived access when you are not actively using this browser session."},
 		},
 	},
 	"zh-CN": {
 		Title: "授权应用", Intro: "此应用正在请求访问你的账户信息。",
 		Approve: "允许", Deny: "拒绝", NewStatus: "本次新增", ExistingStatus: "已授予",
 		Scopes: map[string][2]string{
-			"openid":  {"基本身份", "确认你的稳定账户标识。"},
-			"profile": {"个人资料", "读取你的显示名称和用户名。"},
-			"email":   {"邮箱", "读取你的邮箱地址和验证状态。"},
+			"openid":         {"基本身份", "确认你的稳定账户标识。"},
+			"profile":        {"个人资料", "读取你的显示名称和用户名。"},
+			"email":          {"邮箱", "读取你的邮箱地址和验证状态。"},
+			"offline_access": {"离线访问", "即使你当前未使用此浏览器会话，仍允许应用维持长期访问。"},
 		},
 	},
 }
@@ -189,7 +191,7 @@ func (a *applicationHandler) renderConsent(writer http.ResponseWriter, request *
 	lang := preferredLanguage(request)
 	text := consentTranslations[lang]
 	scopes := make([]consentScopeData, 0, len(transaction.Scopes))
-	for _, scope := range []string{"openid", "profile", "email"} {
+	for _, scope := range []string{"openid", "profile", "email", "offline_access"} {
 		if !slices.Contains(transaction.Scopes, scope) {
 			continue
 		}
@@ -200,6 +202,7 @@ func (a *applicationHandler) renderConsent(writer http.ResponseWriter, request *
 		}
 		scopes = append(scopes, consentScopeData{Name: scopeText[0], Description: scopeText[1], Status: status})
 	}
+	setFormActionPolicy(writer.Header(), transaction.RedirectURI)
 	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 	writer.Header().Set("Cache-Control", "no-store")
 	writer.WriteHeader(http.StatusOK)

@@ -121,7 +121,7 @@ func (s *Service) CreateLocal(ctx context.Context, requestID string, now time.Ti
 func (s *Service) CreateVerified(ctx context.Context, input VerifiedInput, requestID string, now time.Time) (string, Transaction, error) {
 	input.Scopes = canonicalStrings(input.Scopes)
 	if input.ClientID == uuid.Nil || !validAbsoluteURI(input.RedirectURI) || input.ResponseType != "code" || input.ResponseMode != "query" ||
-		len(input.Scopes) == 0 || len(input.Scopes) > 3 || !validOIDCScopes(input.Scopes) {
+		len(input.Scopes) == 0 || len(input.Scopes) > 4 || !validOIDCScopes(input.Scopes) {
 		return "", Transaction{}, ErrInvalid
 	}
 	if !validS256Challenge(input.PKCEChallenge) {
@@ -242,12 +242,16 @@ func (s *Service) Reject(ctx context.Context, transaction Transaction, reason st
 func (s *Service) Cleanup(ctx context.Context, now time.Time) (int64, error) {
 	expired, err := s.repository.ExpireAuthTransactions(ctx, now.UTC())
 	if err != nil {
-		return 0, err
-	}
-	deleted, err := s.repository.CleanupAuthTransactions(ctx, now.UTC().Add(-24*time.Hour))
-	if err != nil {
+		s.observe("expire", "failure")
 		return expired, err
 	}
+	s.observe("expire", "success")
+	deleted, err := s.repository.CleanupAuthTransactions(ctx, now.UTC().Add(-24*time.Hour))
+	if err != nil {
+		s.observe("cleanup", "failure")
+		return expired, err
+	}
+	s.observe("cleanup", "success")
 	return expired + deleted, nil
 }
 
@@ -310,7 +314,7 @@ func validOIDCScopes(values []string) bool {
 		return false
 	}
 	for _, value := range values {
-		if value != "openid" && value != "profile" && value != "email" {
+		if value != "openid" && value != "profile" && value != "email" && value != "offline_access" {
 			return false
 		}
 	}

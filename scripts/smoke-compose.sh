@@ -12,6 +12,7 @@ client_a_port=${ONEISSUER_SMOKE_CLIENT_A_PORT:-8081}
 client_b_port=${ONEISSUER_SMOKE_CLIENT_B_PORT:-8082}
 client_a_url=http://localhost:$client_a_port
 client_b_url=http://localhost:$client_b_port
+alpine_image='alpine:3.23.5@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40'
 
 # Export every acceptance-specific override so values from a developer .env do
 # not silently weaken or redirect the test. PostgreSQL stays on the internal
@@ -22,13 +23,32 @@ export ONEISSUER_ENV=development
 export ONEISSUER_REGISTRATION_ENABLED=true
 export ONEISSUER_COOKIE_NAME=$session_cookie_name
 export ONEISSUER_COOKIE_SECURE=false
-export ONEISSUER_VERSION=${ONEISSUER_VERSION:-v0.1.0-dev.3}
+export ONEISSUER_VERSION=${ONEISSUER_VERSION:-v0.1.0-dev.4}
 export ONEISSUER_AUTHORIZATION_CODE_TTL=30s
+export ONEISSUER_REFRESH_TOKEN_TTL=${ONEISSUER_SMOKE_REFRESH_TOKEN_TTL:-1h}
+export ONEISSUER_REFRESH_TOKEN_ABSOLUTE_TTL=${ONEISSUER_SMOKE_REFRESH_TOKEN_ABSOLUTE_TTL:-24h}
+export ONEISSUER_LOGOUT_TRANSACTION_TTL=${ONEISSUER_SMOKE_LOGOUT_TRANSACTION_TTL:-1m}
+export ONEISSUER_LOGOUT_MAX_ACTIVE_PER_SESSION=${ONEISSUER_SMOKE_LOGOUT_MAX_ACTIVE_PER_SESSION:-3}
+export ONEISSUER_LOGOUT_ID_TOKEN_HINT_MAX_AGE=${ONEISSUER_SMOKE_LOGOUT_HINT_MAX_AGE:-24h}
+export ONEISSUER_OAUTH_RATE_PER_MINUTE=60000
+export ONEISSUER_OAUTH_RATE_BURST=1000
+export ONEISSUER_OAUTH_GLOBAL_RATE_PER_SECOND=10000
+export ONEISSUER_OAUTH_GLOBAL_BURST=20000
+# The smoke suite intentionally creates many independent browser flows in a few
+# seconds from one host. Unit/HTTP tests own limiter behavior; give this bounded
+# acceptance workload the documented maximum test budget so it exercises OIDC
+# semantics rather than sleeping for token refill.
+export ONEISSUER_AUTH_RATE_PER_MINUTE=60000
+export ONEISSUER_AUTH_RATE_BURST=1000
+export ONEISSUER_AUTH_GLOBAL_RATE_PER_SECOND=10000
+export ONEISSUER_AUTH_GLOBAL_BURST=20000
 export POSTGRES_PORT=${ONEISSUER_SMOKE_POSTGRES_PORT:-0}
 export EXAMPLE_CLIENT_A_PORT=$client_a_port
 export EXAMPLE_CLIENT_B_PORT=$client_b_port
 export EXAMPLE_CLIENT_A_REDIRECT_URI=$client_a_url/callback
 export EXAMPLE_CLIENT_B_REDIRECT_URI=$client_b_url/callback
+export EXAMPLE_CLIENT_A_POST_LOGOUT_REDIRECT_URI=$client_a_url/logged-out
+export EXAMPLE_CLIENT_B_POST_LOGOUT_REDIRECT_URI=$client_b_url/logged-out
 
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/oneissuer-compose-smoke.XXXXXX")
 chmod 700 "$temporary"
@@ -40,12 +60,15 @@ go run ./cmd/oneissuer keys generate --alg RS256 --out "$signing_key" >/dev/null
 # into an unsafe deployment example.
 docker run --rm --user 0:0 --entrypoint /bin/sh \
   --mount "type=bind,source=$signing_key,target=/run/oneissuer-secret" \
-  alpine:3.23.3 -c 'chown 65532:65532 /run/oneissuer-secret && chmod 0600 /run/oneissuer-secret'
+  "$alpine_image" -c 'chown 65532:65532 /run/oneissuer-secret && chmod 0600 /run/oneissuer-secret'
 export ONEISSUER_SIGNING_KEY_HOST_FILE=$signing_key
 sensitive_values=$temporary/sensitive-values
+sensitive_labels=$temporary/sensitive-labels
 exposure_surface=$temporary/exposure-surface
 : >"$sensitive_values"
 chmod 600 "$sensitive_values"
+: >"$sensitive_labels"
+chmod 600 "$sensitive_labels"
 
 compose() {
   docker compose -f "$compose_file" "$@"
@@ -195,6 +218,19 @@ record_sensitive() {
     fail "$sensitive_label was unexpectedly empty"
   fi
   printf '%s\n' "$sensitive_value" >>"$sensitive_values"
+  printf '%s\n' "$sensitive_label" >>"$sensitive_labels"
+}
+
+prepare_exposure_copy() {
+  exposure_input=$1
+  exposure_output=$2
+  exposure_csrf=$3
+  exposure_label=$4
+  shift 4
+  if ! "$root/scripts/prepare-smoke-exposure.sh" "$exposure_input" "$exposure_output" "$exposure_csrf" "$@" \
+    >/dev/null 2>&1; then
+    fail "$exposure_label could not be prepared for exposure scan"
+  fi
 }
 
 write_csrf_header() {
@@ -248,15 +284,14 @@ curl_request -D "$health_headers" -o /dev/null "$base_url/health/live"
 request_id=$(header_value X-Request-ID "$health_headers")
 [ -n "$request_id" ] || fail "health response omitted X-Request-ID"
 
-# Phase-three Discovery and JWKS are live only with the complete Code/Token/
-# UserInfo route set. Deferred phase-four endpoints must remain absent.
+# Discovery must describe only the complete live Phase-four route set.
 discovery_body=$temporary/discovery-body
 discovery_status=$(curl_request -o "$discovery_body" -w '%{http_code}' "$base_url/.well-known/openid-configuration")
 assert_status "$discovery_status" 200 "OIDC Discovery"
-for marker in '"grant_types_supported":["authorization_code"]' '"code_challenge_methods_supported":["S256"]' '"id_token_signing_alg_values_supported":["RS256"]'; do
+for marker in '"grant_types_supported":["authorization_code","refresh_token"]' '"scopes_supported":["openid","profile","email","offline_access"]' '"revocation_endpoint":"' '"introspection_endpoint":"' '"end_session_endpoint":"' '"code_challenge_methods_supported":["S256"]' '"id_token_signing_alg_values_supported":["RS256"]'; do
   assert_file_contains "$discovery_body" "$marker" "OIDC Discovery"
 done
-for forbidden in refresh_token offline_access revocation_endpoint introspection_endpoint end_session_endpoint registration_endpoint; do
+for forbidden in registration_endpoint frontchannel_logout_supported backchannel_logout_supported sid; do
   assert_file_excludes "$discovery_body" "$forbidden" "OIDC Discovery"
 done
 jwks_body=$temporary/jwks-body
@@ -277,7 +312,7 @@ userinfo_post_status=$(curl_request -X POST -o "$protocol_body" -w '%{http_code}
 assert_status "$userinfo_post_status" 401 "unauthenticated POST UserInfo"
 for protocol_path in /oauth2/revoke /oauth2/introspect /oauth2/logout; do
   protocol_status=$(curl_request -X POST -o "$protocol_body" -w '%{http_code}' "$base_url$protocol_path")
-  assert_status "$protocol_status" 404 "deferred POST $protocol_path"
+  assert_status "$protocol_status" 400 "malformed POST $protocol_path"
 done
 
 migrate_id=$(compose ps -aq migrate)
@@ -526,7 +561,7 @@ write_csrf_header "$admin_csrf" "$admin_csrf_header"
 
 public_payload=$temporary/public-client-payload
 cat >"$public_payload" <<EOF
-{"client_type":"public","name":"Compose Smoke Public","description":"phase-three Public RP acceptance","registration_enabled":true,"redirect_uris":["$client_a_url/callback"],"logout_uris":["$client_a_url/logout"],"scopes":["openid","profile","email"]}
+{"client_type":"public","name":"Compose Smoke Public","description":"phase-four Public RP acceptance","registration_enabled":true,"redirect_uris":["$client_a_url/callback"],"logout_uris":["$client_a_url/logged-out"],"scopes":["openid","profile","email","offline_access"]}
 EOF
 public_headers=$temporary/public-client-headers
 public_body=$temporary/public-client-body
@@ -550,7 +585,7 @@ assert_file_contains "$public_rotate_body" invalid_input "Public Client rotation
 
 confidential_payload=$temporary/confidential-client-payload
 cat >"$confidential_payload" <<EOF
-{"client_type":"confidential","name":"Compose Smoke Confidential","description":"phase-three Confidential RP acceptance","registration_enabled":false,"redirect_uris":["$client_b_url/callback"],"logout_uris":["$client_b_url/logout"],"scopes":["openid","profile","email"]}
+{"client_type":"confidential","name":"Compose Smoke Confidential","description":"phase-four Confidential RP acceptance","registration_enabled":false,"redirect_uris":["$client_b_url/callback"],"logout_uris":["$client_b_url/logged-out"],"scopes":["openid","profile","email","offline_access"]}
 EOF
 confidential_headers=$temporary/confidential-client-headers
 confidential_body=$temporary/confidential-client-body
@@ -592,7 +627,7 @@ printf '%s' "$rotated_client_secret" >"$client_b_secret_file"
 chmod 600 "$client_b_secret_file"
 docker run --rm --user 0:0 --entrypoint /bin/sh \
   --mount "type=bind,source=$client_b_secret_file,target=/run/oneissuer-secret" \
-  alpine:3.23.3 -c 'chown 65532:65532 /run/oneissuer-secret && chmod 0600 /run/oneissuer-secret'
+  "$alpine_image" -c 'chown 65532:65532 /run/oneissuer-secret && chmod 0600 /run/oneissuer-secret'
 export EXAMPLE_CLIENT_A_ID=$public_protocol_client_id
 export EXAMPLE_CLIENT_B_ID=$confidential_protocol_client_id
 export EXAMPLE_CLIENT_B_SECRET_FILE=$client_b_secret_file
@@ -708,6 +743,37 @@ assert_status "$a_home_status" 200 "Client A signed-in home"
 assert_file_contains "$a_home" 'Signed in as <strong>OIDC Smoke User</strong>' "Client A verified identity"
 assert_file_excludes "$a_home" 'access_token' "Client A page"
 assert_file_excludes "$a_home" 'id_token' "Client A page"
+
+# The example RP mutates its server-side Session through a same-origin,
+# Session-bound POST. Keep the hidden CSRF value in a mode-restricted form file;
+# the Refresh Token remains server-side and never enters this request.
+a_refresh_csrf=$(hidden_value csrf_token "$a_home")
+record_sensitive "$a_refresh_csrf" "Client A refresh CSRF"
+a_home_exposure=$temporary/client-a-home-exposure
+prepare_exposure_copy "$a_home" "$a_home_exposure" "$a_refresh_csrf" \
+  "Client A signed-in home" /refresh /logout
+a_refresh_form=$temporary/client-a-refresh-form
+printf 'csrf_token=%s' "$a_refresh_csrf" >"$a_refresh_form"
+chmod 600 "$a_refresh_form"
+a_refresh_headers=$temporary/client-a-refresh-headers
+a_refresh_body=$temporary/client-a-refresh-body
+a_refresh_status=$(curl_request -X POST -b "$oidc_jar" -c "$oidc_jar" -D "$a_refresh_headers" \
+  -H "Origin: $client_a_url" -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$a_refresh_form" -o "$a_refresh_body" -w '%{http_code}' "$client_a_url/refresh")
+assert_status "$a_refresh_status" 303 "Client A RP Refresh POST"
+assert_equal "$(header_value Location "$a_refresh_headers")" / "Client A RP Refresh redirect"
+a_refreshed_home=$temporary/client-a-refreshed-home
+a_refreshed_home_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -o "$a_refreshed_home" \
+  -w '%{http_code}' "$client_a_url/")
+assert_status "$a_refreshed_home_status" 200 "Client A refreshed home"
+assert_file_contains "$a_refreshed_home" 'Signed in as <strong>OIDC Smoke User</strong>' "Client A refreshed identity"
+assert_file_excludes "$a_refreshed_home" 'access_token' "Client A refreshed page"
+assert_file_excludes "$a_refreshed_home" 'id_token' "Client A refreshed page"
+a_refreshed_home_csrf=$(hidden_value csrf_token "$a_refreshed_home")
+record_sensitive "$a_refreshed_home_csrf" "Client A refreshed home CSRF"
+a_refreshed_home_exposure=$temporary/client-a-refreshed-home-exposure
+prepare_exposure_copy "$a_refreshed_home" "$a_refreshed_home_exposure" "$a_refreshed_home_csrf" \
+  "Client A refreshed home" /refresh /logout
 
 # A consumed Code remains unusable outside the RP after its successful callback.
 a_replay_form=$temporary/client-a-replay-form
@@ -894,26 +960,85 @@ assert_file_excludes "$expired_code_body" "$expiry_code" "expired-Code response"
 assert_file_excludes "$expired_code_body" 'access_token' "expired-Code response"
 assert_file_excludes "$expired_code_body" 'id_token' "expired-Code response"
 
-# Deferred phase-four surfaces fail explicitly and Discovery remains honest.
-refresh_form=$temporary/refresh-grant-form
-printf 'grant_type=refresh_token&code=%s&redirect_uri=%s&client_id=%s&code_verifier=%s' \
-  "$direct_public_code" "$public_redirect_encoded" "$public_protocol_client_id" "$pkce_verifier" >"$refresh_form"
-chmod 600 "$refresh_form"
-refresh_body=$temporary/refresh-grant-body
-refresh_status=$(curl_request -X POST -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @"$refresh_form" \
-  -o "$refresh_body" -w '%{http_code}' "$base_url/oauth2/token")
-assert_status "$refresh_status" 400 "deferred Refresh grant"
-assert_file_contains "$refresh_body" '"error":"unsupported_grant_type"' "Refresh grant response"
+# Phase-four Public Client flow: requesting offline_access adds a Grant scope,
+# returns a three-token initial response, and then rotates the family.
 offline_state="offline-state-${nonce}"
-record_sensitive "$offline_state" "offline_access rejected state"
+record_sensitive "$offline_state" "offline_access state"
 offline_headers=$temporary/offline-authorize-headers
 offline_body=$temporary/offline-authorize-body
 offline_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$offline_headers" -o "$offline_body" -w '%{http_code}' \
-  "$base_url/oauth2/authorize?client_id=$public_protocol_client_id&redirect_uri=$public_redirect_encoded&response_type=code&scope=openid%20offline_access&state=$offline_state&code_challenge=$pkce_challenge&code_challenge_method=S256")
-assert_status "$offline_status" 302 "offline_access rejection"
-offline_location=$(header_value Location "$offline_headers")
-assert_prefix "$offline_location" "$client_a_url/callback?error=invalid_scope" "offline_access error redirect"
-assert_file_contains "$offline_headers" "state=$offline_state" "offline_access state round trip"
+  "$base_url/oauth2/authorize?client_id=$public_protocol_client_id&redirect_uri=$public_redirect_encoded&response_type=code&scope=openid%20profile%20offline_access&state=$offline_state&prompt=consent&code_challenge=$pkce_challenge&code_challenge_method=S256")
+assert_status "$offline_status" 303 "offline_access Consent redirect"
+offline_consent_location=$(header_value Location "$offline_headers")
+assert_prefix "$offline_consent_location" "/consent?transaction=" "offline_access Consent page"
+offline_consent_page=$temporary/offline-consent-page
+offline_consent_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -o "$offline_consent_page" -w '%{http_code}' \
+  "$(absolute_url "$base_url" "$offline_consent_location")")
+assert_status "$offline_consent_status" 200 "offline_access Consent page"
+assert_file_contains "$offline_consent_page" 'Offline access' "offline_access Consent disclosure"
+offline_consent_csrf=$(hidden_value csrf_token "$offline_consent_page")
+offline_consent_transaction=$(hidden_value transaction "$offline_consent_page")
+record_sensitive "$offline_consent_csrf" "offline_access Consent CSRF"
+record_sensitive "$offline_consent_transaction" "offline_access Consent transaction"
+offline_consent_form=$temporary/offline-consent-form
+printf 'csrf_token=%s&transaction=%s&decision=approve' "$offline_consent_csrf" "$offline_consent_transaction" >"$offline_consent_form"
+chmod 600 "$offline_consent_form"
+offline_consent_headers=$temporary/offline-consent-headers
+offline_consent_post_body=$temporary/offline-consent-post-body
+offline_consent_post_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$offline_consent_headers" \
+  -o "$offline_consent_post_body" -w '%{http_code}' -H "Origin: $base_url" \
+  -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @"$offline_consent_form" "$base_url/consent")
+assert_status "$offline_consent_post_status" 302 "offline_access Consent approval"
+offline_callback=$(header_value Location "$offline_consent_headers")
+assert_prefix "$offline_callback" "$client_a_url/callback?code=" "offline_access callback"
+offline_code=$(query_value code "$offline_callback")
+record_sensitive "$offline_code" "offline_access Authorization Code"
+offline_form=$temporary/offline-token-form
+printf 'grant_type=authorization_code&code=%s&redirect_uri=%s&client_id=%s&code_verifier=%s' \
+  "$offline_code" "$public_redirect_encoded" "$public_protocol_client_id" "$pkce_verifier" >"$offline_form"
+chmod 600 "$offline_form"
+offline_token_headers=$temporary/offline-token-headers
+offline_token_body=$temporary/offline-token-body
+offline_token_status=$(curl_request -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$offline_form" -D "$offline_token_headers" -o "$offline_token_body" \
+  -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$offline_token_status" 200 "offline_access initial token response"
+assert_file_contains "$offline_token_body" '"refresh_token":"r1_' "offline_access initial Refresh Token"
+offline_access_token=$(json_string access_token "$offline_token_body")
+offline_id_token=$(json_string id_token "$offline_token_body")
+offline_refresh_token=$(json_string refresh_token "$offline_token_body")
+record_sensitive "$offline_access_token" "offline_access initial Access Token"
+record_sensitive "$offline_id_token" "offline_access initial ID Token"
+record_sensitive "$offline_refresh_token" "offline_access initial Refresh Token"
+refresh_form=$temporary/refresh-grant-form
+printf 'grant_type=refresh_token&refresh_token=%s&client_id=%s' "$offline_refresh_token" "$public_protocol_client_id" >"$refresh_form"
+chmod 600 "$refresh_form"
+refresh_body=$temporary/refresh-grant-body
+refresh_headers=$temporary/refresh-grant-headers
+refresh_status=$(curl_request -X POST -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @"$refresh_form" \
+  -D "$refresh_headers" -o "$refresh_body" -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$refresh_status" 200 "Public Refresh rotation"
+assert_file_contains "$refresh_body" '"refresh_token":"r1_' "Public Refresh replacement"
+assert_file_excludes "$refresh_body" '"id_token"' "Public Refresh response"
+replacement_refresh_token=$(json_string refresh_token "$refresh_body")
+replacement_access_token=$(json_string access_token "$refresh_body")
+record_sensitive "$replacement_refresh_token" "Public replacement Refresh Token"
+record_sensitive "$replacement_access_token" "Public replacement Access Token"
+replay_refresh_body=$temporary/replay-refresh-body
+replay_refresh_status=$(curl_request -X POST -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @"$refresh_form" \
+  -o "$replay_refresh_body" -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$replay_refresh_status" 400 "consumed Refresh replay"
+assert_file_contains "$replay_refresh_body" '"error":"invalid_grant"' "consumed Refresh replay"
+invalid_scope_state="invalid-scope-state-${nonce}"
+record_sensitive "$invalid_scope_state" "invalid_scope state"
+invalid_scope_headers=$temporary/invalid-scope-authorize-headers
+invalid_scope_body=$temporary/invalid-scope-authorize-body
+invalid_scope_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$invalid_scope_headers" -o "$invalid_scope_body" -w '%{http_code}' \
+  "$base_url/oauth2/authorize?client_id=$public_protocol_client_id&redirect_uri=$public_redirect_encoded&response_type=code&scope=openid%20address&state=$invalid_scope_state&code_challenge=$pkce_challenge&code_challenge_method=S256")
+assert_status "$invalid_scope_status" 302 "unregistered scope rejection"
+invalid_scope_location=$(header_value Location "$invalid_scope_headers")
+assert_prefix "$invalid_scope_location" "$client_a_url/callback?error=invalid_scope" "unregistered scope error redirect"
+assert_file_contains "$invalid_scope_headers" "state=$invalid_scope_state" "unregistered scope state round trip"
 
 none_state="none-state-${nonce}"
 record_sensitive "$none_state" "prompt=none state"
@@ -1128,6 +1253,148 @@ confidential_replay_status=$(curl_request -X POST -H @"$correct_basic_header" -H
 assert_status "$confidential_replay_status" 400 "Confidential Code replay"
 assert_file_contains "$confidential_replay_body" '"error":"invalid_grant"' "Confidential replay response"
 
+# Confidential Client B must receive the same explicit offline_access Consent
+# and rotating family semantics. Its owning Basic credential is required for
+# Refresh and Introspection; the public Client cannot use this boundary.
+b_offline_state="b-offline-state-${nonce}"
+record_sensitive "$b_offline_state" "Confidential offline state"
+b_offline_headers=$temporary/b-offline-authorize-headers
+b_offline_body=$temporary/b-offline-authorize-body
+b_offline_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$b_offline_headers" -o "$b_offline_body" -w '%{http_code}' \
+  "$base_url/oauth2/authorize?client_id=$confidential_protocol_client_id&redirect_uri=$confidential_redirect_encoded&response_type=code&scope=openid%20offline_access&state=$b_offline_state&prompt=consent&code_challenge=$pkce_challenge&code_challenge_method=S256")
+assert_status "$b_offline_status" 303 "Confidential offline Consent redirect"
+b_offline_consent_location=$(header_value Location "$b_offline_headers")
+assert_prefix "$b_offline_consent_location" "/consent?transaction=" "Confidential offline Consent page"
+b_offline_consent_page=$temporary/b-offline-consent-page
+b_offline_consent_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -o "$b_offline_consent_page" -w '%{http_code}' \
+  "$(absolute_url "$base_url" "$b_offline_consent_location")")
+assert_status "$b_offline_consent_status" 200 "Confidential offline Consent page"
+assert_file_contains "$b_offline_consent_page" 'Offline access' "Confidential offline Consent disclosure"
+b_offline_csrf=$(hidden_value csrf_token "$b_offline_consent_page")
+b_offline_transaction=$(hidden_value transaction "$b_offline_consent_page")
+record_sensitive "$b_offline_csrf" "Confidential offline Consent CSRF"
+record_sensitive "$b_offline_transaction" "Confidential offline Consent transaction"
+b_offline_consent_form=$temporary/b-offline-consent-form
+printf 'csrf_token=%s&transaction=%s&decision=approve' "$b_offline_csrf" "$b_offline_transaction" >"$b_offline_consent_form"
+chmod 600 "$b_offline_consent_form"
+b_offline_consent_headers=$temporary/b-offline-consent-headers
+b_offline_consent_body=$temporary/b-offline-consent-body
+b_offline_consent_post_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$b_offline_consent_headers" -o "$b_offline_consent_body" \
+  -w '%{http_code}' -H "Origin: $base_url" -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$b_offline_consent_form" "$base_url/consent")
+assert_status "$b_offline_consent_post_status" 302 "Confidential offline Consent approval"
+b_offline_callback=$(header_value Location "$b_offline_consent_headers")
+assert_prefix "$b_offline_callback" "$client_b_url/callback?code=" "Confidential offline callback"
+b_offline_code=$(query_value code "$b_offline_callback")
+record_sensitive "$b_offline_code" "Confidential offline Authorization Code"
+b_offline_token_form=$temporary/b-offline-token-form
+printf 'grant_type=authorization_code&code=%s&redirect_uri=%s&code_verifier=%s' \
+  "$b_offline_code" "$confidential_redirect_encoded" "$pkce_verifier" >"$b_offline_token_form"
+chmod 600 "$b_offline_token_form"
+b_offline_token_body=$temporary/b-offline-token-body
+b_offline_token_status=$(curl_request -X POST -H @"$correct_basic_header" -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$b_offline_token_form" -o "$b_offline_token_body" -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$b_offline_token_status" 200 "Confidential offline initial token response"
+assert_file_contains "$b_offline_token_body" '"refresh_token":"r1_' "Confidential offline initial Refresh Token"
+b_offline_access_token=$(json_string access_token "$b_offline_token_body")
+b_offline_refresh_token=$(json_string refresh_token "$b_offline_token_body")
+record_sensitive "$b_offline_access_token" "Confidential offline Access Token"
+record_sensitive "$b_offline_refresh_token" "Confidential offline Refresh Token"
+b_refresh_form=$temporary/b-refresh-form
+printf 'grant_type=refresh_token&refresh_token=%s' "$b_offline_refresh_token" >"$b_refresh_form"
+chmod 600 "$b_refresh_form"
+b_refresh_body=$temporary/b-refresh-body
+b_refresh_status=$(curl_request -X POST -H @"$correct_basic_header" -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$b_refresh_form" -o "$b_refresh_body" -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$b_refresh_status" 200 "Confidential Refresh rotation"
+b_replacement_refresh_token=$(json_string refresh_token "$b_refresh_body")
+b_replacement_access_token=$(json_string access_token "$b_refresh_body")
+record_sensitive "$b_replacement_refresh_token" "Confidential replacement Refresh Token"
+record_sensitive "$b_replacement_access_token" "Confidential replacement Access Token"
+# Introspection is owner-bound and returns a minimal active snapshot. A Public
+# Client is rejected before token lookup, while B cannot probe A's token.
+b_introspect_form=$temporary/b-introspect-form
+printf 'token=%s' "$b_replacement_access_token" >"$b_introspect_form"
+chmod 600 "$b_introspect_form"
+b_introspect_body=$temporary/b-introspect-body
+b_introspect_status=$(curl_request -X POST -H @"$correct_basic_header" -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$b_introspect_form" -o "$b_introspect_body" -w '%{http_code}' "$base_url/oauth2/introspect")
+assert_status "$b_introspect_status" 200 "owning Confidential Introspection"
+assert_file_contains "$b_introspect_body" '"active":true' "owning Confidential Introspection"
+public_introspect_form=$temporary/public-introspect-form
+printf 'token=%s&client_id=%s' "$b_offline_access_token" "$public_protocol_client_id" >"$public_introspect_form"
+chmod 600 "$public_introspect_form"
+public_introspect_body=$temporary/public-introspect-body
+public_introspect_status=$(curl_request -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$public_introspect_form" -o "$public_introspect_body" -w '%{http_code}' "$base_url/oauth2/introspect")
+assert_status "$public_introspect_status" 401 "Public Introspection rejection"
+assert_file_contains "$public_introspect_body" '"error":"invalid_client"' "Public Introspection rejection"
+cross_introspect_form=$temporary/cross-introspect-form
+printf 'token=%s' "$public_access_token" >"$cross_introspect_form"
+chmod 600 "$cross_introspect_form"
+cross_introspect_body=$temporary/cross-introspect-body
+cross_introspect_status=$(curl_request -X POST -H @"$correct_basic_header" -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$cross_introspect_form" -o "$cross_introspect_body" -w '%{http_code}' "$base_url/oauth2/introspect")
+assert_status "$cross_introspect_status" 200 "cross-Client Introspection response"
+assert_file_contains "$cross_introspect_body" '"active":false' "cross-Client Introspection response"
+
+wrong_owner_refresh_form=$temporary/wrong-owner-refresh-form
+printf 'grant_type=refresh_token&refresh_token=%s&client_id=%s' "$b_replacement_refresh_token" "$public_protocol_client_id" >"$wrong_owner_refresh_form"
+chmod 600 "$wrong_owner_refresh_form"
+wrong_owner_refresh_body=$temporary/wrong-owner-refresh-body
+wrong_owner_refresh_status=$(curl_request -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$wrong_owner_refresh_form" -o "$wrong_owner_refresh_body" -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$wrong_owner_refresh_status" 400 "wrong-owner Refresh"
+assert_file_contains "$wrong_owner_refresh_body" '"error":"invalid_grant"' "wrong-owner Refresh"
+
+# Reusing the consumed first generation revokes the entire B family, including
+# the replacement Access/Refresh metadata just introspected above.
+b_refresh_replay_body=$temporary/b-refresh-replay-body
+b_refresh_replay_status=$(curl_request -X POST -H @"$correct_basic_header" -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$b_refresh_form" -o "$b_refresh_replay_body" -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$b_refresh_replay_status" 400 "Confidential consumed Refresh replay"
+assert_file_contains "$b_refresh_replay_body" '"error":"invalid_grant"' "Confidential consumed Refresh replay"
+
+b_replay_introspect_form=$temporary/b-replay-introspect-form
+printf 'token=%s&token_type_hint=access_token' "$b_replacement_access_token" >"$b_replay_introspect_form"
+chmod 600 "$b_replay_introspect_form"
+b_replay_introspect_body=$temporary/b-replay-introspect-body
+b_replay_introspect_status=$(curl_request -X POST -H @"$correct_basic_header" -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$b_replay_introspect_form" -o "$b_replay_introspect_body" -w '%{http_code}' "$base_url/oauth2/introspect")
+assert_status "$b_replay_introspect_status" 200 "replayed-family Access Introspection"
+assert_equal "$(cat "$b_replay_introspect_body")" '{"active":false}' "replayed-family Access Introspection body"
+
+# RFC 7009 revocation is uniform and cascades through the owning metadata.
+unknown_revoke_form=$temporary/unknown-revoke-form
+printf 'token=opaque-unknown&token_type_hint=refresh_token' >"$unknown_revoke_form"
+chmod 600 "$unknown_revoke_form"
+unknown_revoke_body=$temporary/unknown-revoke-body
+unknown_revoke_status=$(curl_request -X POST -H @"$correct_basic_header" -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$unknown_revoke_form" -o "$unknown_revoke_body" -w '%{http_code}' "$base_url/oauth2/revoke")
+assert_status "$unknown_revoke_status" 200 "unknown Refresh revocation"
+assert_equal "$(wc -c <"$unknown_revoke_body" | tr -d '[:space:]')" 0 "unknown Refresh revocation body length"
+revoke_b_form=$temporary/revoke-b-form
+printf 'token=%s&token_type_hint=access_token' "$b_replacement_access_token" >"$revoke_b_form"
+chmod 600 "$revoke_b_form"
+revoke_b_body=$temporary/revoke-b-body
+revoke_b_status=$(curl_request -X POST -H @"$correct_basic_header" -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$revoke_b_form" -o "$revoke_b_body" -w '%{http_code}' "$base_url/oauth2/revoke")
+assert_status "$revoke_b_status" 200 "Confidential Access revocation"
+b_replacement_bearer_header=$temporary/b-replacement-bearer-header
+printf 'Authorization: Bearer %s\n' "$b_replacement_access_token" >"$b_replacement_bearer_header"
+chmod 600 "$b_replacement_bearer_header"
+b_revoked_userinfo_body=$temporary/b-revoked-userinfo-body
+b_revoked_userinfo_status=$(curl_request -H @"$b_replacement_bearer_header" -o "$b_revoked_userinfo_body" -w '%{http_code}' "$base_url/oauth2/userinfo")
+assert_status "$b_revoked_userinfo_status" 401 "revoked Confidential Access UserInfo"
+b_revoked_refresh_form=$temporary/b-revoked-refresh-form
+printf 'grant_type=refresh_token&refresh_token=%s' "$b_replacement_refresh_token" >"$b_revoked_refresh_form"
+chmod 600 "$b_revoked_refresh_form"
+b_revoked_refresh_body=$temporary/b-revoked-refresh-body
+b_revoked_refresh_status=$(curl_request -X POST -H @"$correct_basic_header" -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$b_revoked_refresh_form" -o "$b_revoked_refresh_body" -w '%{http_code}' "$base_url/oauth2/token")
+assert_status "$b_revoked_refresh_status" 400 "revoked Confidential Refresh family"
+assert_file_contains "$b_revoked_refresh_body" '"error":"invalid_grant"' "revoked Confidential Refresh family"
+
 # A fresh Public Code is raced through two independent HTTP requests. Exactly
 # one response commits JWT metadata; the loser is a generic invalid_grant.
 concurrent_state="concurrent-state-${nonce}"
@@ -1292,7 +1559,7 @@ assert_status "$client_enable_status" 200 "re-enable Confidential Client"
 reenabled_client_userinfo_body=$temporary/reenabled-client-userinfo-body
 reenabled_client_userinfo_status=$(curl_request -H @"$confidential_bearer_header" -o "$reenabled_client_userinfo_body" \
   -w '%{http_code}' "$base_url/oauth2/userinfo")
-assert_status "$reenabled_client_userinfo_status" 200 "re-enabled Client UserInfo"
+assert_status "$reenabled_client_userinfo_status" 401 "re-enabled Client old Access remains revoked"
 reenabled_client_token_body=$temporary/reenabled-client-token-body
 reenabled_client_token_status=$(curl_request -X POST -H @"$correct_basic_header" \
   -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @"$disabled_client_exchange_form" \
@@ -1367,7 +1634,7 @@ assert_status "$user_enable_status" 200 "re-enable OIDC User"
 reenabled_user_userinfo_body=$temporary/reenabled-user-userinfo-body
 reenabled_user_userinfo_status=$(curl_request -H @"$public_bearer_header" -o "$reenabled_user_userinfo_body" \
   -w '%{http_code}' "$base_url/oauth2/userinfo")
-assert_status "$reenabled_user_userinfo_status" 200 "re-enabled User UserInfo"
+assert_status "$reenabled_user_userinfo_status" 401 "revoked pre-disable User UserInfo"
 reenabled_user_token_body=$temporary/reenabled-user-token-body
 reenabled_user_token_status=$(curl_request -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
   --data-binary @"$disabled_user_form" -o "$reenabled_user_token_body" -w '%{http_code}' "$base_url/oauth2/token")
@@ -1539,6 +1806,124 @@ for event_type in \
   cat "$event_audit" >>"$audit_after_restart"
 done
 
+# Owner-bound Grant API: the OIDC user can list the public Client projections and
+# revoke A's Grant, while a different User cannot select it. Revocation must
+# immediately invalidate the already-issued Public Access metadata.
+oidc_me_headers=$temporary/oidc-me-headers
+oidc_me_body=$temporary/oidc-me-body
+oidc_me_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$oidc_me_headers" -o "$oidc_me_body" \
+  -w '%{http_code}' "$base_url/api/v1/me")
+assert_status "$oidc_me_status" 200 "OIDC user identity before Grant API"
+oidc_api_csrf=$(header_value X-CSRF-Token "$oidc_me_headers")
+record_sensitive "$oidc_api_csrf" "OIDC Grant API CSRF token"
+oidc_api_csrf_header=$temporary/oidc-api-csrf-header
+write_csrf_header "$oidc_api_csrf" "$oidc_api_csrf_header"
+oidc_grants_body=$temporary/oidc-grants-body
+oidc_grants_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -H @"$oidc_api_csrf_header" \
+  -o "$oidc_grants_body" -w '%{http_code}' "$base_url/api/v1/me/grants")
+assert_status "$oidc_grants_status" 200 "owner Grant list"
+assert_file_contains "$oidc_grants_body" "$public_protocol_client_id" "owner Grant list Public Client"
+assert_file_contains "$oidc_grants_body" "$confidential_protocol_client_id" "owner Grant list Confidential Client"
+grant_revoke_payload=$temporary/grant-revoke-payload
+printf '{"client_id":"%s"}' "$public_protocol_client_id" >"$grant_revoke_payload"
+chmod 600 "$grant_revoke_payload"
+grant_revoke_body=$temporary/grant-revoke-body
+grant_revoke_status=$(curl_request -X POST -b "$oidc_jar" -c "$oidc_jar" -H @"$oidc_api_csrf_header" \
+  -H 'Content-Type: application/json' --data-binary @"$grant_revoke_payload" \
+  -o "$grant_revoke_body" -w '%{http_code}' "$base_url/api/v1/me/grants/revoke")
+assert_status "$grant_revoke_status" 200 "owner Public Grant revoke"
+assert_file_contains "$grant_revoke_body" '"revoked_at"' "owner Public Grant revoke response"
+public_after_grant_revoke_body=$temporary/public-after-grant-revoke-body
+public_after_grant_revoke_status=$(curl_request -H @"$public_bearer_header" -o "$public_after_grant_revoke_body" \
+  -w '%{http_code}' "$base_url/oauth2/userinfo")
+assert_status "$public_after_grant_revoke_status" 401 "Access after Grant revoke"
+
+wrong_owner_grant_body=$temporary/wrong-owner-grant-body
+wrong_owner_grant_status=$(curl_request -X POST -b "$user_jar" -c "$user_jar" -H "X-CSRF-Token: $user_csrf" \
+  -H 'Content-Type: application/json' --data-binary @"$grant_revoke_payload" \
+  -o "$wrong_owner_grant_body" -w '%{http_code}' "$base_url/api/v1/me/grants/revoke")
+if [ "$wrong_owner_grant_status" = 200 ]; then
+  fail "a different User could revoke the OIDC user's Grant"
+fi
+assert_file_excludes "$wrong_owner_grant_body" "$public_protocol_client_id" "wrong-owner Grant response"
+
+# RP-Initiated Logout is a form POST. The example keeps the ID Token Hint and
+# state out of its URL, and only destroys its local Session after OneIssuer
+# confirms the exact state on the registered post-logout URI.
+rp_logout_home=$temporary/client-a-logout-home
+rp_logout_home_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -o "$rp_logout_home" -w '%{http_code}' "$client_a_url/")
+assert_status "$rp_logout_home_status" 200 "Client A logout home"
+rp_logout_home_csrf=$(hidden_value csrf_token "$rp_logout_home")
+record_sensitive "$rp_logout_home_csrf" "Client A logout CSRF"
+rp_logout_home_exposure=$temporary/client-a-logout-home-exposure
+prepare_exposure_copy "$rp_logout_home" "$rp_logout_home_exposure" "$rp_logout_home_csrf" \
+  "Client A logout home" /refresh /logout
+rp_logout_mutation_form=$temporary/client-a-logout-form
+printf 'csrf_token=%s' "$rp_logout_home_csrf" >"$rp_logout_mutation_form"
+chmod 600 "$rp_logout_mutation_form"
+rp_logout_form_body=$temporary/rp-logout-form-body
+rp_logout_form_headers=$temporary/rp-logout-form-headers
+rp_logout_form_status=$(curl_request -X POST -b "$oidc_jar" -c "$oidc_jar" -D "$rp_logout_form_headers" \
+  -H "Origin: $client_a_url" -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @"$rp_logout_mutation_form" -o "$rp_logout_form_body" -w '%{http_code}' "$client_a_url/logout")
+assert_status "$rp_logout_form_status" 200 "Client A RP logout form"
+rp_logout_action=$(sed -n 's/.*<form method="post" action="\([^"]*\)".*/\1/p' "$rp_logout_form_body" | head -n 1)
+assert_equal "$rp_logout_action" "$base_url/oauth2/logout" "Client A RP logout endpoint"
+rp_logout_hint=$(hidden_value id_token_hint "$rp_logout_form_body")
+rp_logout_state=$(hidden_value state "$rp_logout_form_body")
+record_sensitive "$rp_logout_hint" "Client A logout ID Token Hint"
+record_sensitive "$rp_logout_state" "Client A logout State"
+rp_logout_provider_form=$temporary/rp-logout-provider-form
+printf 'client_id=%s&id_token_hint=%s&post_logout_redirect_uri=http%%3A%%2F%%2Flocalhost%%3A%s%%2Flogged-out&state=%s' \
+  "$public_protocol_client_id" "$rp_logout_hint" "$client_a_port" "$rp_logout_state" >"$rp_logout_provider_form"
+chmod 600 "$rp_logout_provider_form"
+rp_logout_start_headers=$temporary/rp-logout-start-headers
+rp_logout_start_body=$temporary/rp-logout-start-body
+rp_logout_start_status=$(curl_request -X POST -b "$oidc_jar" -c "$oidc_jar" -D "$rp_logout_start_headers" \
+  -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @"$rp_logout_provider_form" \
+  -o "$rp_logout_start_body" -w '%{http_code}' "$base_url/oauth2/logout")
+assert_status "$rp_logout_start_status" 303 "RP logout provider POST"
+assert_equal "$(header_value Location "$rp_logout_start_headers")" /oauth2/logout/confirm "RP logout confirmation redirect"
+rp_logout_cookie=$(cookie_value "${session_cookie_name}_logout_transaction" "$oidc_jar")
+record_sensitive "$rp_logout_cookie" "RP logout transaction cookie"
+rp_logout_confirm_body=$temporary/rp-logout-confirm-body
+rp_logout_confirm_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -o "$rp_logout_confirm_body" -w '%{http_code}' \
+  "$base_url/oauth2/logout/confirm")
+assert_status "$rp_logout_confirm_status" 200 "RP logout confirmation page"
+rp_logout_csrf=$(hidden_value csrf_token "$rp_logout_confirm_body")
+record_sensitive "$rp_logout_csrf" "RP logout confirmation CSRF"
+rp_logout_confirm_form=$temporary/rp-logout-confirm-form
+printf 'csrf_token=%s&decision=confirm' "$rp_logout_csrf" >"$rp_logout_confirm_form"
+chmod 600 "$rp_logout_confirm_form"
+rp_logout_complete_headers=$temporary/rp-logout-complete-headers
+rp_logout_complete_body=$temporary/rp-logout-complete-body
+rp_logout_complete_status=$(curl_request -X POST -b "$oidc_jar" -c "$oidc_jar" -D "$rp_logout_complete_headers" \
+  -H "Origin: $base_url" -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @"$rp_logout_confirm_form" \
+  -o "$rp_logout_complete_body" -w '%{http_code}' "$base_url/oauth2/logout/confirm")
+assert_status "$rp_logout_complete_status" 303 "RP logout confirmation commit"
+rp_logout_callback=$(header_value Location "$rp_logout_complete_headers")
+assert_prefix "$rp_logout_callback" "$client_a_url/logged-out?state=" "RP logout registered callback"
+rp_logout_wrong_callback_config=$temporary/rp-logout-wrong-callback-curl
+write_curl_url_config "$client_a_url/logged-out?state=logout_wrong_${nonce}" "$rp_logout_wrong_callback_config"
+rp_logout_wrong_callback_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -o "$rp_logout_complete_body" \
+  -w '%{http_code}' --config "$rp_logout_wrong_callback_config")
+assert_status "$rp_logout_wrong_callback_status" 400 "RP logout wrong-state callback"
+rp_logout_callback_config=$temporary/rp-logout-callback-curl
+write_curl_url_config "$rp_logout_callback" "$rp_logout_callback_config"
+rp_logout_callback_headers=$temporary/rp-logout-callback-headers
+rp_logout_callback_body=$temporary/rp-logout-callback-body
+rp_logout_callback_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -D "$rp_logout_callback_headers" \
+  -o "$rp_logout_callback_body" -w '%{http_code}' --config "$rp_logout_callback_config")
+assert_status "$rp_logout_callback_status" 303 "Client A RP logout callback"
+assert_equal "$(header_value Location "$rp_logout_callback_headers")" / "Client A RP logout clean redirect"
+rp_logout_replay_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -o "$rp_logout_callback_body" \
+  -w '%{http_code}' --config "$rp_logout_callback_config")
+assert_status "$rp_logout_replay_status" 400 "RP logout callback replay"
+rp_logout_home_body=$temporary/client-a-logged-out-home
+rp_logout_home_status=$(curl_request -b "$oidc_jar" -c "$oidc_jar" -o "$rp_logout_home_body" -w '%{http_code}' "$client_a_url/")
+assert_status "$rp_logout_home_status" 200 "Client A post-logout home"
+assert_file_excludes "$rp_logout_home_body" 'Signed in as' "Client A post-logout Session"
+
 # Exercise the hosted logout form after persistence checks, then verify the
 # current Session is unusable and the revocation audit is still queryable.
 logout_form=$temporary/logout-form
@@ -1547,7 +1932,7 @@ chmod 600 "$logout_form"
 logout_headers=$temporary/logout-headers
 logout_body=$temporary/logout-body
 logout_status=$(curl_request -b "$user_jar" -c "$user_jar" -D "$logout_headers" -o "$logout_body" \
-  -w '%{http_code}' -H 'Content-Type: application/x-www-form-urlencoded' \
+  -w '%{http_code}' -H "Origin: $base_url" -H 'Content-Type: application/x-www-form-urlencoded' \
   --data-binary @"$logout_form" "$base_url/logout")
 assert_status "$logout_status" 303 "POST /logout"
 assert_equal "$(header_value Location "$logout_headers")" /login "logout redirect"
@@ -1607,20 +1992,40 @@ set -- \
   "$persisted_admin_body" \
   "$public_read_after_restart" \
   "$confidential_read_after_restart" \
-  "$a_home" \
+  "$a_home_exposure" \
+  "$a_refresh_body" \
+  "$a_refreshed_home_exposure" \
   "$b_home" \
   "$a_replay_body" \
   "$direct_public_wrong_body" \
   "$direct_public_replay_body" \
+  "$replay_refresh_body" \
   "$missing_verifier_body" \
   "$expired_code_body" \
-  "$refresh_body" \
   "$none_grant_body" \
   "$forced_consent_deny_body" \
   "$active_create_body" \
   "$bad_redirect_body" \
   "$wrong_secret_body" \
   "$confidential_replay_body" \
+  "$b_introspect_body" \
+  "$b_replay_introspect_body" \
+  "$public_introspect_body" \
+  "$cross_introspect_body" \
+  "$wrong_owner_refresh_body" \
+  "$unknown_revoke_body" \
+  "$revoke_b_body" \
+  "$b_revoked_userinfo_body" \
+  "$b_revoked_refresh_body" \
+  "$public_after_grant_revoke_body" \
+  "$oidc_grants_body" \
+  "$grant_revoke_body" \
+  "$rp_logout_home_exposure" \
+  "$wrong_owner_grant_body" \
+  "$rp_logout_start_body" \
+  "$rp_logout_complete_body" \
+  "$rp_logout_callback_body" \
+  "$rp_logout_home_body" \
   "$concurrent_failure_body" \
   "$concurrent_userinfo_body" \
   "$state_check_callback_body" \
@@ -1660,11 +2065,31 @@ if printf '%s\n' "$bootstrap_password" | grep -Fq -f - "$exposure_surface"; then
   fail "logs, audit, or a credential-free response exposed the Bootstrap password"
 fi
 if grep -Fq -f "$sensitive_values" "$exposure_surface"; then
+  for exposure_file do
+    exposure_label=$(basename "$exposure_file")
+    sensitive_index=0
+    while IFS= read -r sensitive_value; do
+      sensitive_index=$((sensitive_index + 1))
+      if printf '%s\n' "$sensitive_value" | grep -Fq -f - "$exposure_file"; then
+        sensitive_label=$(sed -n "${sensitive_index}p" "$sensitive_labels")
+        [ -n "$sensitive_label" ] || sensitive_label='unknown sensitive value'
+        fail "$exposure_label exposed known sensitive value ($sensitive_label)"
+      else
+        sensitive_match_status=$?
+        [ "$sensitive_match_status" -eq 1 ] ||
+          fail "$exposure_label could not be scanned for known sensitive values"
+      fi
+    done <"$sensitive_values"
+  done
   fail "logs, audit, or a credential-free response exposed a known clear sensitive value"
+else
+  sensitive_scan_status=$?
+  [ "$sensitive_scan_status" -eq 1 ] ||
+    fail "logs, audit, or a credential-free response could not be scanned"
 fi
 for exposure_file do
   exposure_label=$(basename "$exposure_file")
-  if grep -Eq '(s1_|p1_|c1_|t1_)[A-Za-z0-9_-]{20,}|ois_sec_v1_[A-Za-z0-9_-]{20,}|\$argon2id\$' "$exposure_file"; then
+  if grep -Eq '(s1_|p1_|c1_|r1_|t1_)[A-Za-z0-9_-]{20,}|ois_sec_v1_[A-Za-z0-9_-]{20,}|\$argon2id\$' "$exposure_file"; then
     fail "$exposure_label exposed token/Secret/hash-shaped material"
   fi
   if grep -Eq '"(password|password_hash|token_hash|csrf_hash|secret_hash)"[[:space:]]*:' "$exposure_file"; then
@@ -1672,4 +2097,4 @@ for exposure_file do
   fi
 done
 
-printf '%s\n' 'compose smoke: PASS (empty volume, migration/Bootstrap regression, Public+Confidential S256, prompt/create/none Consent semantics, strict RP callbacks, Token/UserInfo expiry and concurrent metadata, disabled/restart authority, privacy, outage recovery, and graceful shutdown)'
+printf '%s\n' 'phase-four compose smoke: PASS (empty volume, schema 15 migration/Bootstrap regression, Public+Confidential offline Consent and Refresh rotation/replay, Revocation and owner-bound Introspection, Grant cascade, RP-Initiated Logout state/CSRF, S256 prompt/Consent semantics, strict callbacks, Token/UserInfo expiry and concurrency, disabled/restart authority, privacy, outage recovery, and graceful shutdown)'

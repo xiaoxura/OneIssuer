@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Go 1.26.x (the container builder is fixed to 1.26.5);
+- Go 1.26.x (the container builder is fixed to 1.26.5 and pinned by digest);
 - Node.js 22.12+ and npm for `web/`;
 - Docker Engine with Compose for PostgreSQL, integration tests, examples, image
   scans, and acceptance tests;
@@ -70,7 +70,7 @@ then the complete release gates:
 make generate
 make contract-check
 make check
-make phase-3-smoke
+make phase-4-smoke
 make container-check
 git diff --check
 ```
@@ -80,10 +80,13 @@ sensitive public examples, `go vet`, golangci-lint, race-enabled Go tests,
 bounded Fuzz smoke, `govulncheck`, a static binary build, Web lint/typecheck/build,
 high-severity npm audit results, and the management OpenAPI document.
 
-`make contract-check` additionally validates the secret-free Conformance record.
+`make contract-check` additionally validates the secret-free historical Phase-three
+record and the Phase-four matrix/result scaffold.
 It also runs pinned actionlint over GitHub Actions workflows and checks local
 Markdown link targets.
-`make phase-3-smoke` is the disposable real-PostgreSQL A/B OIDC acceptance gate.
+`make phase-4-smoke` is the disposable real-PostgreSQL A/B OIDC acceptance gate,
+including offline Consent, Refresh rotation, lifecycle endpoint, Grant, and
+logout checks; `make phase-3-smoke` remains the compatibility alias.
 `make container-check` generates a CycloneDX SBOM, rejects private-key artifacts,
 and rejects fixable High/Critical findings in the final runtime image. Reports go
 under ignored `.artifacts/`; do not publish a raw Conformance export until it has
@@ -118,14 +121,19 @@ Change `queries/*.sql`, add rather than rewrite a migration, run `make generate`
 and commit source plus generated output. `make generate-check` regenerates into a
 temporary directory without mutating the worktree.
 
-Production migrations 00001–00005 are frozen phase-two input. The checksum gate
-must prove their bytes are unchanged. Phase three's expected schema is version
-10; see [migrations.md](./migrations.md).
+Production migrations 00001–00011 are frozen phase-three input. The checksum gate
+must prove their bytes are unchanged. The current expected schema is version 15;
+see [migrations.md](./migrations.md).
+
+All released migration bytes through 00011 are checksum-pinned. The Dockerfile
+frontend, Go builder, Alpine runtime, and Compose PostgreSQL image are likewise
+digest-pinned. Base refreshes are explicit review changes; do not add a mutable
+build-time `apk upgrade` step.
 
 ## Build metadata
 
 ```bash
-make build VERSION=v0.1.0-dev.3 \
+make build VERSION=v0.1.0-dev.4 \
   COMMIT="$(git rev-parse --short=12 HEAD)"
 ./bin/oneissuer version
 ```
@@ -142,20 +150,23 @@ build metadata or a Docker build argument.
   parsing, redirect safety, prompt/max-age; Consent; Code/PKCE; Basic Client
   authentication; JWT claims/signatures; UserInfo; audit/privacy; metrics;
   request IDs; proxy trust; panic recovery; and shutdown bounds;
-- real PostgreSQL/Testcontainers tests cover all ten production migrations,
+- real PostgreSQL/Testcontainers tests cover all fourteen production migrations,
   a populated version-5 authority upgrade, identity/Client/Session/Audit
   lifecycle, transaction/Grant/Code atomicity, concurrent approval and
   exchange, mid-flow disabled User/Client checks, signer/Audit/deferred-Commit
-  rollback, canceled/deadline cleanup rollback, retention, and reopen
-  persistence;
+  rollback, atomic five-attempt form reservation, monotonic User/Client optimistic
+  versions, first-batch cleanup rollback, later-batch partial progress, retention,
+  and reopen persistence;
 - `scripts/smoke-compose.sh` exercises an empty volume, explicit migration,
   Bootstrap, Public A and Confidential B, `prompt=create/none/login/consent`,
   Session reuse/rotation, separate Consent, S256 exchange, ID Token/UserInfo,
   missing/wrong verifier and real Code expiry, replay/concurrent metadata,
-  disabled principals, restart, database outage/recovery, privacy surfaces,
+  offline Consent, Refresh rotation/replay, Revocation/Introspection, Grant and
+  RP logout semantics, disabled principals, restart, database outage/recovery, privacy surfaces,
   non-root/read-only containers, and graceful shutdown;
 - `conformance/phase-3/` records the pinned, applicable non-certification OpenID
-  Conformance Suite subset and its limitations;
+  Conformance Suite subset and its limitations; `conformance/phase-4/` freezes
+  the applicable lifecycle modules without claiming they have run;
 - `scripts/container-security.sh` inspects the final runtime image and writes
   reproducible tool/version/digest evidence.
 
@@ -169,23 +180,26 @@ Compose, release artifacts, or production.
 `examples/oidc-client/` is built as a separate server-side executable. It keeps
 state, nonce, and verifier in an in-memory server Session; uses Discovery;
 requires S256; validates RS256 signature and ID Token claims; compares UserInfo
-`sub`; and keys its mock JIT identity by `(iss, sub)`. It never renders or logs
-Tokens.
+`sub`; authorizes optional claims from the Token endpoint's actual granted Scope;
+and keys its mock JIT identity by `(iss, sub)`. Its Session map is capped at 1024,
+rejects stale re-insertion/double completion, and never renders or logs Tokens.
 
-Run the tested A/B form through `make phase-3-smoke`. Do not turn this example
+Run the tested A/B form through `make phase-4-smoke`. Do not turn this example
 into a generic SDK by adding loose metadata parsing, disabled verification,
 browser localStorage, or a fallback Client authentication method.
 
 ## Conformance updates
 
-The current reviewed suite release, source commit, container digests, selected
-modules, configuration placeholders, results, and non-applicable categories are
-documented in [phase-3-conformance.md](./phase-3-conformance.md). A rerun must:
+The current Phase-four suite release, source commit, container digests, selected
+modules, configuration placeholders, pending results, and non-applicable
+categories are documented in the [Phase-four matrix](../conformance/phase-4/matrix.json)
+and [Phase-four result](../conformance/phase-4/results/2026-08-03.json). The
+Phase-three record remains the historical baseline. A rerun must:
 
 1. use a temporary HTTPS Issuer and throwaway static Clients;
 2. keep clear Client Secrets out of Git and console output;
 3. export raw evidence into permission-restricted `.artifacts/conformance/`;
-4. record SHA-256 digests and secret-free summaries under `conformance/phase-3/`;
+4. record SHA-256 digests and secret-free summaries under `conformance/phase-4/`;
 5. rerun `./scripts/check-conformance-record.py`;
 6. never claim OpenID Foundation certification.
 

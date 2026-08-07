@@ -1,10 +1,7 @@
-# syntax=docker/dockerfile:1.7
-ARG GO_VERSION=1.26.5
-ARG ALPINE_VERSION=3.23.3
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-FROM golang:${GO_VERSION}-alpine3.23 AS builder
+FROM golang:1.26.5-alpine3.23@sha256:622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc AS builder
 ARG GOPROXY=https://proxy.golang.org,direct
-RUN apk add --no-cache ca-certificates
 WORKDIR /src
 
 COPY go.mod go.sum ./
@@ -23,7 +20,7 @@ COPY cmd ./cmd
 COPY internal ./internal
 COPY migrations ./migrations
 
-ARG VERSION=v0.1.0-dev.3
+ARG VERSION=v0.1.0-dev.4
 ARG COMMIT=unknown
 ARG BUILD_TIME=unknown
 RUN --mount=type=cache,target=/go/pkg/mod \
@@ -32,14 +29,12 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildTime=${BUILD_TIME}" \
       -o /out/oneissuer ./cmd/oneissuer
 
-FROM alpine:${ALPINE_VERSION} AS runtime
+FROM alpine:3.23.5@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40 AS runtime
 
-# The exact base tag is retained for reviewable builds while security fixes
-# published to that stable Alpine branch are applied before the image is
-# scanned. The final package set is captured by the resulting image digest.
-RUN apk upgrade --no-cache
+# Base and frontend digests are deliberately immutable. Dependency updates are
+# explicit review events rather than mutable package upgrades during a build.
 
-ARG VERSION=v0.1.0-dev.3
+ARG VERSION=v0.1.0-dev.4
 ARG COMMIT=unknown
 ARG SOURCE_REPOSITORY=https://github.com/oneissuer/oneissuer
 LABEL org.opencontainers.image.title="OneIssuer" \

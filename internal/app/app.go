@@ -22,6 +22,7 @@ import (
 	"github.com/oneissuer/oneissuer/internal/httpserver"
 	"github.com/oneissuer/oneissuer/internal/identity"
 	"github.com/oneissuer/oneissuer/internal/keystore"
+	logoutdomain "github.com/oneissuer/oneissuer/internal/logout"
 	"github.com/oneissuer/oneissuer/internal/observability"
 	"github.com/oneissuer/oneissuer/internal/session"
 	"github.com/oneissuer/oneissuer/internal/storage/postgres"
@@ -31,6 +32,8 @@ import (
 const (
 	startupTimeout            = 10 * time.Second
 	protocolArtifactRetention = 24 * time.Hour
+	refreshArtifactRetention  = 30 * 24 * time.Hour
+	cleanupOperationTimeout   = 5 * time.Second
 )
 
 // ErrShutdownTimeout indicates that in-flight HTTP work exceeded the configured
@@ -66,16 +69,16 @@ func Serve(ctx context.Context, cfg config.Config, build observability.BuildInfo
 		return fmt.Errorf("database migration check: %w", err)
 	}
 
+	metrics := observability.NewMetrics(build)
+	if err := metrics.RegisterDatabasePool(store.Stats); err != nil {
+		return fmt.Errorf("register database metrics: %w", err)
+	}
+	store.SetAuditObserver(metrics)
 	auditCtx, cancelStartupAudit := context.WithTimeout(ctx, startupTimeout)
 	err = appendSigningKeyLoaded(auditCtx, store, time.Now().UTC())
 	cancelStartupAudit()
 	if err != nil {
 		return fmt.Errorf("record signing key startup audit: %w", err)
-	}
-
-	metrics := observability.NewMetrics(build)
-	if err := metrics.RegisterDatabasePool(store.Stats); err != nil {
-		return fmt.Errorf("register database metrics: %w", err)
 	}
 	identityService, err := identity.NewService(ctx, cfg.Password, nil)
 	if err != nil {
@@ -101,9 +104,18 @@ func Serve(ctx context.Context, cfg config.Config, build observability.BuildInfo
 	protocolTokenService, err := token.NewService(
 		store, keyStore, nil, cfg.Issuer.String(), cfg.OIDC.IDTokenTTL,
 		cfg.OIDC.AccessTokenTTL, cfg.OIDC.ClockSkew, metrics,
+		token.WithRefreshLifetimes(cfg.Lifecycle.RefreshTokenTTL, cfg.Lifecycle.RefreshTokenAbsoluteTTL),
 	)
 	if err != nil {
 		return fmt.Errorf("initialize token service: %w", err)
+	}
+	logoutService, err := logoutdomain.NewService(
+		store, clientService, keyStore, cfg.Issuer.String(),
+		cfg.Lifecycle.LogoutTransactionTTL, cfg.Lifecycle.LogoutIDTokenHintMaxAge,
+		cfg.OIDC.ClockSkew, cfg.Lifecycle.LogoutMaxActivePerSession, nil, metrics,
+	)
+	if err != nil {
+		return fmt.Errorf("initialize RP logout service: %w", err)
 	}
 	authnService := authn.NewService(store, identityService, tokenManager, authflowService, clientService, cfg.Browser.RegistrationEnabled, metrics)
 	sessionService := session.NewService(store, tokenManager, metrics)
@@ -113,12 +125,24 @@ func Serve(ctx context.Context, cfg config.Config, build observability.BuildInfo
 		Authn: authnService, Sessions: sessionService, Admin: adminService,
 		Clients: clientService, Transactions: authflowService,
 		Consents: consentService, Authorization: authorizationService, Tokens: protocolTokenService,
+		Logout: logoutService, LogoutCookies: logoutdomain.NewCookieManager(cfg.Browser.CookieName, cfg.Browser.CookieSecure, cfg.Lifecycle.LogoutTransactionTTL),
 		Cookies: cookies, Issuer: cfg.Issuer, PublicKeys: keyStore,
+		AuthRateLimit: httpserver.AuthenticationRateLimitConfig{
+			PerMinute: cfg.Browser.AuthRatePerMinute, Burst: cfg.Browser.AuthRateBurst,
+			GlobalPerSecond: cfg.Browser.AuthGlobalRate, GlobalBurst: cfg.Browser.AuthGlobalBurst,
+		},
+		OAuthRateLimit: httpserver.AuthenticationRateLimitConfig{
+			PerMinute: cfg.Lifecycle.OAuthRatePerMinute, Burst: cfg.Lifecycle.OAuthRateBurst,
+			GlobalPerSecond: cfg.Lifecycle.OAuthGlobalRate, GlobalBurst: cfg.Lifecycle.OAuthGlobalBurst,
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("initialize application HTTP routes: %w", err)
 	}
-	if hasAdmin, adminErr := store.HasAdmin(ctx); adminErr != nil {
+	bootstrapCtx, cancelBootstrapCheck := context.WithTimeout(ctx, startupTimeout)
+	hasAdmin, adminErr := store.HasAdmin(bootstrapCtx)
+	cancelBootstrapCheck()
+	if adminErr != nil {
 		return fmt.Errorf("check bootstrap state: %w", adminErr)
 	} else if !hasAdmin && logger != nil {
 		logger.Warn("OneIssuer has no administrator; self-service registration remains policy controlled")
@@ -180,6 +204,8 @@ func appendSigningKeyLoaded(ctx context.Context, store startupAuditStore, now ti
 type cleanupStore interface {
 	CountActiveSessions(context.Context, time.Time) (int64, error)
 	CleanupProtocolArtifacts(context.Context, time.Time) (int64, error)
+	CleanupRefreshArtifacts(context.Context, time.Time) (int64, error)
+	CleanupLogoutTransactions(context.Context, time.Time, time.Time) (int64, error)
 }
 
 func startCleanupLoop(
@@ -194,20 +220,28 @@ func startCleanupLoop(
 	done := make(chan struct{})
 	run := func() {
 		now := time.Now().UTC()
-		operationCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		if _, err := sessions.Cleanup(operationCtx, now); err != nil && !errors.Is(err, context.Canceled) && logger != nil {
-			logger.Warn("session cleanup failed", slog.String("error_class", postgres.ErrorClass(err)))
-		}
-		if _, err := transactions.Cleanup(operationCtx, now); err != nil && !errors.Is(err, context.Canceled) && logger != nil {
-			logger.Warn("authorization transaction cleanup failed", slog.String("error_class", postgres.ErrorClass(err)))
-		}
-		if _, err := store.CleanupProtocolArtifacts(operationCtx, now.Add(-protocolArtifactRetention)); err != nil && !errors.Is(err, context.Canceled) && logger != nil {
-			logger.Warn("OIDC protocol metadata cleanup failed", slog.String("error_class", postgres.ErrorClass(err)))
-		}
-		if count, err := store.CountActiveSessions(operationCtx, now); err == nil {
-			metrics.SetActiveSessions(count)
-		}
+		runCleanupOperation(ctx, cleanupOperationTimeout, "sessions", metrics, logger, "session cleanup failed", func(operationCtx context.Context) (int64, error) {
+			return sessions.Cleanup(operationCtx, now)
+		})
+		runCleanupOperation(ctx, cleanupOperationTimeout, "auth_transactions", metrics, logger, "authorization transaction cleanup failed", func(operationCtx context.Context) (int64, error) {
+			return transactions.Cleanup(operationCtx, now)
+		})
+		runCleanupOperation(ctx, cleanupOperationTimeout, "protocol_artifacts", metrics, logger, "OIDC protocol metadata cleanup failed", func(operationCtx context.Context) (int64, error) {
+			return store.CleanupProtocolArtifacts(operationCtx, now.Add(-protocolArtifactRetention))
+		})
+		runCleanupOperation(ctx, cleanupOperationTimeout, "refresh_artifacts", metrics, logger, "Refresh lifecycle metadata cleanup failed", func(operationCtx context.Context) (int64, error) {
+			return store.CleanupRefreshArtifacts(operationCtx, now.Add(-refreshArtifactRetention))
+		})
+		runCleanupOperation(ctx, cleanupOperationTimeout, "logout_transactions", metrics, logger, "RP logout transaction cleanup failed", func(operationCtx context.Context) (int64, error) {
+			return store.CleanupLogoutTransactions(operationCtx, now, now.Add(-protocolArtifactRetention))
+		})
+		runCleanupOperation(ctx, cleanupOperationTimeout, "active_sessions", metrics, logger, "active session count failed", func(operationCtx context.Context) (int64, error) {
+			count, err := store.CountActiveSessions(operationCtx, now)
+			if err == nil && metrics != nil {
+				metrics.SetActiveSessions(count)
+			}
+			return 0, err
+		})
 	}
 	go func() {
 		defer close(done)
@@ -224,6 +258,34 @@ func startCleanupLoop(
 		}
 	}()
 	return done
+}
+
+func runCleanupOperation(
+	ctx context.Context,
+	timeout time.Duration,
+	operation string,
+	metrics *observability.Metrics,
+	logger *slog.Logger,
+	message string,
+	run func(context.Context) (int64, error),
+) {
+	started := time.Now()
+	operationCtx, cancel := context.WithTimeout(ctx, timeout)
+	rows, err := run(operationCtx)
+	cancel()
+	result := "success"
+	if err != nil {
+		result = "failure"
+		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+			result = "canceled"
+		}
+	}
+	if metrics != nil {
+		metrics.Cleanup(operation, result, rows, time.Since(started))
+	}
+	if err != nil && result != "canceled" && logger != nil {
+		logger.Warn(message, slog.String("error_class", postgres.ErrorClass(err)))
+	}
 }
 
 type managedHTTPServer interface {

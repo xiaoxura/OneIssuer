@@ -18,7 +18,7 @@ SET consumed_at = $1
 WHERE id = $2
   AND consumed_at IS NULL
   AND expires_at > $1
-RETURNING id, code_hash, auth_transaction_id, consent_grant_id, user_id, client_id, redirect_uri, scopes, pkce_challenge, pkce_method, nonce_value, auth_time, created_at, expires_at, consumed_at
+RETURNING id, code_hash, auth_transaction_id, consent_grant_id, user_id, client_id, redirect_uri, scopes, pkce_challenge, pkce_method, nonce_value, auth_time, created_at, expires_at, consumed_at, consent_grant_version, origin_session_id, session_binding_id
 `
 
 type ConsumeAuthorizationCodeParams struct {
@@ -45,6 +45,9 @@ func (q *Queries) ConsumeAuthorizationCode(ctx context.Context, arg ConsumeAutho
 		&i.CreatedAt,
 		&i.ExpiresAt,
 		&i.ConsumedAt,
+		&i.ConsentGrantVersion,
+		&i.OriginSessionID,
+		&i.SessionBindingID,
 	)
 	return i, err
 }
@@ -53,31 +56,36 @@ const createAuthorizationCode = `-- name: CreateAuthorizationCode :exec
 INSERT INTO authorization_codes (
     id, code_hash, auth_transaction_id, consent_grant_id, user_id, client_id,
     redirect_uri, scopes, pkce_challenge, pkce_method, nonce_value,
-    auth_time, created_at, expires_at
+    auth_time, created_at, expires_at, consent_grant_version,
+    origin_session_id, session_binding_id
 ) VALUES (
     $1, $2, $3,
     $4, $5, $6,
     $7, $8, $9,
     $10, $11, $12,
-    $13, $14
+    $13, $14, $15,
+    $16, $17
 )
 `
 
 type CreateAuthorizationCodeParams struct {
-	ID                uuid.UUID          `db:"id"`
-	CodeHash          []byte             `db:"code_hash"`
-	AuthTransactionID uuid.UUID          `db:"auth_transaction_id"`
-	ConsentGrantID    uuid.UUID          `db:"consent_grant_id"`
-	UserID            uuid.UUID          `db:"user_id"`
-	ClientID          uuid.UUID          `db:"client_id"`
-	RedirectUri       string             `db:"redirect_uri"`
-	Scopes            []string           `db:"scopes"`
-	PkceChallenge     string             `db:"pkce_challenge"`
-	PkceMethod        string             `db:"pkce_method"`
-	NonceValue        *string            `db:"nonce_value"`
-	AuthTime          pgtype.Timestamptz `db:"auth_time"`
-	CreatedAt         pgtype.Timestamptz `db:"created_at"`
-	ExpiresAt         pgtype.Timestamptz `db:"expires_at"`
+	ID                  uuid.UUID          `db:"id"`
+	CodeHash            []byte             `db:"code_hash"`
+	AuthTransactionID   uuid.UUID          `db:"auth_transaction_id"`
+	ConsentGrantID      uuid.UUID          `db:"consent_grant_id"`
+	UserID              uuid.UUID          `db:"user_id"`
+	ClientID            uuid.UUID          `db:"client_id"`
+	RedirectUri         string             `db:"redirect_uri"`
+	Scopes              []string           `db:"scopes"`
+	PkceChallenge       string             `db:"pkce_challenge"`
+	PkceMethod          string             `db:"pkce_method"`
+	NonceValue          *string            `db:"nonce_value"`
+	AuthTime            pgtype.Timestamptz `db:"auth_time"`
+	CreatedAt           pgtype.Timestamptz `db:"created_at"`
+	ExpiresAt           pgtype.Timestamptz `db:"expires_at"`
+	ConsentGrantVersion int64              `db:"consent_grant_version"`
+	OriginSessionID     *uuid.UUID         `db:"origin_session_id"`
+	SessionBindingID    *uuid.UUID         `db:"session_binding_id"`
 }
 
 func (q *Queries) CreateAuthorizationCode(ctx context.Context, arg CreateAuthorizationCodeParams) error {
@@ -96,18 +104,34 @@ func (q *Queries) CreateAuthorizationCode(ctx context.Context, arg CreateAuthori
 		arg.AuthTime,
 		arg.CreatedAt,
 		arg.ExpiresAt,
+		arg.ConsentGrantVersion,
+		arg.OriginSessionID,
+		arg.SessionBindingID,
 	)
 	return err
 }
 
 const deleteRetiredAuthorizationCodes = `-- name: DeleteRetiredAuthorizationCodes :execrows
-DELETE FROM authorization_codes
-WHERE expires_at <= $1
-  AND (consumed_at IS NOT NULL OR expires_at <= $1)
+WITH candidates AS (
+    SELECT codes.id
+    FROM authorization_codes AS codes
+    WHERE codes.expires_at <= $1
+    ORDER BY codes.expires_at, codes.id
+    LIMIT $2
+    FOR UPDATE OF codes SKIP LOCKED
+)
+DELETE FROM authorization_codes AS codes
+USING candidates
+WHERE codes.id = candidates.id
 `
 
-func (q *Queries) DeleteRetiredAuthorizationCodes(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteRetiredAuthorizationCodes, cutoff)
+type DeleteRetiredAuthorizationCodesParams struct {
+	Cutoff     pgtype.Timestamptz `db:"cutoff"`
+	BatchLimit int32              `db:"batch_limit"`
+}
+
+func (q *Queries) DeleteRetiredAuthorizationCodes(ctx context.Context, arg DeleteRetiredAuthorizationCodesParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteRetiredAuthorizationCodes, arg.Cutoff, arg.BatchLimit)
 	if err != nil {
 		return 0, err
 	}
@@ -115,7 +139,7 @@ func (q *Queries) DeleteRetiredAuthorizationCodes(ctx context.Context, cutoff pg
 }
 
 const getAuthorizationCodeByHash = `-- name: GetAuthorizationCodeByHash :one
-SELECT id, code_hash, auth_transaction_id, consent_grant_id, user_id, client_id, redirect_uri, scopes, pkce_challenge, pkce_method, nonce_value, auth_time, created_at, expires_at, consumed_at FROM authorization_codes WHERE code_hash = $1
+SELECT id, code_hash, auth_transaction_id, consent_grant_id, user_id, client_id, redirect_uri, scopes, pkce_challenge, pkce_method, nonce_value, auth_time, created_at, expires_at, consumed_at, consent_grant_version, origin_session_id, session_binding_id FROM authorization_codes WHERE code_hash = $1
 `
 
 func (q *Queries) GetAuthorizationCodeByHash(ctx context.Context, codeHash []byte) (AuthorizationCode, error) {
@@ -137,12 +161,15 @@ func (q *Queries) GetAuthorizationCodeByHash(ctx context.Context, codeHash []byt
 		&i.CreatedAt,
 		&i.ExpiresAt,
 		&i.ConsumedAt,
+		&i.ConsentGrantVersion,
+		&i.OriginSessionID,
+		&i.SessionBindingID,
 	)
 	return i, err
 }
 
 const lockAuthorizationCodeByHash = `-- name: LockAuthorizationCodeByHash :one
-SELECT id, code_hash, auth_transaction_id, consent_grant_id, user_id, client_id, redirect_uri, scopes, pkce_challenge, pkce_method, nonce_value, auth_time, created_at, expires_at, consumed_at FROM authorization_codes WHERE code_hash = $1 FOR UPDATE
+SELECT id, code_hash, auth_transaction_id, consent_grant_id, user_id, client_id, redirect_uri, scopes, pkce_challenge, pkce_method, nonce_value, auth_time, created_at, expires_at, consumed_at, consent_grant_version, origin_session_id, session_binding_id FROM authorization_codes WHERE code_hash = $1 FOR UPDATE
 `
 
 func (q *Queries) LockAuthorizationCodeByHash(ctx context.Context, codeHash []byte) (AuthorizationCode, error) {
@@ -164,6 +191,9 @@ func (q *Queries) LockAuthorizationCodeByHash(ctx context.Context, codeHash []by
 		&i.CreatedAt,
 		&i.ExpiresAt,
 		&i.ConsumedAt,
+		&i.ConsentGrantVersion,
+		&i.OriginSessionID,
+		&i.SessionBindingID,
 	)
 	return i, err
 }

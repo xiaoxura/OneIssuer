@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/oneissuer/oneissuer/internal/audit"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 )
@@ -20,26 +21,31 @@ type DatabasePoolStats struct {
 // Metrics owns OneIssuer's private Prometheus registry and instruments only
 // bounded labels.
 type Metrics struct {
-	registry         *prometheus.Registry
-	httpRequests     *prometheus.CounterVec
-	httpDuration     *prometheus.HistogramVec
-	inFlight         prometheus.Gauge
-	readiness        prometheus.Gauge
-	registrations    *prometheus.CounterVec
-	logins           *prometheus.CounterVec
-	passwordRehash   *prometheus.CounterVec
-	sessionsCreated  *prometheus.CounterVec
-	sessionsRevoked  *prometheus.CounterVec
-	clientOperations *prometheus.CounterVec
-	authTransactions *prometheus.CounterVec
-	authorizations   *prometheus.CounterVec
-	tokenOperations  *prometheus.CounterVec
-	auditEvents      *prometheus.CounterVec
-	sessionsActive   prometheus.Gauge
+	registry           *prometheus.Registry
+	httpRequests       *prometheus.CounterVec
+	httpDuration       *prometheus.HistogramVec
+	inFlight           prometheus.Gauge
+	readiness          prometheus.Gauge
+	registrations      *prometheus.CounterVec
+	logins             *prometheus.CounterVec
+	passwordRehash     *prometheus.CounterVec
+	sessionsCreated    *prometheus.CounterVec
+	sessionsRevoked    *prometheus.CounterVec
+	clientOperations   *prometheus.CounterVec
+	authTransactions   *prometheus.CounterVec
+	authorizations     *prometheus.CounterVec
+	tokenOperations    *prometheus.CounterVec
+	auditEvents        *prometheus.CounterVec
+	auditWriteFailures *prometheus.CounterVec
+	cleanupOperations  *prometheus.CounterVec
+	cleanupRows        *prometheus.CounterVec
+	cleanupDuration    *prometheus.HistogramVec
+	sessionsActive     prometheus.Gauge
+	rpLogout           *prometheus.CounterVec
 }
 
 // NewMetrics creates an isolated registry, including Go runtime and process
-// collectors plus the phase-one through phase-three application metrics.
+// collectors plus the bounded Phase 1 through Phase 4 application metrics.
 func NewMetrics(build BuildInfo) *Metrics {
 	registry := prometheus.NewRegistry()
 	metrics := &Metrics{
@@ -68,17 +74,22 @@ func NewMetrics(build BuildInfo) *Metrics {
 			Name:      "readiness_status",
 			Help:      "Whether the process currently accepts readiness traffic (1 ready, 0 not ready).",
 		}),
-		registrations:    prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "identity", Name: "registrations_total", Help: "Identity registrations by bounded result."}, []string{"result"}),
-		logins:           prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "identity", Name: "logins_total", Help: "Identity logins by bounded result."}, []string{"result"}),
-		passwordRehash:   prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "identity", Name: "password_rehash_total", Help: "Password rehash operations by bounded result."}, []string{"result"}),
-		sessionsCreated:  prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "sessions", Name: "created_total", Help: "Login sessions created by bounded result."}, []string{"result"}),
-		sessionsRevoked:  prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "sessions", Name: "revoked_total", Help: "Login sessions revoked by bounded reason."}, []string{"reason"}),
-		clientOperations: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "client", Name: "operations_total", Help: "Client registry operations by bounded operation and result."}, []string{"operation", "result"}),
-		authTransactions: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "auth", Name: "transactions_total", Help: "Authorization transaction operations by bounded operation and result."}, []string{"operation", "result"}),
-		authorizations:   prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "oidc", Name: "authorization_total", Help: "OIDC authorization decisions by bounded operation and result."}, []string{"operation", "result"}),
-		tokenOperations:  prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "oidc", Name: "token_operations_total", Help: "OIDC Token and UserInfo operations by bounded operation and result."}, []string{"operation", "result"}),
-		auditEvents:      prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "audit", Name: "events_total", Help: "Audit event appends by bounded event and result."}, []string{"event", "result"}),
-		sessionsActive:   prometheus.NewGauge(prometheus.GaugeOpts{Namespace: "oneissuer", Subsystem: "sessions", Name: "active", Help: "Current active, unexpired login sessions."}),
+		registrations:      prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "identity", Name: "registrations_total", Help: "Identity registrations by bounded result."}, []string{"result"}),
+		logins:             prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "identity", Name: "logins_total", Help: "Identity logins by bounded result."}, []string{"result"}),
+		passwordRehash:     prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "identity", Name: "password_rehash_total", Help: "Password rehash operations by bounded result."}, []string{"result"}),
+		sessionsCreated:    prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "sessions", Name: "created_total", Help: "Login sessions created by bounded result."}, []string{"result"}),
+		sessionsRevoked:    prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "sessions", Name: "revoked_total", Help: "Login sessions revoked by bounded reason."}, []string{"reason"}),
+		clientOperations:   prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "client", Name: "operations_total", Help: "Client registry operations by bounded operation and result."}, []string{"operation", "result"}),
+		authTransactions:   prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "auth", Name: "transactions_total", Help: "Authorization transaction operations by bounded operation and result."}, []string{"operation", "result"}),
+		authorizations:     prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "oidc", Name: "authorization_total", Help: "OIDC authorization decisions by bounded operation and result."}, []string{"operation", "result"}),
+		tokenOperations:    prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "oidc", Name: "token_operations_total", Help: "OIDC Token and UserInfo operations by bounded operation and result."}, []string{"operation", "result"}),
+		auditEvents:        prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "audit", Name: "events_total", Help: "Audit event appends by bounded event and result."}, []string{"event", "result"}),
+		auditWriteFailures: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "audit", Name: "write_failures_total", Help: "Failed audit append operations by bounded event."}, []string{"event"}),
+		cleanupOperations:  prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "cleanup", Name: "operations_total", Help: "Cleanup operations by bounded operation and result."}, []string{"operation", "result"}),
+		cleanupRows:        prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "cleanup", Name: "rows_total", Help: "Rows committed by bounded cleanup operations, including partial progress before a later failure."}, []string{"operation"}),
+		cleanupDuration:    prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: "oneissuer", Subsystem: "cleanup", Name: "duration_seconds", Help: "Cleanup operation duration by bounded operation.", Buckets: prometheus.DefBuckets}, []string{"operation"}),
+		sessionsActive:     prometheus.NewGauge(prometheus.GaugeOpts{Namespace: "oneissuer", Subsystem: "sessions", Name: "active", Help: "Current active, unexpired login sessions."}),
+		rpLogout:           prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "oneissuer", Subsystem: "rp_logout", Name: "total", Help: "RP-Initiated Logout outcomes by bounded result."}, []string{"result"}),
 	}
 
 	buildInfo := prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -97,10 +108,20 @@ func NewMetrics(build BuildInfo) *Metrics {
 			metrics.authorizations.WithLabelValues(operation, result).Add(0)
 		}
 	}
-	for _, operation := range []string{"exchange", "issuance", "userinfo"} {
-		for _, result := range []string{"success", "rejected", "failure"} {
+	for _, operation := range []string{"exchange", "issuance", "refresh", "revoke", "introspect", "userinfo"} {
+		for _, result := range []string{"success", "rejected", "failure", "active", "inactive"} {
 			metrics.tokenOperations.WithLabelValues(operation, result).Add(0)
 		}
+	}
+	for _, result := range []string{"started", "confirmable", "confirmed", "canceled", "capacity", "invalid", "rejected", "failure"} {
+		metrics.rpLogout.WithLabelValues(result).Add(0)
+	}
+	for _, operation := range []string{"sessions", "auth_transactions", "protocol_artifacts", "refresh_artifacts", "logout_transactions", "active_sessions"} {
+		for _, result := range []string{"success", "failure", "canceled"} {
+			metrics.cleanupOperations.WithLabelValues(operation, result).Add(0)
+		}
+		metrics.cleanupRows.WithLabelValues(operation).Add(0)
+		metrics.cleanupDuration.WithLabelValues(operation)
 	}
 
 	registry.MustRegister(
@@ -119,7 +140,12 @@ func NewMetrics(build BuildInfo) *Metrics {
 		metrics.authorizations,
 		metrics.tokenOperations,
 		metrics.auditEvents,
+		metrics.auditWriteFailures,
+		metrics.cleanupOperations,
+		metrics.cleanupRows,
+		metrics.cleanupDuration,
 		metrics.sessionsActive,
+		metrics.rpLogout,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
@@ -191,19 +217,54 @@ func (m *Metrics) Authorization(operation, result string) {
 // outcomes. No Client, Subject, scope, kid, jti, or error value is a label.
 func (m *Metrics) Token(operation, result string) {
 	m.tokenOperations.WithLabelValues(
-		bounded(operation, map[string]bool{"exchange": true, "issuance": true, "userinfo": true}),
-		bounded(result, resultLabels),
+		bounded(operation, map[string]bool{"exchange": true, "issuance": true, "refresh": true, "revoke": true, "introspect": true, "userinfo": true}),
+		bounded(result, map[string]bool{"success": true, "rejected": true, "failure": true, "active": true, "inactive": true}),
 	).Inc()
+}
+
+// RPLogout records only the fixed hosted-flow outcome vocabulary.
+func (m *Metrics) RPLogout(result string) {
+	m.rpLogout.WithLabelValues(bounded(result, map[string]bool{
+		"started": true, "confirmable": true, "confirmed": true, "canceled": true,
+		"capacity": true, "invalid": true, "rejected": true, "failure": true,
+	})).Inc()
 }
 
 // AuditEvent records bounded audit-event labels.
 func (m *Metrics) AuditEvent(event, result string) {
+	event = boundedAuditEvent(event)
 	m.auditEvents.WithLabelValues(
-		bounded(event, map[string]bool{
-			"admin_bootstrap": true, "user": true, "login": true, "session": true,
-			"client": true, "auth_transaction": true,
-		}), bounded(result, resultLabels),
+		event, bounded(result, resultLabels),
 	).Inc()
+}
+
+// AuditWriteFailure records an append failure even when a rejected request is
+// deliberately allowed to return its uniform authentication error.
+func (m *Metrics) AuditWriteFailure(event string) {
+	m.auditWriteFailures.WithLabelValues(boundedAuditEvent(event)).Inc()
+}
+
+func boundedAuditEvent(event string) string {
+	if event == "" || !audit.ValidEventType(event) {
+		return "other"
+	}
+	return event
+}
+
+// Cleanup records one independently bounded cleanup operation. Rows are added
+// only when at least one batch committed; a later deadline may therefore report
+// both progress and a failure result without losing that progress.
+func (m *Metrics) Cleanup(operation, result string, rows int64, duration time.Duration) {
+	operation = bounded(operation, map[string]bool{
+		"sessions": true, "auth_transactions": true, "protocol_artifacts": true,
+		"refresh_artifacts": true, "logout_transactions": true, "active_sessions": true,
+	})
+	result = bounded(result, map[string]bool{"success": true, "failure": true, "canceled": true})
+	m.cleanupOperations.WithLabelValues(operation, result).Inc()
+	if rows > 0 {
+		m.cleanupRows.WithLabelValues(operation).Add(float64(rows))
+	}
+	m.cleanupDuration.WithLabelValues(operation).Observe(duration.Seconds())
 }
 
 // SetActiveSessions updates the active session gauge.

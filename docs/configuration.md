@@ -1,6 +1,6 @@
 # Configuration reference
 
-OneIssuer `v0.1.0-dev.3` uses environment variables only:
+OneIssuer `v0.1.0-dev.4` uses environment variables only:
 
 ```text
 safe code defaults < environment variables < explicit test injection
@@ -19,7 +19,7 @@ reports only safe key metadata; it never prints a file path or private JWK.
 | `ONEISSUER_ENV` | `development` | `development`, `test`, or `production` |
 | `ONEISSUER_ISSUER` | `http://localhost:8080` | Canonical origin only: absolute HTTP(S), no user info/path/trailing slash/query/fragment; non-loopback HTTP is rejected; explicit HTTPS required in production |
 | `ONEISSUER_HTTP_ADDR` | `:8080` | TCP listen address with port 1–65535 |
-| `ONEISSUER_DATABASE_URL` | none | Required PostgreSQL URL with host/database; `sslmode=disable` rejected in production |
+| `ONEISSUER_DATABASE_URL` | none | Required PostgreSQL URL with host/database; production requires exactly one explicit `sslmode=verify-full` query value |
 | `ONEISSUER_DATABASE_MAX_CONNS` | `10` | 1–100 |
 | `ONEISSUER_SIGNING_KEY_FILE` | none | Required regular, non-symlink private RSA JWK file; must pass the key rules below |
 | `ONEISSUER_VERIFICATION_KEYS_FILE` | empty | Optional regular, non-symlink, **public-only** JWKS for overlap during restart-style rotation |
@@ -44,18 +44,43 @@ reports only safe key metadata; it never prints a file path or private JWK.
 | `ONEISSUER_AUTH_TRANSACTION_TTL` | `10m` | Positive, at most 1 hour |
 | `ONEISSUER_LOGIN_REAUTH_WINDOW` | `15m` | Positive, at most 24 hours; bounds sensitive administrator operations |
 | `ONEISSUER_CLEANUP_INTERVAL` | `5m` | Positive, at most 1 hour |
+| `ONEISSUER_AUTH_RATE_PER_MINUTE` | `20` | 1–60000; refill rate for each client-IP browser authentication bucket |
+| `ONEISSUER_AUTH_RATE_BURST` | `10` | 1–1000; burst capacity for each client-IP bucket |
+| `ONEISSUER_AUTH_GLOBAL_RATE_PER_SECOND` | `50` | 1–10000; process-wide browser authentication refill rate |
+| `ONEISSUER_AUTH_GLOBAL_BURST` | `100` | 1–20000; process-wide browser authentication burst capacity |
 | `ONEISSUER_REGISTRATION_ENABLED` | `false` | Deny by default; production requires an explicit value |
 | `ONEISSUER_PASSWORD_MIN_LENGTH` | `15` | 15–128 Unicode code points |
 | `ONEISSUER_PASSWORD_MAX_BYTES` | `1024` | 64–4096 UTF-8 bytes and at least the minimum-length setting |
 | `ONEISSUER_ARGON2_MEMORY_KIB` | `65536` | 19456–1048576 KiB per hash |
 | `ONEISSUER_ARGON2_TIME` | `3` | 2–10 Argon2id passes |
 | `ONEISSUER_ARGON2_THREADS` | `2` | 1–16 lanes |
-| `ONEISSUER_ARGON2_MAX_CONCURRENT` | `2` | 1–64 in-process concurrent hashes |
+| `ONEISSUER_ARGON2_MAX_CONCURRENT` | `2` | 1–64 in-process concurrent hashes; memory × concurrency must be at most 1048576 KiB |
 
-Compose-only interpolation values such as
-`ONEISSUER_SIGNING_KEY_HOST_FILE`, `ONEISSUER_BUILD_GOPROXY`, port overrides,
-and `EXAMPLE_CLIENT_*` are deployment inputs to `deploy/docker-compose.yml`, not
-application environment variables. See [`.env.example`](../.env.example).
+## Phase-four lifecycle variables
+
+| Variable | Default | Accepted range and behavior |
+| --- | --- | --- |
+| `ONEISSUER_REFRESH_TOKEN_TTL` | `720h` | 1 hour–30 days rolling lifetime; every successful exchange rotates the generation |
+| `ONEISSUER_REFRESH_TOKEN_ABSOLUTE_TTL` | `2160h` | 24 hours–365 days family lifetime and never shorter than rolling TTL |
+| `ONEISSUER_LOGOUT_TRANSACTION_TTL` | `5m` | 1–15 minutes for zero-authority RP logout transactions |
+| `ONEISSUER_LOGOUT_MAX_ACTIVE_PER_SESSION` | `3` | 1–5 bound Hosted logout transactions per Session; excess binds are rejected |
+| `ONEISSUER_LOGOUT_ID_TOKEN_HINT_MAX_AGE` | `24h` | 5 minutes–30 days accepted hint age; stale hints fall back to local logout |
+| `ONEISSUER_OAUTH_RATE_PER_MINUTE` | `120` | 1–60000 per-IP/per-client lifecycle bucket |
+| `ONEISSUER_OAUTH_RATE_BURST` | `30` | 1–1000 bounded lifecycle burst |
+| `ONEISSUER_OAUTH_GLOBAL_RATE_PER_SECOND` | `100` | 1–10000 process-wide lifecycle guard |
+| `ONEISSUER_OAUTH_GLOBAL_BURST` | `200` | 1–20000 process-wide lifecycle burst |
+
+Refresh values are never configuration data: only their TTLs and bounded
+capacity budgets appear in `config check`/`SafeMap`. Refresh digests, logout
+lookup/proof digests, Client Secrets, ID Token Hints, and State are never logged.
+
+Compose-only interpolation values such as `ONEISSUER_COMPOSE_DATABASE_URL`,
+`ONEISSUER_SIGNING_KEY_HOST_FILE`, `ONEISSUER_BUILD_GOPROXY`, port overrides, and
+`EXAMPLE_CLIENT_*` are deployment inputs to `deploy/docker-compose.yml`, not
+application environment variables. The Compose database override is passed to
+both the one-shot migration and service containers; leave it empty for the local
+PostgreSQL service, and provide a container-reachable `verify-full` URL for any
+reviewed production-derived deployment. See [`.env.example`](../.env.example).
 
 ## Issuer invariants
 
@@ -132,7 +157,7 @@ With `ONEISSUER_ENV=production`, validation fails closed unless all of these are
 true:
 
 1. `ONEISSUER_ISSUER` is explicitly set and uses HTTPS;
-2. the database URL does not disable TLS;
+2. the database URL contains exactly one explicit `sslmode=verify-full` value;
 3. `ONEISSUER_COOKIE_SECURE=true`;
 4. `ONEISSUER_COOKIE_NAME` begins with `__Host-`;
 5. `ONEISSUER_REGISTRATION_ENABLED` is explicitly `true` or `false`;
@@ -160,8 +185,32 @@ Argon2 memory is per operation. A rough upper memory budget is:
 ONEISSUER_ARGON2_MEMORY_KIB × ONEISSUER_ARGON2_MAX_CONCURRENT
 ```
 
-Benchmark on the actual CPU and memory limit. When the bounded worker budget is
-full, the service returns `429 temporarily_unavailable`; do not remove the bound.
+Configuration rejects this product above **1048576 KiB (1 GiB)**, including a
+nominally valid per-hash/concurrency pair that would exceed the process budget.
+This is a hard validation ceiling, not a sizing recommendation: benchmark on the
+actual CPU and memory limit and choose a lower deployment-specific budget. When
+the bounded worker budget is full, the service returns `429
+temporarily_unavailable`; do not remove the bound.
+
+## Browser authentication abuse bounds
+
+The four `ONEISSUER_AUTH_*` settings protect `GET /oauth2/authorize` plus
+`GET/POST /login` and `/register` before those requests reach PostgreSQL or
+Argon2. The limiter uses a process-wide token bucket and a per-client-IP bucket,
+stores at most 4096 client entries, lazily retires entries idle for ten minutes,
+and fails closed when that bounded table is full. A limiter rejection is HTTP
+`429`, `Retry-After: 60`, and `Cache-Control: no-store`.
+
+After a form has been issued, PostgreSQL independently and atomically reserves at
+most five login or registration submissions for that pre-authentication record.
+The sixth submission fails as an invalid flow before account lookup or password
+hashing. A new form is required. The fixed attempt budget is not configurable so
+a deployment cannot accidentally turn one CSRF-bound form into an unbounded
+Argon2 work source.
+
+These are per-process/local-flow controls. Multi-replica or Internet-facing
+deployments still require an edge/distributed limiter and abuse monitoring; do
+not rely on client IP alone as an identity signal.
 
 ## Session and cleanup semantics
 
@@ -174,16 +223,27 @@ full, the service returns `429 temporarily_unavailable`; do not remove the bound
 - retired login Sessions are retained for 30 days;
 - Authorization Code and Access Token metadata are retained for 24 hours after
   expiry;
-- Consent Grants persist until a future explicit grant-management lifecycle;
+- Consent Grants persist until explicit current-user revocation; a revoked Grant
+  keeps its row/version as evidence and requires interactive Consent to reactivate;
+- Refresh families use a 30-day rolling/90-day absolute default, no grace window,
+  and revoke linked Access metadata on reuse, owning revocation, Grant/Session
+  cascade, or disabled User/Client;
+- RP logout GET/POST creates only a short-lived zero-authority transaction; clean
+  confirmation binds the current Session and uses cookie-only, transaction-bound
+  CSRF before any Session cascade or exact post-logout redirect;
 - Audit events are never deleted by the application cleanup loop.
 
 Cleanup never grants validity: every read/exchange path enforces expiry before a
-background deletion can occur.
+background deletion can occur. Cleanup uses independently timed operations and
+250-row commit batches; metrics preserve the count from committed batches even
+if a later batch times out.
 
 ## Command scopes
 
 - `oneissuer version`, `help`, and `keys *` do not load service configuration;
-- `oneissuer migrate *` requires only the database URL and pool limit;
+- `oneissuer migrate *` requires the environment, database URL, and pool limit;
+  production migration commands enforce the same explicit `verify-full` rule as
+  `serve`;
 - `oneissuer admin bootstrap` validates database, environment, PostgreSQL TLS,
   password policy, and Argon2 settings, but does not require a signing key;
 - `oneissuer serve` and `oneissuer config check` validate every service setting

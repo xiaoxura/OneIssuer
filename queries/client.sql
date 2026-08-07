@@ -71,8 +71,9 @@ UPDATE oidc_clients SET
     logo_uri = sqlc.arg(logo_uri),
     status = sqlc.arg(status),
     registration_enabled = sqlc.arg(registration_enabled),
-    updated_at = sqlc.arg(updated_at)
-WHERE id = sqlc.arg(id) AND updated_at = sqlc.arg(expected_updated_at)
+    updated_at = sqlc.arg(updated_at),
+    version = version + 1
+WHERE id = sqlc.arg(id) AND version = sqlc.arg(expected_version)
 RETURNING *;
 
 -- name: DeleteOIDCClientRedirectURIs :exec
@@ -95,3 +96,6 @@ SELECT secret_hash
 FROM oidc_client_secrets
 WHERE client_id = sqlc.arg(client_id) AND revoked_at IS NULL
 ORDER BY created_at DESC;
+
+-- name: LockOIDCClientByClientID :one
+SELECT * FROM oidc_clients WHERE client_id = sqlc.arg(client_id) FOR UPDATE;

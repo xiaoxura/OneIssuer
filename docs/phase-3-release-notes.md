@@ -1,14 +1,43 @@
 # OneIssuer `v0.1.0-dev.3` phase-three release notes
 
-Status: **Verified** — local Definition of Done and final repository-wide verification complete
+Status: **Verified** — original phase-three release plus the hardening addendum below
 Release date: 2026-08-01
 Previous version: `v0.1.0-dev.2`
-Schema: 5 → 10
+Original schema: 5 → 10; current hardened schema: **11**
 
 > [!WARNING]
 > This is a development release, not production-ready software. OneIssuer has not
 > obtained OpenID Foundation certification. The recorded Conformance results are
 > applicable interoperability evidence only.
+
+## 2026-08-02 security-hardening addendum
+
+The protocol surface and advertised capabilities are unchanged. A repository-wide
+review added migration `00011_security_hardening.sql` and the following defensive
+controls:
+
+- production database configuration now requires exactly one explicit
+  `sslmode=verify-full` for service, Bootstrap, and migration scopes;
+- User/Client optimistic versions are positive monotonic `bigint` values rather
+  than timestamp aliases, including same-timestamp stale-writer protection;
+- Authorize/login/registration have bounded per-IP and process-wide buckets;
+  every issued login/registration form permits five atomic submissions before
+  any further credential lookup/Argon2 work is refused;
+- the configured Argon2 memory × concurrency product may not exceed 1 GiB;
+- cleanup selects/commits 250-row `SKIP LOCKED` batches under fresh per-operation
+  deadlines and exports operation/result, committed-row, and duration metrics;
+- Audit success counters are emitted only after commit, and direct or
+  transactional append failures increment a fixed-label failure counter;
+- Authorization parsing rejects NUL in every query key/value and opaque field;
+- the example RP authorizes claims from actual granted Scope and caps/CAS-protects
+  its in-memory Session store at 1024 entries;
+- Dockerfile frontend, Go builder, Alpine runtime, and Compose PostgreSQL bases
+  are digest-pinned, with no mutable build-time `apk upgrade`.
+
+Migration 11 also adds the form-attempt column/constraint, consumed/expiry cleanup
+indexes, and a partial unique index that bounds consumed-Code replay rejection
+Audit to one row per Code. It backfills existing version/attempt values using safe
+defaults and preserves all phase-two/phase-three authority.
 
 ## Summary
 
@@ -108,7 +137,8 @@ authorization services; the legacy authorization is safely terminal after the
 upgrade.
 
 New sqlc sources are `queries/authorization.sql`, `queries/consent.sql`, and
-`queries/token.sql`. Expected schema version is 10.
+`queries/token.sql`. The original release expected schema 10; the hardening
+addendum raises the current expected version to 11.
 
 Code and Access metadata are eligible for cleanup 24 hours after expiry, while
 read/exchange paths enforce expiry immediately. Consent Grants persist. Audit is
@@ -130,9 +160,9 @@ not deleted by application cleanup.
   deferred constraint-trigger failure at Commit, after minting has begun; both
   leave the Code unconsumed with zero Access metadata/Audit rows, and the same
   Code can succeed after the fault is removed;
-- cleanup cancellation (the shutdown path) and an operation deadline are
-  injected after Access metadata deletion but before Code deletion; both roll
-  the transaction back without a partial cleanup;
+- the original schema-10 cleanup fault tests prove a single batch rolls back
+  atomically; hardened cleanup additionally proves that completed 250-row batches
+  remain committed and counted when a later batch reaches its deadline;
 - consumed-Code replay Audit is bounded to at most one rejection row per Code.
 
 HTTP response delivery remains at-most-once. If commit succeeds but the Client
@@ -189,8 +219,9 @@ production SDK. Compose can run it twice:
 - B: Confidential / `client_secret_basic` / Secret file mount.
 
 It stores state/nonce/verifier server-side, performs S256, validates ID Token
-signature/Issuer/Audience/nonce/time, compares UserInfo Subject, links the mock
-identity by `(iss, sub)`, and never renders/logs Tokens.
+signature/Issuer/Audience/nonce/time and granted-Scope claim boundaries, compares
+UserInfo Subject, links the mock identity by `(iss, sub)`, bounds Sessions at 1024,
+and never renders/logs Tokens.
 
 `make phase-3-smoke` starts an empty database, migrates, Bootstraps, creates A/B,
 tests `prompt=create`, SSO and independent Consent, exchanges Tokens, calls
@@ -230,11 +261,23 @@ These results are **not** an OpenID Foundation certification claim.
   upgrading the transitive Fosite dependency path to v3.0.5;
 - runtime JOSE remains `github.com/go-jose/go-jose/v4` v4.1.4; Fosite v0.49.0 is
   isolated behind `internal/oidc` adapters;
-- final container remains non-root UID/GID 65532 and read-only compatible.
+- final container remains non-root UID/GID 65532 and read-only compatible;
+- the hardening addendum pins frontend, builder, runtime, and PostgreSQL image
+  references by digest, removes mutable build-time package upgrades, advances
+  the runtime to Alpine 3.23.5, and advances the development/test database
+  within major version 17 to PostgreSQL 17.10 on Alpine 3.23.5.
 
 Artifacts are written to ignored `.artifacts/supply-chain/`. A clean scan means
 no fixable High/Critical result under the configured gate; it is not a guarantee
 that the image has no residual vulnerability.
+
+The official PostgreSQL image is reviewed separately from the OneIssuer final-
+image gate. Its 17.10 update removes all detected Alpine package findings. Trivy
+still identifies 15 Go-standard-library advisories in the image's upstream
+`gosu` 1.19 binary (built with Go 1.24.6); pinned `govulncheck -mode=binary`
+reports no reachable vulnerable symbol in that executable. Keep this upstream
+residual under review and refresh the digest when PostgreSQL publishes a `gosu`
+rebuild; it is not included in the clean OneIssuer application-image claim.
 
 ## Upgrade checklist
 
@@ -243,8 +286,8 @@ that the image has no residual vulnerability.
 2. back up PostgreSQL and independently stage/backup the private signing key;
 3. configure a canonical HTTPS Issuer, Secure `__Host-` cookie, PostgreSQL TLS,
    registration decision, and key mount;
-4. stop phase-two writers and apply migrations 6–10 with one actor;
-5. verify expected version 10 and run `oneissuer config check` as the service UID;
+4. stop phase-two writers and apply migrations 6–11 with one actor;
+5. verify expected version 11 and run `oneissuer config check` as the service UID;
 6. start the service and verify startup Audit, readiness, Discovery, and JWKS;
 7. statically create/review Clients, transfer Confidential Secrets once, and
    require S256 in each RP;
@@ -253,9 +296,11 @@ that the image has no residual vulnerability.
 
 ## Final verification record
 
-The following gates were rerun from the repository root against the final
-phase-three worktree on 2026-08-01. The checked-in GitHub Actions workflow is the
-authoritative repeat on push and pull requests.
+The following table is the historical schema-10 release record run from the
+repository root on 2026-08-01. The hardening addendum is covered by the current
+repository gates and checked-in GitHub Actions workflow; the historical command
+results below are intentionally not rewritten as if they had run against schema
+11 on that earlier date.
 
 | Gate | Command | Result |
 | --- | --- | --- |

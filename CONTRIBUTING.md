@@ -27,7 +27,7 @@ controlled sharing.
 make generate
 make contract-check
 make check
-make phase-3-smoke
+make phase-4-smoke
 make container-check
 git diff --check
 ```

@@ -116,10 +116,28 @@ Current-user Session access is owner-scoped and hides foreign UUIDs as 404.
 Administrator session summaries may include username/status and a coarse network
 prefix, so administrator API access remains privacy-sensitive.
 
+## Post-phase-two authentication hardening
+
+The hardened phase-three implementation retains this model and adds three local
+resource controls without changing identity authority:
+
+- `GET /oauth2/authorize` and `GET/POST /login`/`register` pass through bounded
+  per-client-IP and process-wide token buckets before PostgreSQL or Argon2;
+- each CSRF-bound pre-authentication form atomically permits five submissions;
+  the sixth fails before credential lookup/password hashing, including under
+  concurrent requests;
+- configuration rejects
+  `ARGON2_MEMORY_KIB × ARGON2_MAX_CONCURRENT > 1048576 KiB`.
+
+These controls are verified by unit/concurrency/integration tests and complement
+an edge limiter. They are not a distributed reputation, CAPTCHA, or lockout
+system, and client IP is not treated as account identity.
+
 ## Residual risks and deferred controls
 
-- There is no distributed rate limiter, IP reputation, CAPTCHA, MFA, or breached
-  password service. Internet-facing production use is not approved.
+- The current code has bounded per-process authentication buckets, but no
+  distributed rate limiter, IP reputation, CAPTCHA, MFA, or breached-password
+  service. Internet-facing production use is not approved.
 - Dummy Argon2 reduces a direct fast path but cannot guarantee perfectly identical
   end-to-end timing under every database/cache/load condition.
 - SHA-256 is appropriate for high-entropy opaque values, but process-memory or TLS

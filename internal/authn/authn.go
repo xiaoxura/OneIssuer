@@ -24,6 +24,8 @@ var (
 	ErrRegistrationDisabled = errors.New("self-service registration is disabled")
 )
 
+const maxAuthenticationAttempts int16 = 5
+
 // BeginMode selects login or registration form preparation.
 type BeginMode string
 
@@ -42,13 +44,14 @@ type BeginResult struct {
 
 // RegisterInput carries clear browser values and must never be logged.
 type RegisterInput struct {
-	PreAuthToken     string
-	CSRFToken        string
-	TransactionToken string
-	Account          identity.CreateInput
-	UserAgent        string
-	ClientIP         netip.Addr
-	RequestID        string
+	PreAuthToken         string
+	CSRFToken            string
+	TransactionToken     string
+	Account              identity.CreateInput
+	ExistingSessionToken string
+	UserAgent            string
+	ClientIP             netip.Addr
+	RequestID            string
 }
 
 // LoginInput carries clear credentials and must never be logged.
@@ -66,12 +69,14 @@ type LoginInput struct {
 
 // RegisterCommit contains the records written atomically for registration.
 type RegisterCommit struct {
-	User               identity.PreparedUser
-	Session            session.Record
-	PreAuthID          uuid.UUID
-	TransactionID      uuid.UUID
-	ConsumeTransaction bool
-	Events             []audit.Event
+	User                identity.PreparedUser
+	Session             session.Record
+	PreAuthID           uuid.UUID
+	TransactionID       uuid.UUID
+	ConsumeTransaction  bool
+	ExistingSessionHash []byte
+	RequestID           string
+	Events              []audit.Event
 }
 
 // LoginCommit contains the records mutated atomically for successful login.
@@ -92,9 +97,10 @@ type LoginCommit struct {
 type Repository interface {
 	CreatePreAuth(context.Context, session.PreAuthRecord) error
 	FindPreAuth(context.Context, []byte) (session.PreAuthRecord, error)
+	ReservePreAuthAttempt(context.Context, uuid.UUID, time.Time, int16) error
 	FindLoginRecord(context.Context, string) (identity.LoginRecord, error)
 	CommitRegistration(context.Context, RegisterCommit) error
-	CommitLogin(context.Context, LoginCommit) error
+	CommitLogin(context.Context, LoginCommit) (uuid.UUID, error)
 	AppendAudit(context.Context, audit.Event) error
 }
 
@@ -132,6 +138,9 @@ func NewService(repository Repository, identities *identity.Service, sessions *s
 
 // Begin creates a pre-auth session bound to a server-issued transaction.
 func (s *Service) Begin(ctx context.Context, mode BeginMode, transactionToken, requestID string, now time.Time) (BeginResult, error) {
+	if mode == BeginRegister && transactionToken == "" && !s.registrationEnabled {
+		return BeginResult{}, ErrRegistrationDisabled
+	}
 	var transaction authflow.Transaction
 	var err error
 	if transactionToken == "" {
@@ -170,6 +179,10 @@ func (s *Service) Register(ctx context.Context, input RegisterInput, now time.Ti
 		s.observeRegistration("rejected")
 		return session.Issued{}, err
 	}
+	if err := s.repository.ReservePreAuthAttempt(ctx, preauth.ID, now.UTC(), maxAuthenticationAttempts); err != nil {
+		s.observeRegistration("rejected")
+		return session.Issued{}, ErrInvalidFlow
+	}
 	if err := s.checkRegistration(ctx, transaction); err != nil {
 		s.observeRegistration("rejected")
 		s.recordRejected(ctx, audit.UserRegistrationRejected, input.RequestID, now)
@@ -190,10 +203,14 @@ func (s *Service) Register(ctx context.Context, input RegisterInput, now time.Ti
 	if err != nil {
 		return session.Issued{}, err
 	}
-	if err := s.repository.CommitRegistration(ctx, RegisterCommit{
+	commit := RegisterCommit{
 		User: prepared, Session: issued.Record, PreAuthID: preauth.ID, TransactionID: transaction.ID,
-		ConsumeTransaction: consumeTransaction, Events: events,
-	}); err != nil {
+		ConsumeTransaction: consumeTransaction, RequestID: input.RequestID, Events: events,
+	}
+	if input.ExistingSessionToken != "" {
+		commit.ExistingSessionHash = session.HashToken(input.ExistingSessionToken)
+	}
+	if err := s.repository.CommitRegistration(ctx, commit); err != nil {
 		s.observeRegistration("failure")
 		if errors.Is(err, identity.ErrDuplicate) {
 			s.recordRejected(ctx, audit.UserRegistrationRejected, input.RequestID, now)
@@ -213,6 +230,10 @@ func (s *Service) Login(ctx context.Context, input LoginInput, now time.Time) (s
 	if err != nil {
 		s.observeLogin("rejected")
 		return session.Issued{}, identity.User{}, err
+	}
+	if err := s.repository.ReservePreAuthAttempt(ctx, preauth.ID, now.UTC(), maxAuthenticationAttempts); err != nil {
+		s.observeLogin("rejected")
+		return session.Issued{}, identity.User{}, ErrInvalidFlow
 	}
 	normalized, normalizeErr := identity.NormalizeLoginIdentifier(input.Identifier)
 	var record *identity.LoginRecord
@@ -261,10 +282,16 @@ func (s *Service) Login(ctx context.Context, input LoginInput, now time.Time) (s
 	if input.ExistingSessionToken != "" {
 		commit.ExistingSessionHash = session.HashToken(input.ExistingSessionToken)
 	}
-	if err := s.repository.CommitLogin(ctx, commit); err != nil {
+	bindingID, err := s.repository.CommitLogin(ctx, commit)
+	if err != nil {
 		s.observeLogin("failure")
 		return session.Issued{}, identity.User{}, err
 	}
+	if bindingID == uuid.Nil {
+		s.observeLogin("failure")
+		return session.Issued{}, identity.User{}, ErrInvalidFlow
+	}
+	issued.Record.SessionBindingID = bindingID
 	s.observeLogin("success")
 	if s.metrics != nil {
 		s.metrics.SessionCreated("success")

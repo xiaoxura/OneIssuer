@@ -1,4 +1,4 @@
-import { useMemo, useState, type FormEvent } from 'react'
+import { useId, useMemo, useState, type FormEvent } from 'react'
 import {
   AppWindow,
   Ban,
@@ -15,6 +15,7 @@ import {
   X,
 } from 'lucide-react'
 import { Avatar, Modal, PageHeader, StatusPill } from '../../components/ui'
+import { useDialogFocus } from '../../components/useDialogFocus'
 import { users, type PrototypeUser, type UserStatus } from '../../data/mock'
 import { useI18n, type TranslationKey } from '../../i18n'
 import { MFA_KEYS, USER_STATUS_KEYS } from '../../i18n/domain'
@@ -37,22 +38,31 @@ function statusTone(status: UserStatus) {
 
 function UserDrawer({ user, onClose }: { user: PrototypeUser; onClose: () => void }) {
   const { formatDate, formatRelativeTime, t } = useI18n()
+  const titleId = useId()
+  const profileNameId = useId()
+  const descriptionId = useId()
+  const drawerRef = useDialogFocus<HTMLElement>(onClose)
 
   return (
     <div className="drawer-backdrop" role="presentation" onMouseDown={onClose}>
       <aside
-        aria-label={t('users.drawer.detailsFor', { name: user.name })}
+        aria-describedby={descriptionId}
+        aria-labelledby={`${titleId} ${profileNameId}`}
+        aria-modal="true"
         className="detail-drawer"
+        ref={drawerRef}
+        role="dialog"
+        tabIndex={-1}
         onMouseDown={(event) => event.stopPropagation()}
       >
         <header className="detail-drawer__topbar">
-          <span>{t('users.drawer.title')}</span>
+          <h2 id={titleId}>{t('users.drawer.title')}</h2>
           <button className="icon-button" type="button" onClick={onClose} aria-label={t('users.drawer.close')}><X size={18} /></button>
         </header>
         <div className="detail-drawer__profile">
           <Avatar initials={user.initials} tone={user.tone} size="large" />
-          <h2>{user.name}</h2>
-          <p>{user.email}</p>
+          <h2 id={profileNameId}>{user.name}</h2>
+          <p id={descriptionId}>{user.email}</p>
           <StatusPill tone={statusTone(user.status)}>{t(USER_STATUS_KEYS[user.status])}</StatusPill>
         </div>
 
@@ -107,6 +117,11 @@ export function UsersPage() {
     setInviteOpen(false)
   }
 
+  function openUserDrawer(user: PrototypeUser, trigger: HTMLElement) {
+    trigger.focus()
+    setSelectedUser(user)
+  }
+
   return (
     <>
       <PageHeader
@@ -145,9 +160,19 @@ export function UsersPage() {
             </thead>
             <tbody>
               {filteredUsers.map((user) => (
-                <tr key={user.id} onClick={() => setSelectedUser(user)}>
+                <tr
+                  aria-haspopup="dialog"
+                  key={user.id}
+                  onClick={(event) => openUserDrawer(user, event.currentTarget)}
+                  onKeyDown={(event) => {
+                    if (event.target !== event.currentTarget || (event.key !== 'Enter' && event.key !== ' ')) return
+                    event.preventDefault()
+                    openUserDrawer(user, event.currentTarget)
+                  }}
+                  tabIndex={0}
+                >
                   <td className="checkbox-cell" onClick={(event) => event.stopPropagation()}><input aria-label={t('users.selectUser', { name: user.name })} type="checkbox" /></td>
-                  <td><button className="user-cell user-cell--button" onClick={(event) => { event.stopPropagation(); setSelectedUser(user) }} type="button"><Avatar initials={user.initials} tone={user.tone} /><span><strong>{user.name}</strong><small>{user.email}</small></span></button></td>
+                  <td><button className="user-cell user-cell--button" onClick={(event) => { event.stopPropagation(); openUserDrawer(user, event.currentTarget) }} type="button"><Avatar initials={user.initials} tone={user.tone} /><span><strong>{user.name}</strong><small>{user.email}</small></span></button></td>
                   <td><StatusPill tone={statusTone(user.status)}>{t(USER_STATUS_KEYS[user.status])}</StatusPill></td>
                   <td><span className={user.mfa === 'notEnrolled' ? 'mfa-state mfa-state--missing' : 'mfa-state'}><ShieldCheck size={15} />{t(MFA_KEYS[user.mfa])}</span></td>
                   <td><span className="application-count"><AppWindow size={15} />{user.applications}</span></td>

@@ -32,7 +32,7 @@ func TestLoadExampleConfigRejectsUnsafeOriginsRedirectScopesAndCookies(t *testin
 		{name: "backchannel path", key: "EXAMPLE_PROVIDER_BACKCHANNEL", value: "http://oneissuer:8080/path"},
 		{name: "redirect query", key: "EXAMPLE_REDIRECT_URI", value: "http://127.0.0.1:8081/callback?x=1"},
 		{name: "remote HTTP redirect", key: "EXAMPLE_REDIRECT_URI", value: "http://rp.example/callback"},
-		{name: "offline scope", key: "EXAMPLE_SCOPES", value: "openid offline_access"},
+		{name: "unsupported scope", key: "EXAMPLE_SCOPES", value: "openid unsupported"},
 		{name: "missing openid", key: "EXAMPLE_SCOPES", value: "profile email"},
 		{name: "duplicate scope", key: "EXAMPLE_SCOPES", value: "openid openid"},
 		{name: "cookie injection", key: "EXAMPLE_COOKIE_NAME", value: "bad;cookie"},

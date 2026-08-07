@@ -10,15 +10,22 @@ import (
 )
 
 type AccessToken struct {
-	ID                  uuid.UUID          `db:"id"`
-	JtiHash             []byte             `db:"jti_hash"`
-	AuthorizationCodeID uuid.UUID          `db:"authorization_code_id"`
-	ConsentGrantID      uuid.UUID          `db:"consent_grant_id"`
-	UserID              uuid.UUID          `db:"user_id"`
-	ClientID            uuid.UUID          `db:"client_id"`
-	Scopes              []string           `db:"scopes"`
-	IssuedAt            pgtype.Timestamptz `db:"issued_at"`
-	ExpiresAt           pgtype.Timestamptz `db:"expires_at"`
+	ID                   uuid.UUID          `db:"id"`
+	JtiHash              []byte             `db:"jti_hash"`
+	AuthorizationCodeID  *uuid.UUID         `db:"authorization_code_id"`
+	ConsentGrantID       uuid.UUID          `db:"consent_grant_id"`
+	UserID               uuid.UUID          `db:"user_id"`
+	ClientID             uuid.UUID          `db:"client_id"`
+	Scopes               []string           `db:"scopes"`
+	IssuedAt             pgtype.Timestamptz `db:"issued_at"`
+	ExpiresAt            pgtype.Timestamptz `db:"expires_at"`
+	IssuanceSource       string             `db:"issuance_source"`
+	SourceRefreshTokenID *uuid.UUID         `db:"source_refresh_token_id"`
+	RefreshFamilyID      *uuid.UUID         `db:"refresh_family_id"`
+	OriginSessionID      *uuid.UUID         `db:"origin_session_id"`
+	SessionBindingID     *uuid.UUID         `db:"session_binding_id"`
+	RevokedAt            pgtype.Timestamptz `db:"revoked_at"`
+	RevokeReason         *string            `db:"revoke_reason"`
 }
 
 type AuditEvent struct {
@@ -56,21 +63,24 @@ type AuthTransaction struct {
 }
 
 type AuthorizationCode struct {
-	ID                uuid.UUID          `db:"id"`
-	CodeHash          []byte             `db:"code_hash"`
-	AuthTransactionID uuid.UUID          `db:"auth_transaction_id"`
-	ConsentGrantID    uuid.UUID          `db:"consent_grant_id"`
-	UserID            uuid.UUID          `db:"user_id"`
-	ClientID          uuid.UUID          `db:"client_id"`
-	RedirectUri       string             `db:"redirect_uri"`
-	Scopes            []string           `db:"scopes"`
-	PkceChallenge     string             `db:"pkce_challenge"`
-	PkceMethod        string             `db:"pkce_method"`
-	NonceValue        *string            `db:"nonce_value"`
-	AuthTime          pgtype.Timestamptz `db:"auth_time"`
-	CreatedAt         pgtype.Timestamptz `db:"created_at"`
-	ExpiresAt         pgtype.Timestamptz `db:"expires_at"`
-	ConsumedAt        pgtype.Timestamptz `db:"consumed_at"`
+	ID                  uuid.UUID          `db:"id"`
+	CodeHash            []byte             `db:"code_hash"`
+	AuthTransactionID   uuid.UUID          `db:"auth_transaction_id"`
+	ConsentGrantID      uuid.UUID          `db:"consent_grant_id"`
+	UserID              uuid.UUID          `db:"user_id"`
+	ClientID            uuid.UUID          `db:"client_id"`
+	RedirectUri         string             `db:"redirect_uri"`
+	Scopes              []string           `db:"scopes"`
+	PkceChallenge       string             `db:"pkce_challenge"`
+	PkceMethod          string             `db:"pkce_method"`
+	NonceValue          *string            `db:"nonce_value"`
+	AuthTime            pgtype.Timestamptz `db:"auth_time"`
+	CreatedAt           pgtype.Timestamptz `db:"created_at"`
+	ExpiresAt           pgtype.Timestamptz `db:"expires_at"`
+	ConsumedAt          pgtype.Timestamptz `db:"consumed_at"`
+	ConsentGrantVersion int64              `db:"consent_grant_version"`
+	OriginSessionID     *uuid.UUID         `db:"origin_session_id"`
+	SessionBindingID    *uuid.UUID         `db:"session_binding_id"`
 }
 
 type ConsentGrant struct {
@@ -80,6 +90,8 @@ type ConsentGrant struct {
 	Scopes    []string           `db:"scopes"`
 	CreatedAt pgtype.Timestamptz `db:"created_at"`
 	UpdatedAt pgtype.Timestamptz `db:"updated_at"`
+	RevokedAt pgtype.Timestamptz `db:"revoked_at"`
+	Version   int64              `db:"version"`
 }
 
 type Credential struct {
@@ -91,20 +103,40 @@ type Credential struct {
 }
 
 type LoginSession struct {
-	ID              uuid.UUID          `db:"id"`
-	UserID          uuid.UUID          `db:"user_id"`
-	TokenHash       []byte             `db:"token_hash"`
-	CsrfHash        []byte             `db:"csrf_hash"`
-	CsrfExpiresAt   pgtype.Timestamptz `db:"csrf_expires_at"`
-	CreatedAt       pgtype.Timestamptz `db:"created_at"`
-	LastSeenAt      pgtype.Timestamptz `db:"last_seen_at"`
-	AuthenticatedAt pgtype.Timestamptz `db:"authenticated_at"`
-	ExpiresAt       pgtype.Timestamptz `db:"expires_at"`
-	IdleExpiresAt   pgtype.Timestamptz `db:"idle_expires_at"`
-	RevokedAt       pgtype.Timestamptz `db:"revoked_at"`
-	RevokeReason    *string            `db:"revoke_reason"`
-	UserAgentHash   []byte             `db:"user_agent_hash"`
-	IpPrefix        *string            `db:"ip_prefix"`
+	ID               uuid.UUID          `db:"id"`
+	UserID           uuid.UUID          `db:"user_id"`
+	TokenHash        []byte             `db:"token_hash"`
+	CsrfHash         []byte             `db:"csrf_hash"`
+	CsrfExpiresAt    pgtype.Timestamptz `db:"csrf_expires_at"`
+	CreatedAt        pgtype.Timestamptz `db:"created_at"`
+	LastSeenAt       pgtype.Timestamptz `db:"last_seen_at"`
+	AuthenticatedAt  pgtype.Timestamptz `db:"authenticated_at"`
+	ExpiresAt        pgtype.Timestamptz `db:"expires_at"`
+	IdleExpiresAt    pgtype.Timestamptz `db:"idle_expires_at"`
+	RevokedAt        pgtype.Timestamptz `db:"revoked_at"`
+	RevokeReason     *string            `db:"revoke_reason"`
+	UserAgentHash    []byte             `db:"user_agent_hash"`
+	IpPrefix         *string            `db:"ip_prefix"`
+	SessionBindingID uuid.UUID          `db:"session_binding_id"`
+}
+
+type LogoutTransaction struct {
+	ID                    uuid.UUID          `db:"id"`
+	LookupHash            []byte             `db:"lookup_hash"`
+	Stage                 string             `db:"stage"`
+	CsrfHash              []byte             `db:"csrf_hash"`
+	VerifiedClientID      *uuid.UUID         `db:"verified_client_id"`
+	PostLogoutRedirectUri *string            `db:"post_logout_redirect_uri"`
+	StateValue            *string            `db:"state_value"`
+	HintSubject           *string            `db:"hint_subject"`
+	UserID                *uuid.UUID         `db:"user_id"`
+	SessionID             *uuid.UUID         `db:"session_id"`
+	SessionBindingID      *uuid.UUID         `db:"session_binding_id"`
+	CreatedAt             pgtype.Timestamptz `db:"created_at"`
+	ExpiresAt             pgtype.Timestamptz `db:"expires_at"`
+	BoundAt               pgtype.Timestamptz `db:"bound_at"`
+	ConsumedAt            pgtype.Timestamptz `db:"consumed_at"`
+	AttemptCount          int16              `db:"attempt_count"`
 }
 
 type OidcClient struct {
@@ -119,6 +151,7 @@ type OidcClient struct {
 	RegistrationEnabled     bool               `db:"registration_enabled"`
 	CreatedAt               pgtype.Timestamptz `db:"created_at"`
 	UpdatedAt               pgtype.Timestamptz `db:"updated_at"`
+	Version                 int64              `db:"version"`
 }
 
 type OidcClientLogoutUri struct {
@@ -156,6 +189,32 @@ type PreauthSession struct {
 	CreatedAt         pgtype.Timestamptz `db:"created_at"`
 	ExpiresAt         pgtype.Timestamptz `db:"expires_at"`
 	ConsumedAt        pgtype.Timestamptz `db:"consumed_at"`
+	AttemptCount      int16              `db:"attempt_count"`
+}
+
+type RefreshToken struct {
+	ID         uuid.UUID          `db:"id"`
+	FamilyID   uuid.UUID          `db:"family_id"`
+	TokenHash  []byte             `db:"token_hash"`
+	Generation int64              `db:"generation"`
+	IssuedAt   pgtype.Timestamptz `db:"issued_at"`
+	ExpiresAt  pgtype.Timestamptz `db:"expires_at"`
+	ConsumedAt pgtype.Timestamptz `db:"consumed_at"`
+}
+
+type RefreshTokenFamily struct {
+	ID                        uuid.UUID          `db:"id"`
+	OriginAuthorizationCodeID *uuid.UUID         `db:"origin_authorization_code_id"`
+	ConsentGrantID            uuid.UUID          `db:"consent_grant_id"`
+	UserID                    uuid.UUID          `db:"user_id"`
+	ClientID                  uuid.UUID          `db:"client_id"`
+	OriginSessionID           *uuid.UUID         `db:"origin_session_id"`
+	SessionBindingID          uuid.UUID          `db:"session_binding_id"`
+	Scopes                    []string           `db:"scopes"`
+	CreatedAt                 pgtype.Timestamptz `db:"created_at"`
+	AbsoluteExpiresAt         pgtype.Timestamptz `db:"absolute_expires_at"`
+	RevokedAt                 pgtype.Timestamptz `db:"revoked_at"`
+	RevokeReason              *string            `db:"revoke_reason"`
 }
 
 type User struct {
@@ -172,4 +231,5 @@ type User struct {
 	CreatedAt          pgtype.Timestamptz `db:"created_at"`
 	UpdatedAt          pgtype.Timestamptz `db:"updated_at"`
 	LastLoginAt        pgtype.Timestamptz `db:"last_login_at"`
+	Version            int64              `db:"version"`
 }

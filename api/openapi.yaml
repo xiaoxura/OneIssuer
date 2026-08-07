@@ -1,25 +1,25 @@
 openapi: 3.1.0
 info:
   title: OneIssuer Identity and Client Management API
-  version: 0.1.0-dev.3
+  version: 0.1.0-dev.4
   license:
     name: Apache License 2.0
     identifier: Apache-2.0
   description: |-
     Implemented management/current-user JSON contract for a self-hosted, single-Issuer
-    deployment. It covers health, current-user session management, and the
+    deployment. It covers health, current-user session and consent Grant management, and the
     administrator Users, Clients, Sessions, and Audit APIs.
 
     Browser authentication is hosted as HTML at `/login`, `/register`,
     `/logout`, and `/auth/complete`; those form interactions are intentionally
     not represented as JSON operations here. Discovery, JWKS, Authorize, Token,
-    and UserInfo are implemented standard protocol surfaces but intentionally
-    remain outside this management API description. Revocation, Introspection,
-    Refresh Token, and RP-Initiated Logout are not implemented.
+    UserInfo, Refresh Token, Revocation, Introspection, and RP-Initiated Logout are
+    implemented standard protocol surfaces but intentionally remain outside this
+    management API description.
 
     Authenticated JSON calls use a server-side session cookie. State-changing
     calls additionally require the clear CSRF value returned in the
-    `X-CSRF-Token` response header by `/api/v1/me`, `/api/v1/me/sessions`,
+    `X-CSRF-Token` response header by `/api/v1/me`, `/api/v1/me/sessions`, `/api/v1/me/grants`,
     `/api/admin/v1/me`, or an administrative list endpoint. The browser also
     sends the matching CSRF cookie, and OneIssuer applies same-origin checks.
 servers:
@@ -189,6 +189,82 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /api/v1/me/grants:
+    get:
+      tags: [Current user]
+      operationId: listCurrentUserConsentGrants
+      summary: List the current user's client consent Grants
+      description: |-
+        Uses an owner-safe keyset cursor containing only `updated_at` and public
+        `client_id`. Internal Grant, Client, family, and Session identifiers are absent.
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/GrantCursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A bounded owner-only Grant page.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            X-CSRF-Token:
+              $ref: "#/components/headers/CSRFToken"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GrantPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /api/v1/me/grants/revoke:
+    post:
+      tags: [Current user]
+      operationId: revokeCurrentUserConsentGrant
+      summary: Revoke one owned Grant by public client_id
+      description: |-
+        Atomically revokes the Grant, increments its authority version, and revokes
+        every dependent Refresh family and live Access metadata row. Unknown Clients
+        and another user's Grant are indistinguishable from not found. Repeating an
+        already completed revoke is idempotent and does not append another Audit event.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevokeGrantRequest"
+      responses:
+        "200":
+          description: Safe current state of the revoked Grant.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedGrant"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalError"
         "405":
@@ -721,6 +797,16 @@ components:
       schema:
         type: string
         pattern: "^[A-Za-z0-9_-]{34}$"
+    GrantCursor:
+      name: cursor
+      in: query
+      required: false
+      description: Versioned opaque keyset cursor containing only updated_at and public client_id.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 1024
+        pattern: "^[A-Za-z0-9_-]+$"
     Limit:
       name: limit
       in: query
@@ -999,6 +1085,66 @@ components:
         next_cursor:
           type: string
           pattern: "^[A-Za-z0-9_-]{34}$"
+    ManagedGrant:
+      type: object
+      additionalProperties: false
+      description: Owner-safe consent authority projection with no internal UUID.
+      required:
+        - client_id
+        - client_name
+        - client_status
+        - scopes
+        - created_at
+        - updated_at
+        - has_active_offline_family
+      properties:
+        client_id:
+          type: string
+          pattern: "^ois_cli_[A-Za-z0-9_-]{32}$"
+        client_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        client_status:
+          $ref: "#/components/schemas/ClientStatus"
+        scopes:
+          $ref: "#/components/schemas/ScopeList"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: string
+          format: date-time
+        has_active_offline_family:
+          type: boolean
+    GrantPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/ManagedGrant"
+        next_cursor:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          pattern: "^[A-Za-z0-9_-]+$"
+    RevokeGrantRequest:
+      type: object
+      additionalProperties: false
+      required: [client_id]
+      minProperties: 1
+      maxProperties: 1
+      properties:
+        client_id:
+          type: string
+          pattern: "^ois_cli_[A-Za-z0-9_-]{32}$"
     RevokedCount:
       type: object
       additionalProperties: false
@@ -1218,12 +1364,41 @@ components:
         - authorization_transaction_consumed
         - authorization_transaction_expired
         - authorization_transaction_rejected
+        - authorization_granted
+        - authorization_denied
+        - authorization_code_issued
+        - authorization_code_exchange_succeeded
+        - authorization_code_exchange_rejected
+        - consent_grant_created
+        - consent_grant_expanded
+        - access_token_issued
+        - signing_key_loaded
+        - refresh_token_issued
+        - refresh_token_rotated
+        - refresh_token_exchange_rejected
+        - refresh_token_reuse_detected
+        - refresh_token_family_revoked
+        - access_token_revoked
+        - consent_grant_revoked
+        - consent_grant_reactivated
+        - rp_logout_completed
+        - logout_transaction_rejected
     AuditResult:
       type: string
       enum: [success, rejected, failure]
     AuditTargetType:
       type: string
-      enum: [user, client, session, auth_transaction]
+      enum:
+        - user
+        - client
+        - session
+        - auth_transaction
+        - consent_grant
+        - authorization_code
+        - access_token
+        - refresh_token
+        - refresh_token_family
+        - logout_transaction
     AuditChangedField:
       type: string
       enum:
@@ -1242,6 +1417,12 @@ components:
         - secret
         - revoked
         - created
+        - expanded
+        - issued
+        - consumed
+        - rotated
+        - reused
+        - reactivated
     AuditEvent:
       type: object
       additionalProperties: false

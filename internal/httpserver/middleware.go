@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"log/slog"
 	"net/http"
-	"runtime/debug"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -76,8 +76,8 @@ func metricMethod(method string) string {
 func routeLabel(path string) string {
 	switch path {
 	case "/health/live", "/health/ready", "/metrics", "/login", "/register", "/consent", "/logout", "/auth/complete",
-		"/.well-known/openid-configuration", "/oauth2/jwks", "/oauth2/authorize", "/oauth2/authorize/continue", "/oauth2/token", "/oauth2/userinfo",
-		"/api/v1/me", "/api/v1/me/sessions", "/api/v1/me/sessions/revoke-others",
+		"/.well-known/openid-configuration", "/oauth2/jwks", "/oauth2/authorize", "/oauth2/authorize/continue", "/oauth2/token", "/oauth2/userinfo", "/oauth2/revoke", "/oauth2/introspect", "/oauth2/logout", "/oauth2/logout/confirm",
+		"/api/v1/me", "/api/v1/me/sessions", "/api/v1/me/sessions/revoke-others", "/api/v1/me/grants", "/api/v1/me/grants/revoke",
 		"/api/admin/v1/me", "/api/admin/v1/users", "/api/admin/v1/clients",
 		"/api/admin/v1/sessions", "/api/admin/v1/audit-events":
 		return path
@@ -112,7 +112,7 @@ func recoveryMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 				if logger != nil {
 					logger.ErrorContext(request.Context(), "panic recovered",
 						slog.String("request_id", RequestID(request.Context())),
-						slog.String("stack", string(debug.Stack())),
+						slog.String("error_class", "panic"),
 					)
 				}
 				setSecurityHeaders(writer.Header())
@@ -175,12 +175,41 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 
 func setSecurityHeaders(header http.Header) {
 	header.Set("X-Content-Type-Options", "nosniff")
-	header.Set("Referrer-Policy", "no-referrer")
+	// Browsers serialize the Origin of a form POST as `null` under no-referrer,
+	// which conflicts with the explicit same-origin state-change check. Keep full
+	// referrers inside the Issuer only and suppress them at every RP boundary.
+	header.Set("Referrer-Policy", "same-origin")
 	header.Set("X-Frame-Options", "DENY")
-	header.Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+	setFormActionPolicy(header)
 	header.Set("Cache-Control", "no-store")
 	// Account/admin APIs are same-origin only; intentionally emit no CORS opt-in.
 	header.Del("Access-Control-Allow-Origin")
+}
+
+// setFormActionPolicy keeps hosted forms same-origin by default, while allowing
+// a transaction-bound redirect to the exact origin already validated by the
+// authorization or logout service. CSP evaluates the final URL after a 3xx,
+// so a static form-action 'self' would block normal OIDC callback delivery.
+func setFormActionPolicy(header http.Header, destinations ...string) {
+	formActions := []string{"'self'"}
+	seen := map[string]struct{}{"'self'": {}}
+	for _, raw := range destinations {
+		parsed, err := url.Parse(raw)
+		if err != nil || !parsed.IsAbs() || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+			continue
+		}
+		scheme := strings.ToLower(parsed.Scheme)
+		if scheme != "http" && scheme != "https" {
+			continue
+		}
+		origin := scheme + "://" + strings.ToLower(parsed.Host)
+		if _, exists := seen[origin]; exists {
+			continue
+		}
+		seen[origin] = struct{}{}
+		formActions = append(formActions, origin)
+	}
+	header.Set("Content-Security-Policy", "default-src 'none'; form-action "+strings.Join(formActions, " ")+"; base-uri 'none'; frame-ancestors 'none'")
 }
 
 func headerContainsToken(header http.Header, key, token string) bool {

@@ -22,37 +22,48 @@ import (
 	clientdomain "github.com/oneissuer/oneissuer/internal/client"
 	"github.com/oneissuer/oneissuer/internal/consent"
 	"github.com/oneissuer/oneissuer/internal/identity"
+	logoutdomain "github.com/oneissuer/oneissuer/internal/logout"
 	"github.com/oneissuer/oneissuer/internal/oidc"
 	"github.com/oneissuer/oneissuer/internal/pagination"
 	"github.com/oneissuer/oneissuer/internal/session"
 	"github.com/oneissuer/oneissuer/internal/token"
 )
 
-const maxAuthBodyBytes = 64 << 10
+const (
+	maxAuthBodyBytes        = 64 << 10
+	defaultOperationTimeout = 10 * time.Second
+)
 
 //go:embed templates/*.html
 var templateFiles embed.FS
 
 // ApplicationOptions supplies browser and JSON API dependencies.
 type ApplicationOptions struct {
-	Authn         *authn.Service
-	Sessions      *session.Service
-	Admin         *admin.Service
-	Clients       *clientdomain.Service
-	Transactions  *authflow.Service
-	Consents      *consent.Service
-	Authorization *authorization.Service
-	Tokens        ProtocolTokenService
-	Cookies       session.CookieManager
-	Issuer        *url.URL
-	PublicKeys    PublicKeySet
-	Now           func() time.Time
+	Authn          *authn.Service
+	Sessions       *session.Service
+	Admin          *admin.Service
+	Clients        *clientdomain.Service
+	Transactions   *authflow.Service
+	Consents       *consent.Service
+	Authorization  *authorization.Service
+	Tokens         ProtocolTokenService
+	Cookies        session.CookieManager
+	Issuer         *url.URL
+	PublicKeys     PublicKeySet
+	AuthRateLimit  AuthenticationRateLimitConfig
+	Logout         *logoutdomain.Service
+	LogoutCookies  logoutdomain.CookieManager
+	OAuthRateLimit AuthenticationRateLimitConfig
+	Now            func() time.Time
 }
 
 // ProtocolTokenService is the narrow HTTP boundary for Code exchange and
 // UserInfo. It deliberately exposes neither signing keys nor persistence.
 type ProtocolTokenService interface {
 	Exchange(context.Context, token.ExchangeInput) (token.Response, error)
+	Refresh(context.Context, token.RefreshInput) (token.Response, error)
+	Revoke(context.Context, token.RevocationInput) error
+	Introspect(context.Context, token.IntrospectionInput) (token.IntrospectionResponse, error)
 	UserInfoForAccessToken(context.Context, string, time.Time) (token.UserInfo, error)
 }
 
@@ -72,12 +83,16 @@ type applicationHandler struct {
 	transactions  *authflow.Service
 	consents      *consent.Service
 	authorization *authorization.Service
+	logout        *logoutdomain.Service
+	logoutCookies logoutdomain.CookieManager
 	tokens        ProtocolTokenService
 	cookies       session.CookieManager
 	issuer        *url.URL
 	publicKeys    PublicKeySet
 	metadata      []byte
 	now           func() time.Time
+	authLimiter   *authenticationRateLimiter
+	oauthLimiter  *authenticationRateLimiter
 	templates     *template.Template
 }
 
@@ -93,7 +108,11 @@ func NewApplicationHandler(options ApplicationOptions) (http.Handler, error) {
 	if options.Now == nil {
 		options.Now = time.Now
 	}
-	metadata, err := oidc.BuildProviderMetadata(options.Issuer)
+	metadataOptions := []oidc.MetadataOption{}
+	if options.Logout != nil {
+		metadataOptions = append(metadataOptions, oidc.WithEndSessionEndpoint())
+	}
+	metadata, err := oidc.BuildProviderMetadata(options.Issuer, metadataOptions...)
 	if err != nil {
 		return nil, errors.New("OIDC provider metadata configuration is invalid")
 	}
@@ -104,11 +123,34 @@ func NewApplicationHandler(options ApplicationOptions) (http.Handler, error) {
 	return &applicationHandler{
 		authn: options.Authn, sessions: options.Sessions, admin: options.Admin,
 		clients: options.Clients, tokenClients: options.Clients, transactions: options.Transactions, consents: options.Consents, authorization: options.Authorization, tokens: options.Tokens,
+		logout: options.Logout, logoutCookies: options.LogoutCookies,
 		cookies: options.Cookies, issuer: options.Issuer, publicKeys: options.PublicKeys, metadata: encodedMetadata, now: options.Now, templates: templates,
+		authLimiter:  newAuthenticationRateLimiter(options.AuthRateLimit, options.Now().UTC()),
+		oauthLimiter: newAuthenticationRateLimiter(options.OAuthRateLimit, options.Now().UTC()),
 	}, nil
 }
 
 func (a *applicationHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	if a.issuer != nil {
+		// Keep the configured Issuer explicit in addition to 'self'. Some
+		// browsers evaluate form-action across a top-level cross-origin redirect
+		// chain using the serialized origin rather than the self keyword alone.
+		setFormActionPolicy(writer.Header(), a.issuer.String())
+	}
+	if a.oauthLifecycleRateLimited(request) {
+		a.writeOAuthRateLimitResponse(writer, request)
+		return
+	}
+	if a.authenticationRateLimited(request) {
+		writer.Header().Set("Cache-Control", "no-store")
+		writer.Header().Set("Retry-After", "60")
+		if request.URL.Path == oidc.AuthorizePath {
+			writeError(writer, request, http.StatusTooManyRequests, "temporarily_unavailable", "authentication request rate limit exceeded")
+		} else {
+			a.renderErrorPage(writer, request, http.StatusTooManyRequests, "temporarily_unavailable")
+		}
+		return
+	}
 	switch request.URL.Path {
 	case oidc.AuthorizePath, oidc.AuthorizeContinuePath:
 		if !a.oidcAuthorizationReady() {
@@ -146,6 +188,30 @@ func (a *applicationHandler) ServeHTTP(writer http.ResponseWriter, request *http
 			return
 		}
 		a.handleUserInfo(writer, request)
+	case oidc.RevocationPath:
+		if a.tokenClients == nil || a.tokens == nil {
+			writeError(writer, request, http.StatusNotFound, "not_found", "resource not found")
+			return
+		}
+		a.handleRevocation(writer, request)
+	case oidc.IntrospectionPath:
+		if a.tokenClients == nil || a.tokens == nil {
+			writeError(writer, request, http.StatusNotFound, "not_found", "resource not found")
+			return
+		}
+		a.handleIntrospection(writer, request)
+	case oidc.LogoutPath:
+		if a.logout == nil {
+			writeError(writer, request, http.StatusNotFound, "not_found", "resource not found")
+			return
+		}
+		a.handleRPLogoutRequest(writer, request)
+	case oidc.LogoutConfirmPath:
+		if a.logout == nil {
+			writeError(writer, request, http.StatusNotFound, "not_found", "resource not found")
+			return
+		}
+		a.handleRPLogoutConfirmation(writer, request)
 	case oidc.DiscoveryPath:
 		if !a.oidcProviderReady() {
 			writeError(writer, request, http.StatusNotFound, "not_found", "resource not found")
@@ -196,6 +262,10 @@ func (a *applicationHandler) ServeHTTP(writer http.ResponseWriter, request *http
 		a.handleMySessions(writer, request)
 	case "/api/v1/me/sessions/revoke-others":
 		a.handleRevokeOtherSessions(writer, request)
+	case "/api/v1/me/grants":
+		a.handleMyGrants(writer, request)
+	case "/api/v1/me/grants/revoke":
+		a.handleRevokeMyGrant(writer, request)
 	case "/api/admin/v1/me":
 		a.handleAdminMe(writer, request)
 	case "/api/admin/v1/users":
@@ -212,6 +282,53 @@ func (a *applicationHandler) ServeHTTP(writer http.ResponseWriter, request *http
 		}
 		writeError(writer, request, http.StatusNotFound, "not_found", "resource not found")
 	}
+}
+
+func (a *applicationHandler) writeOAuthRateLimitResponse(writer http.ResponseWriter, request *http.Request) {
+	writer.Header().Set("Cache-Control", "no-store")
+	writer.Header().Set("Pragma", "no-cache")
+	writer.Header().Set("Retry-After", "1")
+	writer.Header().Set("Referrer-Policy", "no-referrer")
+	if request.URL.Path == oidc.LogoutPath {
+		a.renderErrorPage(writer, request, http.StatusTooManyRequests, "temporarily_unavailable")
+		return
+	}
+	setTokenResponseHeaders(writer.Header())
+	if request.URL.Path == oidc.UserInfoPath {
+		writeBearerError(writer, "temporarily_unavailable", http.StatusTooManyRequests)
+		return
+	}
+	writeOAuthError(writer, &oidc.TokenError{Code: "temporarily_unavailable", HTTPStatus: http.StatusTooManyRequests})
+}
+
+func (a *applicationHandler) oauthLifecycleRateLimited(request *http.Request) bool {
+	if a.oauthLimiter == nil {
+		return false
+	}
+	var sensitive bool
+	switch request.URL.Path {
+	case oidc.TokenPath, oidc.RevocationPath, oidc.IntrospectionPath:
+		sensitive = request.Method == http.MethodPost
+	case oidc.UserInfoPath:
+		sensitive = request.Method == http.MethodGet || request.Method == http.MethodPost
+	case oidc.LogoutPath:
+		sensitive = request.Method == http.MethodGet || request.Method == http.MethodPost
+	}
+	return sensitive && !a.oauthLimiter.allow(requestClientIP(request), a.now().UTC())
+}
+
+func (a *applicationHandler) oauthClientRateLimited(clientID uuid.UUID) bool {
+	return a.oauthLimiter != nil && !a.oauthLimiter.allowClient(clientID, a.now().UTC())
+}
+
+func (a *applicationHandler) authenticationRateLimited(request *http.Request) bool {
+	if a.authLimiter == nil {
+		return false
+	}
+	sensitive := (request.URL.Path == oidc.AuthorizePath && request.Method == http.MethodGet) ||
+		((request.URL.Path == "/login" || request.URL.Path == "/register") &&
+			(request.Method == http.MethodGet || request.Method == http.MethodPost))
+	return sensitive && !a.authLimiter.allow(requestClientIP(request), a.now().UTC())
 }
 
 func (a *applicationHandler) oidcAuthorizationReady() bool {
@@ -262,6 +379,10 @@ func methodNotAllowed(writer http.ResponseWriter, request *http.Request, methods
 
 func (a *applicationHandler) authenticate(request *http.Request) (session.Principal, error) {
 	return a.sessions.Authenticate(request.Context(), a.cookies.SessionToken(request), a.now().UTC())
+}
+
+func operationContext(request *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(request.Context(), defaultOperationTimeout)
 }
 
 func (a *applicationHandler) requireStateChange(writer http.ResponseWriter, request *http.Request, principal session.Principal, token string) bool {
@@ -369,14 +490,14 @@ func authErrorStatus(err error) (int, string, string) {
 		return http.StatusForbidden, "forbidden", "administrator permission required"
 	case errors.Is(err, admin.ErrRecentAuth):
 		return http.StatusForbidden, "recent_authentication_required", "recent authentication required"
-	case errors.Is(err, identity.ErrNotFound), errors.Is(err, clientdomain.ErrNotFound), errors.Is(err, session.ErrNotFound):
+	case errors.Is(err, identity.ErrNotFound), errors.Is(err, clientdomain.ErrNotFound), errors.Is(err, session.ErrNotFound), errors.Is(err, consent.ErrNotFound):
 		return http.StatusNotFound, "not_found", "resource not found"
 	case errors.Is(err, identity.ErrDuplicate), errors.Is(err, identity.ErrConflict), errors.Is(err, clientdomain.ErrConflict):
 		return http.StatusConflict, "conflict", "resource conflicts with existing state"
 	case errors.Is(err, identity.ErrLastAdmin):
 		return http.StatusConflict, "last_admin_protected", "the last active administrator is protected"
 	case errors.Is(err, identity.ErrInvalidInput), errors.Is(err, clientdomain.ErrInvalid), errors.Is(err, clientdomain.ErrPublicSecret),
-		errors.Is(err, admin.ErrInvalidFilter), errors.Is(err, pagination.ErrInvalidCursor):
+		errors.Is(err, admin.ErrInvalidFilter), errors.Is(err, pagination.ErrInvalidCursor), errors.Is(err, consent.ErrInvalid):
 		return http.StatusUnprocessableEntity, "invalid_input", "request input is invalid"
 	case errors.Is(err, identity.ErrHashBusy):
 		return http.StatusTooManyRequests, "temporarily_unavailable", "authentication capacity is temporarily unavailable"

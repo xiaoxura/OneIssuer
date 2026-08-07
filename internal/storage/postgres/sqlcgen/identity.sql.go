@@ -60,7 +60,7 @@ INSERT INTO users (
     $8, $9, $10,
     $11, $12
 )
-RETURNING id, subject, username, username_normalized, display_name, email, email_normalized, email_verified, status, role, created_at, updated_at, last_login_at
+RETURNING id, subject, username, username_normalized, display_name, email, email_normalized, email_verified, status, role, created_at, updated_at, last_login_at, version
 `
 
 type CreateUserParams struct {
@@ -108,6 +108,7 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.LastLoginAt,
+		&i.Version,
 	)
 	return i, err
 }
@@ -116,7 +117,7 @@ const findCredentialForLogin = `-- name: FindCredentialForLogin :one
 SELECT
     u.id, u.subject, u.username, u.username_normalized, u.display_name,
     u.email, u.email_normalized, u.email_verified, u.status, u.role,
-    u.created_at, u.updated_at, u.last_login_at,
+    u.created_at, u.updated_at, u.last_login_at, u.version,
     c.password_hash, c.updated_at AS credential_updated_at
 FROM users AS u
 JOIN credentials AS c ON c.user_id = u.id AND c.credential_type = 'password'
@@ -140,6 +141,7 @@ type FindCredentialForLoginRow struct {
 	CreatedAt           pgtype.Timestamptz `db:"created_at"`
 	UpdatedAt           pgtype.Timestamptz `db:"updated_at"`
 	LastLoginAt         pgtype.Timestamptz `db:"last_login_at"`
+	Version             int64              `db:"version"`
 	PasswordHash        string             `db:"password_hash"`
 	CredentialUpdatedAt pgtype.Timestamptz `db:"credential_updated_at"`
 }
@@ -161,6 +163,7 @@ func (q *Queries) FindCredentialForLogin(ctx context.Context, identifier string)
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.LastLoginAt,
+		&i.Version,
 		&i.PasswordHash,
 		&i.CredentialUpdatedAt,
 	)
@@ -168,7 +171,7 @@ func (q *Queries) FindCredentialForLogin(ctx context.Context, identifier string)
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, subject, username, username_normalized, display_name, email, email_normalized, email_verified, status, role, created_at, updated_at, last_login_at FROM users WHERE id = $1
+SELECT id, subject, username, username_normalized, display_name, email, email_normalized, email_verified, status, role, created_at, updated_at, last_login_at, version FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
@@ -188,6 +191,7 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.LastLoginAt,
+		&i.Version,
 	)
 	return i, err
 }
@@ -204,7 +208,7 @@ func (q *Queries) HasAdmin(ctx context.Context) (bool, error) {
 }
 
 const listUsers = `-- name: ListUsers :many
-SELECT id, subject, username, username_normalized, display_name, email, email_normalized, email_verified, status, role, created_at, updated_at, last_login_at
+SELECT id, subject, username, username_normalized, display_name, email, email_normalized, email_verified, status, role, created_at, updated_at, last_login_at, version
 FROM users
 WHERE (
         $1::text = ''
@@ -254,6 +258,7 @@ func (q *Queries) ListUsers(ctx context.Context, arg ListUsersParams) ([]User, e
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.LastLoginAt,
+			&i.Version,
 		); err != nil {
 			return nil, err
 		}
@@ -284,7 +289,7 @@ func (q *Queries) LockLoginIdentifier(ctx context.Context, identifier string) er
 }
 
 const lockUserByID = `-- name: LockUserByID :one
-SELECT id, subject, username, username_normalized, display_name, email, email_normalized, email_verified, status, role, created_at, updated_at, last_login_at FROM users WHERE id = $1 FOR UPDATE
+SELECT id, subject, username, username_normalized, display_name, email, email_normalized, email_verified, status, role, created_at, updated_at, last_login_at, version FROM users WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockUserByID(ctx context.Context, id uuid.UUID) (User, error) {
@@ -304,6 +309,7 @@ func (q *Queries) LockUserByID(ctx context.Context, id uuid.UUID) (User, error) 
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.LastLoginAt,
+		&i.Version,
 	)
 	return i, err
 }
@@ -386,9 +392,10 @@ UPDATE users SET
     email_normalized = $5,
     status = $6,
     role = $7,
-    updated_at = $8
-WHERE id = $9 AND updated_at = $10
-RETURNING id, subject, username, username_normalized, display_name, email, email_normalized, email_verified, status, role, created_at, updated_at, last_login_at
+    updated_at = $8,
+    version = version + 1
+WHERE id = $9 AND version = $10
+RETURNING id, subject, username, username_normalized, display_name, email, email_normalized, email_verified, status, role, created_at, updated_at, last_login_at, version
 `
 
 type UpdateUserParams struct {
@@ -401,7 +408,7 @@ type UpdateUserParams struct {
 	Role               string             `db:"role"`
 	UpdatedAt          pgtype.Timestamptz `db:"updated_at"`
 	ID                 uuid.UUID          `db:"id"`
-	ExpectedUpdatedAt  pgtype.Timestamptz `db:"expected_updated_at"`
+	ExpectedVersion    int64              `db:"expected_version"`
 }
 
 func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) (User, error) {
@@ -415,7 +422,7 @@ func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) (User, e
 		arg.Role,
 		arg.UpdatedAt,
 		arg.ID,
-		arg.ExpectedUpdatedAt,
+		arg.ExpectedVersion,
 	)
 	var i User
 	err := row.Scan(
@@ -432,6 +439,7 @@ func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) (User, e
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.LastLoginAt,
+		&i.Version,
 	)
 	return i, err
 }

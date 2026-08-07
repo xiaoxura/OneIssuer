@@ -13,7 +13,7 @@
 - [ ] `make generate-check`
 - [ ] `make check`
 - [ ] `make contract-check`
-- [ ] `make phase-3-smoke` (or explain why not applicable)
+- [ ] `make phase-4-smoke` (or explain why not applicable)
 - [ ] `make container-check` (or explain why no final-image behavior changed)
 - [ ] `git diff --check`
 

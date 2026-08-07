@@ -88,7 +88,7 @@ func TestPostgresIntegration(t *testing.T) {
 		if migrationErr := postgres.RunMigrationCommand(ctx, databaseURL, postgres.MigrationUp, io.Discard); migrationErr != nil {
 			t.Fatalf("second migration up error = %v", migrationErr)
 		}
-		if !strings.Contains(output.String(), "version 10") {
+		if !strings.Contains(output.String(), "version 15") {
 			t.Fatalf("migration output = %q", output.String())
 		}
 		if checkErr := store.CheckMigrations(ctx); checkErr != nil {
@@ -99,7 +99,7 @@ func TestPostgresIntegration(t *testing.T) {
 		if statusErr := postgres.RunMigrationCommand(ctx, databaseURL, postgres.MigrationStatus, &output); statusErr != nil {
 			t.Fatalf("migration status error = %v", statusErr)
 		}
-		if !strings.Contains(output.String(), "current_version=10 expected_version=10 status=current") {
+		if !strings.Contains(output.String(), "current_version=15 expected_version=15 status=current") {
 			t.Fatalf("migration status = %q", output.String())
 		}
 	})
@@ -108,9 +108,14 @@ func TestPostgresIntegration(t *testing.T) {
 		testPhaseTwoUpgrade(ctx, t, databaseURL)
 	})
 
+	t.Run("populated schema eleven upgrades safely through schema fifteen", func(t *testing.T) {
+		testProjectReviewSchema(ctx, t, databaseURL)
+	})
+
 	t.Run("test-only migration supports down and up", func(t *testing.T) {
 		database := openSQLDatabase(ctx, t, databaseURL)
 		defer func() { _ = database.Close() }()
+		assertMigrationVersion(ctx, t, database, 15)
 		migrationFS := os.DirFS("testdata/migrations")
 		if migrationErr := postgres.MigrateUp(ctx, database, migrationFS, "."); migrationErr != nil {
 			t.Fatalf("MigrateUp() error = %v", migrationErr)
@@ -119,24 +124,28 @@ func TestPostgresIntegration(t *testing.T) {
 			t.Fatalf("idempotent MigrateUp() error = %v", migrationErr)
 		}
 		assertTableExists(ctx, t, database, true)
+		assertMigrationVersion(ctx, t, database, 16)
 		if migrationErr := postgres.MigrateDown(ctx, database, migrationFS, "."); migrationErr != nil {
 			t.Fatalf("MigrateDown() error = %v", migrationErr)
 		}
 		assertTableExists(ctx, t, database, false)
+		assertMigrationVersion(ctx, t, database, 15)
 		if migrationErr := postgres.MigrateUp(ctx, database, migrationFS, "."); migrationErr != nil {
 			t.Fatalf("MigrateUp() after down error = %v", migrationErr)
 		}
 		assertTableExists(ctx, t, database, true)
+		assertMigrationVersion(ctx, t, database, 16)
 		if migrationErr := postgres.MigrateDown(ctx, database, migrationFS, "."); migrationErr != nil {
 			t.Fatalf("final MigrateDown() cleanup error = %v", migrationErr)
 		}
 		assertTableExists(ctx, t, database, false)
+		assertMigrationVersion(ctx, t, database, 15)
 	})
 
 	t.Run("all production migrations support test down and up", func(t *testing.T) {
 		database := openSQLDatabase(ctx, t, databaseURL)
 		defer func() { _ = database.Close() }()
-		for range 10 {
+		for range 15 {
 			if migrationErr := postgres.MigrateDown(ctx, database, productionmigrations.FS, "."); migrationErr != nil {
 				t.Fatalf("production MigrateDown() error = %v", migrationErr)
 			}
@@ -226,6 +235,10 @@ func TestPostgresIntegration(t *testing.T) {
 		testPhaseTwoLifecycle(ctx, t, store, databaseURL)
 	})
 
+	t.Run("project-review authority lifecycle and lock ordering", func(t *testing.T) {
+		testProjectReviewAuthorityLifecycle(ctx, t, store, databaseURL)
+	})
+
 	t.Run("phase three Consent and atomic Authorization Code lifecycle", func(t *testing.T) {
 		testPhaseThreeAuthorizationLifecycle(ctx, t, store, databaseURL)
 	})
@@ -239,7 +252,7 @@ func TestPostgresIntegration(t *testing.T) {
 func startPostgres(ctx context.Context, t *testing.T) (testcontainers.Container, string) {
 	t.Helper()
 	request := testcontainers.ContainerRequest{
-		Image:        "postgres:17.5-alpine3.22",
+		Image:        "postgres:17.10-alpine3.23@sha256:8189a1f6e40904781fc9e2612687877791d21679866db58b1de996b31fc312e4",
 		ExposedPorts: []string{"5432/tcp"},
 		Env: map[string]string{
 			"POSTGRES_USER":     "oneissuer",

@@ -1,0 +1,39 @@
+{
+  "record_version": 1,
+  "target_profile": "OneIssuer phase-four offline access, rotating Refresh Token, restricted lifecycle endpoints, and RP-Initiated Logout",
+  "suite": {
+    "release": "release-v5.2.1",
+    "source_commit": "working-tree-phase4",
+    "plan": "oidcc-test-plan",
+    "plan_display_name": "OpenID Connect Core and lifecycle extension review (not part of certification program)"
+  },
+  "applicable_modules": [
+    {
+      "test_module": "oidcc-refresh-token-rotation",
+      "client_auth_type": "none",
+      "coverage": ["offline_access Consent", "one-time generation", "reuse detection", "scope narrowing"]
+    },
+    {
+      "test_module": "oidcc-refresh-token-rotation",
+      "client_auth_type": "client_secret_basic",
+      "coverage": ["Confidential owning Client", "Revocation", "Introspection", "restart persistence"]
+    },
+    {
+      "test_module": "oidcc-rp-initiated-logout",
+      "client_auth_type": "none",
+      "coverage": ["zero-authority request", "cookie-only confirmation", "exact post-logout redirect", "CSRF/replay"]
+    }
+  ],
+  "not_applicable_categories": [
+    {
+      "category": "certification and unsupported profiles",
+      "modules": ["oidcc-basic-certification-test-plan", "front-channel-logout", "back-channel-logout", "dynamic-registration", "FAPI"],
+      "reason": "Phase four is a self-hosted single-Issuer development profile and explicitly makes no certification or unsupported-channel claim."
+    }
+  ],
+  "certification_plan": {
+    "plan": "oidcc-basic-certification-test-plan",
+    "applicable": false,
+    "reason": "The phase-four profile is not an OpenID Foundation certification submission."
+  }
+}

@@ -21,6 +21,22 @@ trusted local shell, or inject variables through the deployment platform. Never
 pass the database URL as a command argument; shell history and process listings
 can expose it.
 
+## Production database URL must use `sslmode=verify-full`
+
+Every configuration scope parses `ONEISSUER_ENV`. With
+`ONEISSUER_ENV=production`, `serve`, `config check`, `admin bootstrap`, and all
+`migrate` commands reject a missing, duplicated, or weaker `sslmode` value. Use
+exactly one `sslmode=verify-full` query parameter plus the CA/client-certificate
+parameters required by your PostgreSQL deployment. Do not work around the check
+with `require`, `verify-ca`, URL duplication, or a separate insecure migration
+DSN.
+
+Compose intentionally defaults to local `sslmode=disable`. For a reviewed TLS
+deployment, set `ONEISSUER_COMPOSE_DATABASE_URL` to the complete container-
+reachable URL; both `migrate` and `oneissuer` receive it. The native
+`ONEISSUER_DATABASE_URL` in `.env.example` points at host `localhost` and is not
+automatically suitable from inside a container.
+
 ## `ONEISSUER_SIGNING_KEY_FILE: is required`
 
 `serve` and `config check` require an active private RS256 JWK. Migration and
@@ -63,7 +79,7 @@ ownership to the runtime identity, as the smoke test does:
 ```bash
 docker run --rm --user 0:0 --entrypoint /bin/sh \
   --mount "type=bind,source=$PWD/.oneissuer-dev/signing-key.jwk,target=/run/oneissuer-secret" \
-  alpine:3.23.3 \
+  alpine:3.23.5@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40 \
   -c 'chown 65532:65532 /run/oneissuer-secret && chmod 0600 /run/oneissuer-secret'
 ```
 
@@ -75,7 +91,7 @@ file with no group/world bits. Never change it to `0644`.
 
 OneIssuer records a fixed startup Audit event after key, database, and migration
 checks and before listening. An Audit constraint/write failure is intentionally
-fatal. Verify schema version 10 and PostgreSQL health; do not bypass the Audit
+fatal. Verify schema version 15 and PostgreSQL health; do not bypass the Audit
 write or manually loosen its whitelist.
 
 ## Migration metadata, version, or checksum failure
@@ -89,7 +105,7 @@ oneissuer migrate version
 oneissuer serve
 ```
 
-Expected `v0.1.0-dev.3` schema version is **10**. In Compose:
+Expected hardened `v0.1.0-dev.4` schema version is **15**. In Compose:
 
 ```bash
 docker compose -f deploy/docker-compose.yml logs migrate
@@ -164,8 +180,8 @@ Common causes:
 - a required parameter is missing or a security parameter is repeated;
 - `response_type` is not exactly `code`;
 - `response_mode` is present and not `query`;
-- `scope` omits `openid`, contains `offline_access`, or exceeds the registered
-  `openid profile email` subset;
+- `scope` omits `openid`, requests `offline_access` without explicit Consent, or
+  exceeds the registered `openid profile email offline_access` subset;
 - `code_challenge_method` is absent or not exactly `S256`;
 - the challenge is not a 43-character unpadded base64url SHA-256 output;
 - state/nonce exceeds 1024 bytes;
@@ -206,8 +222,29 @@ Scope is covered by both the current Grant and current Client policy.
 Grant after approval; shrinking the Client's allowed Scope immediately limits
 what can be issued without rewriting the historical Grant.
 
-Disabling the User/Client makes the Grant unusable. Phase three has no user-facing
-Consent revocation API; do not delete rows manually.
+Disabling the User/Client makes the Grant unusable. Current-user Grant revocation
+is available at `POST /api/v1/me/grants/revoke` with a same-origin Session and
+CSRF proof; it is atomic with family/Access cascade. Do not delete rows manually.
+
+## Refresh Token rotation and reuse
+
+Refresh values are opaque `r1_` strings and are stored only as SHA-256 digests.
+Every successful `refresh_token` exchange consumes the presented generation and
+returns one replacement. A second use of a consumed generation is `invalid_grant`
+and revokes the whole family plus linked live Access metadata; there is no grace
+retry. Clear the RP's stored family and start a new Authorization Code flow.
+
+`POST /oauth2/revoke` returns the same empty `200` response for unknown, expired,
+wrong-owner, and already-revoked authenticated values. `POST /oauth2/introspect`
+is restricted to the owning Confidential Client and returns exactly
+`{"active":false}` for inactive or cross-Client values.
+
+## RP-Initiated Logout
+
+`GET`/`POST /oauth2/logout` only creates a short-lived zero-authority transaction
+and redirects to clean `/oauth2/logout/confirm`. The clean GET binds the current
+Session; only the cookie-only confirm POST with transaction-bound CSRF can revoke
+the Session binding. Invalid or stale hints never cause an external redirect.
 
 ## Token endpoint returns `invalid_client`
 
@@ -242,26 +279,29 @@ authorization request. Never reset database consumption state.
 
 ## Token endpoint returns `unsupported_grant_type`
 
-Only `grant_type=authorization_code` exists. Refresh Token, Client Credentials,
-password, device, and token exchange grants are outside phase three. A successful
-response never contains a Refresh Token.
+The supported grants are `authorization_code` and rotating `refresh_token`.
+Client Credentials, password, and device grants remain outside the profile. A
+Refresh Token is returned only after explicit `offline_access` Consent and a live
+Grant.
 
 ## UserInfo returns `401 invalid_token`
 
-UserInfo requires one Bearer header containing a phase-three RS256 Access Token
+UserInfo requires one Bearer header containing a phase-four RS256 Access Token
 and an exact committed metadata match. It checks signature, `typ=at+jwt`, `kid`,
 Issuer, UserInfo Audience, Subject, Client ID, `jti` digest, Scope, time claims,
-current User/Client status, and current Consent/Client Scope coverage.
+current User/Client status, current Consent/Client Scope coverage, and live Access
+metadata. Revoked or family-reused values fail closed.
 
 Likely causes are expiry, a token from another issuer/audience, malformed or
-unsupported JWT, missing metadata, disabled User/Client, or changed Scope/Grant
-authority. Do not accept the token in another API merely because its signature
-verifies. There is no Introspection fallback.
+unsupported JWT, missing/revoked metadata, disabled User/Client, or changed
+Scope/Grant authority. Do not accept the token in another API merely because its
+signature verifies. A Confidential owning Client may use `/oauth2/introspect` for
+the minimal active snapshot.
 
-Re-enabling a User/Client can make a still-unexpired Access Token satisfy current
-status again if every other authority check remains valid; disabling is not a
-permanent Revocation record. For incident containment, follow the documented
-lifecycle limitations rather than assuming global revocation.
+Re-enabling a User/Client does not restore a value that was explicitly revoked or
+whose Refresh family was consumed. For incident containment, use the documented
+Revocation, Grant, Session, and disable cascades rather than assuming external JWT
+verifiers have global revocation.
 
 ## Browser login/API problems
 
@@ -283,8 +323,17 @@ Unknown, disabled, malformed, and wrong-password identities intentionally share
 `invalid_credentials` to prevent enumeration. Use administrator APIs and fixed
 Audit event types—not raw login logs—to inspect a known account.
 
-A `429 temporarily_unavailable` with `Retry-After` means the Argon2 concurrency
-budget is full. Benchmark/tune capacity; do not remove the bound.
+A `429 temporarily_unavailable` with `Retry-After: 60` on Authorize/login/
+registration means the built-in per-IP or process-wide browser limiter rejected
+the request. Wait for refill and inspect edge traffic; do not respond by making
+the in-process tables unbounded. `Retry-After: 1` on a password submission means
+the Argon2 concurrency gate is full. Benchmark/tune capacity and keep the
+configured memory × concurrency product at or below 1048576 KiB.
+
+Each issued login/registration form has a separate five-submission PostgreSQL
+budget. After five failed/malformed submissions, the next request returns
+`invalid_authentication_flow` before credential lookup/Argon2; start with a new
+form. This is expected and does not indicate database corruption.
 
 ### Authenticated API returns 401 or 403
 
@@ -328,6 +377,20 @@ Liveness remaining 200 while readiness returns 503 is expected during a database
 outage. Readiness uses a separate short ping and recovers automatically. Protocol
 authority operations fail closed; there is no in-memory fallback.
 
+## Cleanup reports a deadline after deleting rows
+
+Cleanup commits in batches of 250. A five-second operation deadline can therefore
+return an error together with a positive committed-row count; this is deliberate
+partial progress, and the next interval resumes from remaining rows. Inspect
+`oneissuer_cleanup_operations_total`, `oneissuer_cleanup_rows_total`, and
+`oneissuer_cleanup_duration_seconds`. A timeout in one cleanup class does not
+reuse its canceled context for later classes. Persistent failures still require
+investigating PostgreSQL locks, query plans, capacity, and retention volume.
+
+Any increase in `oneissuer_audit_write_failures_total` is higher priority: an
+Audit append failed, and atomic authority transitions roll back. Startup Audit
+failure is fatal. Do not disable Audit constraints/triggers to clear the alert.
+
 ## Production configuration rejected
 
 Production requires explicit HTTPS Issuer, PostgreSQL TLS, Secure `__Host-`
@@ -343,15 +406,15 @@ docker compose -f deploy/docker-compose.yml logs --no-log-prefix migrate oneissu
 docker inspect oneissuer-oneissuer-1 --format '{{json .State.Health}}'
 ```
 
-Confirm migration exited zero, version 10 is compatible, PostgreSQL is healthy,
+Confirm migration exited zero, version 14 is compatible, PostgreSQL is healthy,
 the key mount is readable by UID 65532 with mode `0600`, configuration passed,
 and startup Audit insertion succeeded.
 
 ## Tests cannot start PostgreSQL
 
 Integration tests use Testcontainers and need a working Docker socket. Check
-`docker info` and current-user access. Phase-three acceptance requires real
-PostgreSQL, concurrent Code tests, Compose smoke, and the final image gate;
+`docker info` and current-user access. Phase-four acceptance requires real
+PostgreSQL, concurrent lifecycle tests, Compose smoke, and the final image gate;
 unit-only results are not a substitute.
 
 ## `make generate-check` reports stale code
@@ -368,11 +431,17 @@ JWK/JWKS files or secret-shaped key material in the image are release-blocking.
 The scan rejects fixable High/Critical vulnerabilities; record and review any
 non-fixable residual finding rather than deleting the report.
 
+The Dockerfile frontend, Go builder, Alpine runtime, and Compose PostgreSQL image
+are pinned by digest. Update each digest as an explicit reviewed change and rerun
+both image builds/scans. Do not reintroduce build-time `apk upgrade`: it makes the
+same source resolve to mutable package state and defeats reproducible review.
+
 ## Conformance results differ
 
 Use the pinned suite release, source commit, container digests, non-certification
-plan, static registration, and templates in
-[phase-3-conformance.md](./phase-3-conformance.md). Many upstream Code Flow
+plan, static registration, and templates in the [Phase-four matrix](../conformance/phase-4/matrix.json)
+and [Phase-four result](../conformance/phase-4/results/2026-08-03.json). The
+Phase-three record is the historical baseline. Many upstream Code Flow
 modules omit PKCE and cannot run against mandatory S256; never weaken OneIssuer
 or expand Discovery to make those tests pass. Raw exports may include a runtime
 Client Secret and belong only in restricted ignored `.artifacts/` storage.
